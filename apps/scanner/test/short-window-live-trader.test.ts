@@ -1068,7 +1068,7 @@ test("a price-improved Polymarket fill is requoted into a size-matched Jupiter h
   assert.equal(trader.snapshot().halted, false);
 });
 
-test("a bounded non-exact Jupiter ExactIn quote is submitted then normalized", async () => {
+test("a bounded non-exact Jupiter ExactIn quote is retained without an excess sell", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-bounded-exact-in-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -1096,15 +1096,19 @@ test("a bounded non-exact Jupiter ExactIn quote is submitted then normalized", a
 
   assert.equal(decision.type, "entry");
   assert.equal(events.filter((event) => event === "jupiter:prepare-buy").length, 2);
-  assert.equal(events.includes("jupiter:prepare-sell"), true);
+  assert.equal(events.includes("jupiter:prepare-sell"), false);
   assert.equal(
-    absoluteForTest(decision.position.polymarketContractsMicro - decision.position.jupiterContractsMicro) <= 10_000n,
+    absoluteForTest(decision.position.polymarketContractsMicro - decision.position.jupiterContractsMicro) > 10_000n,
     true,
+  );
+  assert.equal(
+    decision.position.originalContractsMicro,
+    minimumForTest(decision.position.polymarketContractsMicro, decision.position.jupiterContractsMicro),
   );
   assert.equal(trader.snapshot().halted, false);
 });
 
-test("a larger-than-quoted Jupiter execution automatically sells the excess outcome tokens", async () => {
+test("a larger-than-quoted Jupiter execution retains the excess outcome tokens", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-jupiter-excess-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -1130,15 +1134,27 @@ test("a larger-than-quoted Jupiter execution automatically sells the excess outc
   });
 
   assert.equal(decision.type, "entry");
-  assert.equal(events.includes("jupiter:prepare-sell"), true);
+  assert.equal(events.includes("jupiter:prepare-sell"), false);
   assert.equal(
-    absoluteForTest(decision.position.polymarketContractsMicro - decision.position.jupiterContractsMicro) <= 10_000n,
+    absoluteForTest(decision.position.polymarketContractsMicro - decision.position.jupiterContractsMicro) > 10_000n,
     true,
   );
   assert.equal(trader.snapshot().halted, false);
+
+  const hold = await trader.consider({
+    pair: decision.position.pair,
+    bestRoute: route,
+    polymarketBook: book("polymarket", 510_000n, 500_000n, 500_000n, 490_000n),
+    jupiterBook: book("jupiter", 460_000n, 560_000n, 450_000n, 550_000n),
+    atMs: 2_000,
+  });
+  assert.equal(hold.type, "hold");
+  assert.equal(hold.reason, "VENUE_SIZE_MISMATCH_HELD_TO_RESOLUTION");
+  assert.equal(events.includes("jupiter:prepare-close"), false);
+  assert.equal(events.includes("polymarket:submit-sell"), false);
 });
 
-test("a smaller-than-quoted Jupiter execution automatically sells the Polymarket excess", async () => {
+test("a smaller-than-quoted Jupiter execution retains the Polymarket excess", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-polymarket-excess-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -1164,9 +1180,9 @@ test("a smaller-than-quoted Jupiter execution automatically sells the Polymarket
   });
 
   assert.equal(decision.type, "entry");
-  assert.equal(events.filter((event) => event === "polymarket:submit-sell").length, 1);
+  assert.equal(events.filter((event) => event === "polymarket:submit-sell").length, 0);
   assert.equal(
-    absoluteForTest(decision.position.polymarketContractsMicro - decision.position.jupiterContractsMicro) <= 10_000n,
+    absoluteForTest(decision.position.polymarketContractsMicro - decision.position.jupiterContractsMicro) > 10_000n,
     true,
   );
   assert.equal(trader.snapshot().halted, false);
@@ -1407,6 +1423,72 @@ test("a fully observed size mismatch releases the global halt while settlement r
   assert.ok(settlement);
   assert.equal(trader.snapshot().openPositions, 0);
   assert.equal(trader.snapshot().halted, false);
+});
+
+test("startup retains a pre-close legacy size mismatch as an open position", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-size-mismatch-retain-"));
+  const statePath = join(directory, "state.json");
+  const identity = {
+    ...pair("UP", "DOWN"),
+    key: "5m:retained-size-mismatch",
+    endMs: Date.now() + 60_000,
+  };
+  const reason = "Venue fills are size-mismatched; no one-sided buy top-up was attempted: " +
+    "Jupiter Prediction API does not support partial position closes";
+  await writeFile(statePath, JSON.stringify({
+    schemaVersion: 1,
+    sequence: 4,
+    halted: true,
+    haltReason: reason,
+    realizedProfitMicroUsd: "0n",
+    polymarketCashMicroUsd: "96500000n",
+    jupiterCashMicroUsd: "96500000n",
+    forcedEntrySubmissionAttempted: false,
+    completedPairs: [],
+    positions: [{
+      id: "live-4",
+      pair: identity,
+      phase: "exposure_error",
+      enteredAtMs: Date.now() - 5_000,
+      jupiterOrderPubkey: null,
+      jupiterPositionPubkey: "swap-v2:jup-down:down-mint",
+      jupiterContractsMicro: "8160766n",
+      polymarketContractsMicro: "7964284n",
+      jupiterEntryCostMicroUsd: "6616976n",
+      polymarketEntryCostMicroUsd: "2342375n",
+      remainingEntryCostMicroUsd: "8959351n",
+      originalContractsMicro: "0n",
+      realizedProfitMicroUsd: "0n",
+      polymarketSettled: false,
+      jupiterSettled: false,
+      polymarketSettlementPayoutMicroUsd: "0n",
+      jupiterSettlementPayoutMicroUsd: "0n",
+      entrySubmissionSkewMs: 100,
+      exitSubmissionSkewMs: null,
+      diagnosticTestEntry: false,
+      lastError: reason,
+    }],
+  }));
+  const events: string[] = [];
+  const trader = createTrader(new MockJupiter(events), new MockPolymarket(events), statePath);
+
+  await trader.initialize();
+
+  const retained = (await loadLiveState(statePath)).positions[0];
+  assert.equal(retained?.phase, "open");
+  assert.equal(retained?.lastError, null);
+  assert.equal(retained?.originalContractsMicro, 7_964_284n);
+  assert.equal(trader.snapshot().halted, false);
+  const hold = await trader.consider({
+    pair: identity,
+    bestRoute: null,
+    polymarketBook: book("polymarket", 510_000n, 500_000n, 500_000n, 490_000n),
+    jupiterBook: book("jupiter", 460_000n, 560_000n, 450_000n, 550_000n),
+    atMs: Date.now(),
+  });
+  assert.equal(hold.type, "hold");
+  assert.equal(hold.reason, "VENUE_SIZE_MISMATCH_HELD_TO_RESOLUTION");
+  assert.deepEqual(events, []);
 });
 
 test("ambiguous halted exposure does not enter automatic redemption", async () => {
@@ -1853,6 +1935,10 @@ function status(buildValue: JupiterPredictionOrderBuild, state: "pending" | "fil
 
 function absoluteForTest(value: bigint): bigint {
   return value < 0n ? -value : value;
+}
+
+function minimumForTest(left: bigint, right: bigint): bigint {
+  return left < right ? left : right;
 }
 
 function pair(polymarketOutcome: "UP" | "DOWN", jupiterOutcome: "UP" | "DOWN"): LivePairIdentity {

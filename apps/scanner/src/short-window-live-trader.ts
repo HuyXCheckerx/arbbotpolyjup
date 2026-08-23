@@ -330,6 +330,14 @@ export class ShortWindowLiveTrader {
       position.entrySubmissionSkewMs ??= null;
       position.exitSubmissionSkewMs ??= null;
       position.diagnosticTestEntry ??= false;
+      if (isRetainableFullyObservedSizeMismatch(position)) {
+        position.originalContractsMicro = minimum(
+          position.polymarketContractsMicro,
+          position.jupiterContractsMicro,
+        );
+        position.phase = Date.now() < position.pair.endMs ? "open" : "awaiting_resolution";
+        position.lastError = null;
+      }
       if (canSafelyAwaitResolution(position, Date.now())) position.phase = "awaiting_resolution";
     }
     this.#pendingRecoveryDiagnostics.push(...await this.#recoverPersistedZeroExposureEntries("startup"));
@@ -346,7 +354,7 @@ export class ShortWindowLiveTrader {
       await this.#save();
     } else if (this.#releaseHaltWithoutBlockingExposure()) {
       this.#lastAction = this.#state.positions.length > 0
-        ? "Known residual exposure is quarantined for settlement; new entries are re-enabled."
+        ? "Known managed exposure remains open or awaiting settlement; new entries are re-enabled."
         : "No managed exposure remains; live trading is re-enabled.";
       await this.#save();
     }
@@ -1083,107 +1091,19 @@ export class ShortWindowLiveTrader {
         "Entry did not fill both venues; no one-sided buy catch-up was attempted",
       );
     }
-    if (absolute(position.jupiterContractsMicro - position.polymarketContractsMicro) > CONTRACT_TOLERANCE_MICRO) {
-      const normalizationError = await this.#normalizeEntrySizeMismatch(
-        position,
-        polymarketResult,
-        maximumPolymarketPrice,
-      );
-      if (normalizationError) {
-        return await haltWithDiagnostics(`${OBSERVED_ENTRY_SIZE_MISMATCH}: ${normalizationError}`);
-      }
-    }
+    const retainedSizeMismatch = absolute(
+      position.jupiterContractsMicro - position.polymarketContractsMicro,
+    );
     position.originalContractsMicro = minimum(position.jupiterContractsMicro, position.polymarketContractsMicro);
     position.phase = "open";
     this.#lastAction = `LIVE ENTRY ${pair.duration}: ${formatContracts(position.originalContractsMicro)} contracts, ` +
       `$${formatUsd(position.remainingEntryCostMicroUsd)} recorded all-in, submissions ` +
-      `${position.entrySubmissionSkewMs ?? "unknown"}ms apart.`;
+      `${position.entrySubmissionSkewMs ?? "unknown"}ms apart.` +
+      (retainedSizeMismatch > CONTRACT_TOLERANCE_MICRO
+        ? ` Retaining ${formatContracts(retainedSizeMismatch)} contract venue-size skew through resolution.`
+        : "");
     await this.#save();
     return { type: "entry", position, preflight, execution };
-  }
-
-  async #normalizeEntrySizeMismatch(
-    position: LivePosition,
-    polymarketEntryResult: PromiseSettledResult<PolymarketLiveFill>,
-    maximumPolymarketPriceMicroUsd: bigint,
-  ): Promise<string | null> {
-    try {
-      if (position.polymarketContractsMicro > position.jupiterContractsMicro + CONTRACT_TOLERANCE_MICRO) {
-        const excess = position.polymarketContractsMicro - position.jupiterContractsMicro;
-        const entryGross = polymarketEntryResult.status === "fulfilled"
-          ? polymarketEntryResult.value.grossMicroUsd
-          : tradeGross(maximumPolymarketPriceMicroUsd, position.polymarketContractsMicro);
-        const entryPrice = entryGross > 0n
-          ? entryGross * ONE_CONTRACT_MICRO / position.polymarketContractsMicro
-          : maximumPolymarketPriceMicroUsd;
-        const minimumPriceMicroUsd = maximum(
-          POLYMARKET_PRICE_TICK_MICRO_USD,
-          applyBps(entryPrice, this.#config.maximumSlippageBps, "down"),
-        );
-        const contractsBefore = position.polymarketContractsMicro;
-        const balanceBefore = await this.#polymarket.getTokenBalance(position.pair.polymarketTokenId);
-        const prepared = await this.#polymarket.prepareSellFok({
-          tokenId: position.pair.polymarketTokenId,
-          contractsMicro: excess,
-          minimumPriceMicroUsd,
-        });
-        const fill = await this.#polymarket.submitPreparedFok(prepared);
-        const exit = await this.#recordPolymarketExitResult(
-          position,
-          { status: "fulfilled", value: fill },
-          balanceBefore,
-          contractsBefore,
-          minimumPriceMicroUsd,
-        );
-        if (absolute(exit.contractsMicro - excess) > CONTRACT_TOLERANCE_MICRO) {
-          return `Polymarket excess unwind sold ${formatContracts(exit.contractsMicro)} of ` +
-            `${formatContracts(excess)}`;
-        }
-        const realized = exit.grossMicroUsd - exit.feeMicroUsd - exit.entryPortionMicroUsd;
-        position.realizedProfitMicroUsd += realized;
-        this.#state.realizedProfitMicroUsd += realized;
-      } else if (position.jupiterContractsMicro > position.polymarketContractsMicro + CONTRACT_TOLERANCE_MICRO) {
-        const excess = position.jupiterContractsMicro - position.polymarketContractsMicro;
-        const contractsBefore = position.jupiterContractsMicro;
-        const build = await this.#jupiter.prepareSell(position.jupiterPositionPubkey, excess);
-        if (build.order.isBuy || build.order.marketId !== position.pair.jupiterMarketId ||
-          build.order.positionPubkey !== position.jupiterPositionPubkey ||
-          build.order.isYes !== expectedJupiterIsYes(position.pair) ||
-          absolute(build.order.contractsMicro - excess) > CONTRACT_TOLERANCE_MICRO) {
-          return "Jupiter excess unwind build has the wrong identity or size";
-        }
-        const submitted = await this.#jupiter.submitPreparedAndWait(
-          await this.#jupiter.prepareSubmission(build),
-          { timeoutMs: this.#config.jupiterFillTimeoutMs },
-        );
-        const sold = submitted.status.filledContractsMicro;
-        if (submitted.status.status !== "filled" || absolute(sold - excess) > CONTRACT_TOLERANCE_MICRO) {
-          return `Jupiter excess unwind sold ${formatContracts(sold)} of ${formatContracts(excess)}`;
-        }
-        const entryPortion = position.jupiterEntryCostMicroUsd * sold / contractsBefore;
-        const gross = submitted.status.sizeMicroUsd;
-        const fees = build.order.estimatedTotalFeeMicroUsd;
-        this.#state.jupiterCashMicroUsd = this.#jupiterCash() + gross - fees;
-        position.jupiterContractsMicro = maximum(0n, position.jupiterContractsMicro - sold);
-        position.jupiterEntryCostMicroUsd = maximum(0n, position.jupiterEntryCostMicroUsd - entryPortion);
-        position.remainingEntryCostMicroUsd = maximum(
-          0n,
-          position.remainingEntryCostMicroUsd - entryPortion,
-        );
-        const realized = gross - fees - entryPortion;
-        position.realizedProfitMicroUsd += realized;
-        this.#state.realizedProfitMicroUsd += realized;
-      }
-      if (absolute(position.jupiterContractsMicro - position.polymarketContractsMicro) > CONTRACT_TOLERANCE_MICRO) {
-        return `residual size difference is ${formatContracts(
-          absolute(position.jupiterContractsMicro - position.polymarketContractsMicro),
-        )}`;
-      }
-      await this.#save();
-      return null;
-    } catch (error) {
-      return errorMessage(error);
-    }
   }
 
   async #prepareFreshJupiterHedge(
@@ -1375,6 +1295,14 @@ export class ShortWindowLiveTrader {
     polymarketBook: BinaryOrderBook,
     jupiterBook: BinaryOrderBook,
   ): Promise<LiveDecision> {
+    if (absolute(position.polymarketContractsMicro - position.jupiterContractsMicro) >
+      CONTRACT_TOLERANCE_MICRO) {
+      return {
+        type: "hold",
+        reason: "VENUE_SIZE_MISMATCH_HELD_TO_RESOLUTION",
+        position,
+      };
+    }
     const quantity = minimum(position.polymarketContractsMicro, position.jupiterContractsMicro);
     const evaluation = evaluateShortWindowExit({
       polymarketBook,
@@ -1906,6 +1834,13 @@ function canSafelyAwaitResolution(position: LivePosition, atMs: number): boolean
   // recorded. Resolution can safely redeem/settle those balances without
   // placing a one-sided recovery trade. Unknown or one-sided fills stay halted.
   return position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO &&
+    position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
+}
+
+function isRetainableFullyObservedSizeMismatch(position: LivePosition): boolean {
+  return position.phase === "exposure_error" &&
+    position.lastError?.startsWith(OBSERVED_ENTRY_SIZE_MISMATCH) === true &&
+    position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO &&
     position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
 }
 
