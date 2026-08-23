@@ -4,6 +4,7 @@ dist/
 .env.*
 !.env.example
 coverage/
+target/
 *.log
 logs/*.jsonl
 logs/*live-state*.json

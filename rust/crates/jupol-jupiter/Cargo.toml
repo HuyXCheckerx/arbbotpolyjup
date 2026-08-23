@@ -1,0 +1,18 @@
+[package]
+name = "jupol-jupiter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jupol-domain = { path = "../jupol-domain" }
+jupol-http = { path = "../jupol-http" }
+jupol-runtime = { path = "../jupol-runtime" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

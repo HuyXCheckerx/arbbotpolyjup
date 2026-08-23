@@ -118,10 +118,12 @@ pnpm monitor:short-window -- --help
 | `--max-reference-difference-usd` | `30` | Strict opening-reference difference limit |
 | `--reference-retry-ms` | `2000` | Retry interval while references are unavailable |
 | `--reference-api-timeout-ms` | `2000` | Polymarket web reference timeout |
-| `--sample-interval-ms` | `100` | Minimum interval between WebSocket-triggered route evaluations; execution remains responsive at this cadence |
-| `--market-log-interval-ms` | `5000` | Minimum interval per duration between repetitive `book_sample` and changed `arb_opportunity` records |
-| `--jupiter-poll-ms` | `1000` | REST orderbook refresh target only while a live position needs exit screening |
-| `--max-jupiter-age-ms` | `5000` | Maximum Jupiter snapshot age for candidate logging |
+| `--sample-interval-ms` | `50` | Minimum interval between WebSocket-triggered route evaluations; execution remains responsive at this cadence |
+| `--market-log-interval-ms` | `30000` | Minimum interval per duration between repetitive `book_sample` and changed `arb_opportunity` records |
+| `--jupiter-poll-ms` | `200` | REST retry/poll baseline; resolution-only live positions do not request exit books |
+| `--max-polymarket-age-ms` | `5000` | Maximum Polymarket snapshot age for an entry decision |
+| `--max-jupiter-age-ms` | `2000` | Maximum Jupiter snapshot age for an entry decision |
+| `--jupiter-request-interval-ms` | `110` | Shared Developer-tier request spacing; live order builds are prioritized over discovery |
 | `--max-consecutive-jupiter-errors` | `5` | Persistent-error warning threshold; the pair remains active with exponential backoff |
 | `--max-samples` | `0` | Stop after N synchronized samples; zero is unlimited |
 | `--max-opportunities` | `0` | Stop after N distinct candidate records; zero is unlimited |
@@ -139,13 +141,13 @@ pnpm monitor:short-window -- --help
 | `--jupiter-quote-usd` | `5` | Gross cap used to synthesize entry-screening depth from Degen top prices |
 | `--minimum-entry-edge-usd` | `0.01` | Minimum nominal entry edge per contract after entry fees |
 | `--minimum-entry-profit-usd` | `0.10` | Minimum nominal total entry edge |
-| `--minimum-exit-profit-usd` | `0.10` | Minimum net profit for a full two-leg early exit |
-| `--maximum-open-positions` | `2` | Portfolio-wide concurrent position cap |
+| `--minimum-exit-profit-usd` | `0.10` | Legacy threshold retained for compatibility; live automatic exits are disabled |
+| `--maximum-open-positions` | `5` | Portfolio-wide unsettled-position cap |
 | `--web-port` | `3210` | Local dashboard status API port |
 | `--no-web` | off | Disable the local dashboard status API |
 | `--output` | `logs/btc-poly-jup-short-window-arb.jsonl` | Append-only JSONL path |
 
-Short-window entry discovery uses the same public top-price WebSocket as Jupiter's Degen UI. It subscribes to the selected Bison UP/DOWN market IDs in one connection and does not call authenticated Swap `/order` while merely watching prices. A candidate must still pass a fresh atomic Swap V2 build before the bot prepares or submits the Polymarket leg. While a position is open, the bot switches to Jupiter's REST orderbook for exit bids because the top-price socket does not expose executable depth.
+Short-window entry discovery uses the same public top-price WebSocket as Jupiter's Degen UI. It subscribes to the selected Bison UP/DOWN market IDs in one connection and does not call authenticated Swap `/order` while merely watching prices. A candidate must still pass a fresh atomic Swap V2 build before the bot prepares or submits the Polymarket leg. Once a balanced position is open, automatic profit-taking is skipped and no Jupiter REST exit book is polled; the settlement loop takes over after resolution.
 
 The Degen price service is a public frontend dependency but is not part of Jupiter's documented Prediction API contract. The stream reconnects with exponential backoff after errors or 30 seconds without messages. If Jupiter moves the service before this beta stabilizes, override it with `JUPITER_PREDICTION_PRICE_WEBSOCKET_URL` while updating the integration.
 
@@ -189,7 +191,7 @@ jq -s '{
 | `jupiter_poll_error` | Jupiter REST refresh failed |
 | `pair_error` | Discovery or exact-reference data was unavailable |
 | `pair_end` | Market closed, error limit was reached, or the session stopped |
-| `live_entry` / `live_exit` | Confirmed real-money entry or green exit; entries include preflight and per-venue execution diagnostics |
+| `live_entry` / `live_exit` | Confirmed real-money entry or legacy/manual-policy exit; production live mode holds balanced positions through resolution |
 | `live_entry_preflight_failed` | Structured preflight stage, stable code, retry class, cooldown, per-stage timings, quote inputs/results, router/mode, and nested error details |
 | `live_recovery` | Read-only balance reconciliation proved a terminal entry failure left zero exposure; no recovery trade was submitted |
 | `live_halt` | Execution became ambiguous; new entries stopped, with independent Jupiter/Polymarket result, fill, transaction/order, and nested-error fields |

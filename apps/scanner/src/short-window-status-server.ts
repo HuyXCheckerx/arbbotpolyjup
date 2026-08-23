@@ -78,6 +78,43 @@ export interface DurationStatus {
   updatedAt: string;
 }
 
+export interface LivePositionSnapshot {
+  id: string;
+  pairKey: string;
+  duration: string;
+  start: string;
+  end: string;
+  polymarketSlug: string;
+  polymarketMarketId: string;
+  jupiterMarketId: string;
+  phase: string;
+  polymarketOutcome: string;
+  jupiterOutcome: string;
+  polymarketContracts: string;
+  jupiterContracts: string;
+  polymarketCostUsd: string;
+  jupiterCostUsd: string;
+  totalCostUsd: string;
+  contractSkew: string;
+  isHedged: boolean;
+  polymarketSettled: boolean;
+  jupiterSettled: boolean;
+  realizedProfitUsd: string;
+  enteredAt: string;
+  lastError: string | null;
+}
+
+export interface StatusEvent {
+  id: string;
+  timestamp: string;
+  type: string;
+  level: "info" | "warn" | "error" | "success";
+  duration?: string | undefined;
+  code?: string | undefined;
+  message: string;
+  details?: Record<string, unknown> | undefined;
+}
+
 export interface ShortWindowStatusSnapshot {
   schemaVersion: 1;
   scanner: {
@@ -102,6 +139,7 @@ export interface ShortWindowStatusSnapshot {
     openPositions: number;
     awaitingResolution: number;
     lastAction: string;
+    positions?: LivePositionSnapshot[];
     walletBalances: {
       polymarketCollateralUsd: string | null;
       jupiterUsdcUsd: string | null;
@@ -112,6 +150,7 @@ export interface ShortWindowStatusSnapshot {
     updatedAt: string;
   };
   durations: Record<ShortWindowDuration, DurationStatus>;
+  events: StatusEvent[];
 }
 
 export class ShortWindowStatusStore {
@@ -124,6 +163,8 @@ export class ShortWindowStatusStore {
   readonly #feeds: ShortWindowStatusSnapshot["feeds"];
   #strategy: ShortWindowStatusSnapshot["strategy"];
   readonly #durations: ShortWindowStatusSnapshot["durations"];
+  readonly #events: StatusEvent[] = [];
+  #eventSequence = 0;
 
   constructor(input: {
     sessionId: string;
@@ -223,6 +264,22 @@ export class ShortWindowStatusStore {
     };
   }
 
+  recordEvent(event: Omit<StatusEvent, "id" | "timestamp"> & { id?: string; timestamp?: string }): void {
+    this.#eventSequence += 1;
+    const entry: StatusEvent = {
+      id: event.id ?? `evt-${this.#eventSequence}`,
+      timestamp: event.timestamp ?? new Date().toISOString(),
+      type: event.type,
+      level: event.level,
+      duration: event.duration,
+      code: event.code,
+      message: event.message,
+      details: event.details,
+    };
+    this.#events.unshift(entry);
+    if (this.#events.length > 50) this.#events.pop();
+  }
+
   stop(): void {
     this.#running = false;
   }
@@ -241,6 +298,7 @@ export class ShortWindowStatusStore {
       feeds: structuredClone(this.#feeds),
       strategy: structuredClone(this.#strategy),
       durations: structuredClone(this.#durations),
+      events: structuredClone(this.#events),
     };
   }
 }
@@ -250,7 +308,11 @@ export async function startShortWindowStatusServer(
   port: number,
 ): Promise<{ url: string; close: () => Promise<void> }> {
   const server = createServer((request, response) => {
-    response.setHeader("access-control-allow-origin", "*");
+    const origin = request.headers.origin;
+    if (origin === "http://127.0.0.1:3000" || origin === "http://localhost:3000") {
+      response.setHeader("access-control-allow-origin", origin);
+      response.setHeader("vary", "origin");
+    }
     response.setHeader("access-control-allow-methods", "GET, OPTIONS");
     response.setHeader("cache-control", "no-store");
     if (request.method === "OPTIONS") {

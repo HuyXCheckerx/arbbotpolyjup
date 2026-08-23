@@ -21,3 +21,16 @@ test("shared Jupiter request scheduler rejects invalid intervals", () => {
   assert.throws(() => new JupiterRequestScheduler(-1), /non-negative integer/);
   assert.throws(() => new JupiterRequestScheduler(0.5), /non-negative integer/);
 });
+
+test("shared Jupiter request scheduler prioritizes a live build over queued discovery", async () => {
+  const scheduler = new JupiterRequestScheduler(15);
+  await scheduler.wait();
+  const starts: string[] = [];
+
+  const firstDiscovery = scheduler.wait("normal").then(() => starts.push("discovery-1"));
+  const secondDiscovery = scheduler.wait("normal").then(() => starts.push("discovery-2"));
+  const liveBuild = scheduler.wait("critical").then(() => starts.push("live-build"));
+  await Promise.all([firstDiscovery, secondDiscovery, liveBuild]);
+
+  assert.deepEqual(starts, ["discovery-1", "live-build", "discovery-2"]);
+});

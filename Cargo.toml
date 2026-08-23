@@ -1,0 +1,41 @@
+[workspace]
+members = [
+  "rust/crates/jupol-domain",
+  "rust/crates/jupol-http",
+  "rust/crates/jupol-jupiter",
+  "rust/crates/jupol-runtime",
+  "rust/crates/jupol-state",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+rust-version = "1.94"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+float_arithmetic = "deny"
+
+[workspace.dependencies]
+reqwest = { version = "0.13.4", features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "rt", "sync", "time"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+codegen-units = 1
+lto = "fat"

@@ -192,8 +192,7 @@ pnpm bot:short-window:live -- \
   --maximum-jupiter-submit-quote-age-ms=750 \
   --maximum-emergency-hedge-loss-usd=0.50 \
   --minimum-entry-edge-usd=0.02 \
-  --minimum-entry-profit-usd=0.25 \
-  --minimum-exit-profit-usd=0.20
+  --minimum-entry-profit-usd=0.25
 ```
 
 Example using any-route mode, no daily markets, and a separate log:
@@ -212,16 +211,19 @@ Common controls:
 | --- | ---: | --- |
 | `--max-reference-difference-usd=30` | `$30` | Requires the opening references to differ by strictly less than this amount |
 | `--max-venue-allocation-usd=50` | `$50` | Maximum cost at each venue for one position |
-| `--maximum-open-positions=2` | `2` | Portfolio-wide position limit |
+| `--maximum-open-positions=5` | `5` | Portfolio-wide unsettled-position limit; wallet balances can impose a lower practical limit |
 | `--minimum-entry-edge-usd=0.01` | `$0.01` | Minimum modeled edge per contract after entry fees |
 | `--minimum-entry-profit-usd=0.10` | `$0.10` | Minimum modeled total entry profit |
-| `--minimum-exit-profit-usd=0.10` | `$0.10` | Minimum net profit for a full early exit |
+| Exit policy | hold until resolution | Automatic profit-taking exits are disabled; recovery hedges and settlement remain enabled |
 | `--maximum-slippage-bps=100` | `100 bps` | Maximum live price protection per leg; allowed range is 1–500 bps |
-| `--maximum-jupiter-submit-quote-age-ms=1000` | `1 second` | Requotes instead of submitting an older signed Jupiter build after Polymarket fills |
+| `--maximum-jupiter-submit-quote-age-ms=500` | `0.5 seconds` | Requotes instead of submitting an older signed Jupiter build after Polymarket fills |
 | `--maximum-emergency-hedge-loss-usd=1` | `$1` | Maximum modeled loss accepted to hedge an already-filled first leg; it does not relax pre-entry profit checks |
 | `--jupiter-quote-usd=5` | `$5` | Gross cap used for websocket entry screening |
 | `--jupiter-fill-timeout-ms=20000` | `20 seconds` | Jupiter fill/reconciliation timeout |
 | `--market-log-interval-ms=30000` | `30 seconds` | Suppresses repetitive snapshots without slowing execution evaluation |
+| `--max-polymarket-age-ms=5000` | `5 seconds` | Rejects entry decisions based on an older Polymarket snapshot |
+| `--max-jupiter-age-ms=2000` | `2 seconds` | Rejects entry decisions based on an older Jupiter snapshot |
+| `--jupiter-request-interval-ms=110` | `110 ms` | Shares the Developer-tier 10 RPS bucket across Prediction and Swap; live builds jump ahead of discovery |
 | `--no-daily-threshold` | off | Disables daily Bitcoin-above-strike markets |
 | `--web-port=3210` | `3210` | Local status API and live single-instance lock |
 | `--output=PATH` | standard JSONL path | Selects the append-only event log |
@@ -321,7 +323,7 @@ Press `Ctrl-C` once and wait for the session-end message. The live bot persists 
 2. Check the actual Polymarket conditional-token balance and Jupiter outcome-token balance for the recorded markets.
 3. Preserve the JSONL and state file as the exposure audit trail.
 4. Restart with the same command and state file when you want the bot to attempt its supported automatic read-only reconciliation and post-resolution recovery.
-5. If either venue's fill is unknown or one-sided, determine the exact exposure and neutralize it manually if necessary. The bot deliberately will not guess.
+5. Fully observed residual exposure is quarantined after market close and no longer blocks new entries while settlement continues. If either venue's fill is unknown or pending, determine the exact exposure and neutralize it manually if necessary; the bot deliberately will not guess.
 6. Use a new `--live-state` only after every old exposure is accounted for on both venues.
 
 Example after fully completed manual recovery:

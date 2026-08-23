@@ -82,6 +82,7 @@ import {
   type ReferenceStatus,
   type RouteStatus,
 } from "./short-window-status-server.ts";
+import { CoalescingAsyncQueue } from "./coalescing-async-queue.ts";
 
 type Duration = "5m" | "15m";
 
@@ -96,6 +97,7 @@ const LIVE_BALANCE_REFRESH_MS = 5_000;
 const LIVE_BALANCE_LOG_HEARTBEAT_MS = 60_000;
 const LIVE_CONTRACT_TOLERANCE_MICRO = 10_000n;
 const DEFAULT_MARKET_LOG_INTERVAL_MS = 30_000;
+const DEFAULT_JUPITER_DEVELOPER_REQUEST_INTERVAL_MS = 110;
 const LIVE_CONFIRMATION = "I_ACCEPT_REAL_MONEY_RISK";
 const LIVE_TEST_ENTRY_CONFIRMATION = "I_ACCEPT_ONE_UNPROFITABLE_TEST_TRADE";
 const CORE_BASIS_WARNINGS = [
@@ -156,6 +158,7 @@ interface MonitorConfiguration {
   sampleIntervalMs: number;
   marketLogIntervalMs: number;
   jupiterPollMs: number;
+  maximumPolymarketAgeMs: number;
   maximumJupiterAgeMs: number;
   maximumReusableJupiterQuoteAgeMs: number;
   maximumConsecutiveJupiterErrors: number;
@@ -164,6 +167,23 @@ interface MonitorConfiguration {
   dailyThresholdDiscoveryRefreshMs: number;
   minimumEntryEdgeMicroUsdPerContract: bigint;
   minimumEntryEdgeTotalMicroUsd: bigint;
+}
+
+async function retryStartup<T>(name: string, fn: () => Promise<T>, maxRetries = 4, delayMs = 1500): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const msg = error instanceof Error ? `${error.message}${error.cause ? ` (cause: ${String(error.cause)})` : ""}` : String(error);
+      if (attempt < maxRetries) {
+        console.warn(`[startup] ${name} attempt ${attempt}/${maxRetries} failed: ${msg}. Retrying in ${delayMs}ms...`);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw new Error(`[startup] ${name} failed after ${maxRetries} attempts: ${lastError instanceof Error ? lastError.stack || lastError.message : String(lastError)}`);
 }
 
 async function main(): Promise<void> {
@@ -179,14 +199,15 @@ async function main(): Promise<void> {
   );
   const referenceRetryMs = args.integer("reference-retry-ms", 2_000);
   const referenceApiTimeoutMs = args.integer("reference-api-timeout-ms", 2_000);
-  const sampleIntervalMs = args.integer("sample-interval-ms", 100);
+  const sampleIntervalMs = args.integer("sample-interval-ms", 50);
   const marketLogIntervalMs = args.integer("market-log-interval-ms", DEFAULT_MARKET_LOG_INTERVAL_MS);
-  const jupiterPollMs = args.integer("jupiter-poll-ms", 1_000);
-  const maximumJupiterAgeMs = args.integer("max-jupiter-age-ms", 5_000);
+  const jupiterPollMs = args.integer("jupiter-poll-ms", 200);
+  const maximumPolymarketAgeMs = args.integer("max-polymarket-age-ms", 5_000);
+  const maximumJupiterAgeMs = args.integer("max-jupiter-age-ms", 2_000);
   const maximumConsecutiveJupiterErrors = args.integer("max-consecutive-jupiter-errors", 5);
   const dailyThresholdEnabled = !args.has("no-daily-threshold");
   const anyComplementaryRoute = args.has("any-complementary-route");
-  const dailyThresholdPollMs = args.integer("daily-threshold-poll-ms", 10_000);
+  const dailyThresholdPollMs = args.integer("daily-threshold-poll-ms", 5_000);
   const dailyThresholdDiscoveryRefreshMs = args.integer("daily-threshold-discovery-refresh-ms", 300_000);
   const maxSamples = args.has("once") ? 1 : args.integer("max-samples", 0);
   const maxOpportunities = args.integer("max-opportunities", 0);
@@ -197,7 +218,7 @@ async function main(): Promise<void> {
   const checkLiveReadiness = args.has("check-live-readiness");
   const liveStatePath = resolve(process.cwd(), args.string("live-state", DEFAULT_LIVE_STATE));
   const maximumSlippageBps = args.integer("maximum-slippage-bps", 100);
-  const maximumJupiterSubmissionQuoteAgeMs = args.integer("maximum-jupiter-submit-quote-age-ms", 1_000);
+  const maximumJupiterSubmissionQuoteAgeMs = args.integer("maximum-jupiter-submit-quote-age-ms", 500);
   const maximumEmergencyHedgeLossMicroUsd = parseUsd(args.string("maximum-emergency-hedge-loss-usd", "1"));
   const jupiterFillTimeoutMs = args.integer("jupiter-fill-timeout-ms", 20_000);
   const minimumVenueBalanceMicroUsd = parseUsd(args.string("minimum-venue-balance-usd", "50"));
@@ -208,11 +229,14 @@ async function main(): Promise<void> {
   const minimumEntryEdgePerContractMicroUsd = parseUsd(args.string("minimum-entry-edge-usd", "0.01"));
   const minimumEntryEdgeTotalMicroUsd = parseUsd(args.string("minimum-entry-profit-usd", "0.10"));
   const minimumExitProfitMicroUsd = parseUsd(args.string("minimum-exit-profit-usd", "0.10"));
-  const maximumOpenPositions = args.integer("maximum-open-positions", 2);
+  const maximumOpenPositions = args.integer("maximum-open-positions", 5);
   const webPort = args.integer("web-port", 3_210);
   const webEnabled = !args.has("no-web");
-  const minimumJupiterPollMs = 1_000;
-  const exactJupiterBuildMinimumIntervalMs = 1_000;
+  const jupiterRequestIntervalMs = args.integer(
+    "jupiter-request-interval-ms",
+    DEFAULT_JUPITER_DEVELOPER_REQUEST_INTERVAL_MS,
+  );
+  const minimumJupiterPollMs = 100;
 
   if (paperTrade) throw new Error("--paper-trade was removed; use the read-only monitor or real --live-trade mode");
   if (liveTestEntry && !liveTrade) throw new Error("--live-test-entry requires --live-trade");
@@ -241,7 +265,13 @@ async function main(): Promise<void> {
   if (jupiterPollMs < minimumJupiterPollMs) {
     throw new Error(`--jupiter-poll-ms must be at least ${minimumJupiterPollMs}`);
   }
+  if (maximumPolymarketAgeMs < 500 || maximumPolymarketAgeMs > 30_000) {
+    throw new Error("--max-polymarket-age-ms must be between 500 and 30000");
+  }
   if (maximumJupiterAgeMs < jupiterPollMs) throw new Error("--max-jupiter-age-ms must be at least --jupiter-poll-ms");
+  if (jupiterRequestIntervalMs < 100 || jupiterRequestIntervalMs > 5_000) {
+    throw new Error("--jupiter-request-interval-ms must be between 100 and 5000 for the Developer-tier 10 RPS bucket");
+  }
   if (maximumConsecutiveJupiterErrors < 1) throw new Error("--max-consecutive-jupiter-errors must be at least 1");
   if (dailyThresholdPollMs < 2_500) throw new Error("--daily-threshold-poll-ms must be at least 2500");
   if (dailyThresholdDiscoveryRefreshMs < 30_000) {
@@ -303,7 +333,18 @@ async function main(): Promise<void> {
   const twapAnchors = new ExactTwapAnchorStore();
   const spotAnchors = new ExactChainlinkSpotStore();
   const polymarketClient = new PolymarketClient();
-  const jupiterClient = new JupiterClient();
+  const configuredJupiterApiKey = optionalEnvironment("JUPITER_API_KEY");
+  const jupiterRequestScheduler = configuredJupiterApiKey
+    ? new JupiterRequestScheduler(jupiterRequestIntervalMs)
+    : undefined;
+  const jupiterClient = configuredJupiterApiKey && jupiterRequestScheduler
+    ? new JupiterClient({
+      apiKey: configuredJupiterApiKey,
+      minRequestIntervalMs: 0,
+      requestScheduler: jupiterRequestScheduler,
+      requestPriority: "normal",
+    })
+    : new JupiterClient();
   const forecastCache = new ForecastMarketCache(jupiterClient);
   const dailyThresholdCache = new DailyThresholdMarketCache(jupiterClient, dailyThresholdPollMs);
   const referenceHttp = new HttpClient({
@@ -323,6 +364,7 @@ async function main(): Promise<void> {
     sampleIntervalMs,
     marketLogIntervalMs,
     jupiterPollMs,
+    maximumPolymarketAgeMs,
     maximumJupiterAgeMs,
     maximumReusableJupiterQuoteAgeMs,
     maximumConsecutiveJupiterErrors,
@@ -354,18 +396,20 @@ async function main(): Promise<void> {
   let jupiterPredictionLiveExecutor: JupiterLiveExecutor | null = null;
   if (liveTrade) {
     const relayerRequired = !checkPolymarketReadiness;
-    polymarketLiveExecutor = await PolymarketLiveExecutor.create({
-      privateKey: requiredEnvironment("POLYMARKET_PRIVATE_KEY"),
-      walletAddress: requiredEnvironment("POLYMARKET_WALLET_ADDRESS"),
-      relayerApiKey: relayerRequired
-        ? requiredEnvironment("POLYMARKET_RELAYER_API_KEY")
-        : optionalEnvironment("POLYMARKET_RELAYER_API_KEY"),
-      relayerApiKeyAddress: relayerRequired
-        ? requiredEnvironment("POLYMARKET_RELAYER_API_KEY_ADDRESS")
-        : optionalEnvironment("POLYMARKET_RELAYER_API_KEY_ADDRESS"),
-    });
+    polymarketLiveExecutor = await retryStartup("Polymarket secure client initialization", () =>
+      PolymarketLiveExecutor.create({
+        privateKey: requiredEnvironment("POLYMARKET_PRIVATE_KEY"),
+        walletAddress: requiredEnvironment("POLYMARKET_WALLET_ADDRESS"),
+        relayerApiKey: relayerRequired
+          ? requiredEnvironment("POLYMARKET_RELAYER_API_KEY")
+          : optionalEnvironment("POLYMARKET_RELAYER_API_KEY"),
+        relayerApiKeyAddress: relayerRequired
+          ? requiredEnvironment("POLYMARKET_RELAYER_API_KEY_ADDRESS")
+          : optionalEnvironment("POLYMARKET_RELAYER_API_KEY_ADDRESS"),
+      }));
     if (checkPolymarketReadiness) {
-      const readiness = await polymarketLiveExecutor.assertReady(minimumVenueBalanceMicroUsd);
+      const readiness = await retryStartup("Polymarket readiness check", () =>
+        polymarketLiveExecutor!.assertReady(minimumVenueBalanceMicroUsd));
       const allowance = readiness.minimumAllowanceMicroUsd >= 2n ** 128n
         ? "unlimited"
         : `$${formatUsd(readiness.minimumAllowanceMicroUsd)}`;
@@ -381,13 +425,16 @@ async function main(): Promise<void> {
       return;
     }
     const jupiterApiKey = requiredEnvironment("JUPITER_API_KEY");
+    if (!jupiterRequestScheduler) {
+      throw new Error("Live trading requires the shared Jupiter request scheduler");
+    }
     const solanaRpcUrl = requiredEnvironment("SOLANA_RPC_URL");
     const jupiterPrivateKey = requiredEnvironment("JUPITER_SOLANA_PRIVATE_KEY");
-    const jupiterRequestScheduler = new JupiterRequestScheduler(exactJupiterBuildMinimumIntervalMs);
     const jupiterExecutionClient = new JupiterClient({
       apiKey: jupiterApiKey,
       minRequestIntervalMs: 0,
       requestScheduler: jupiterRequestScheduler,
+      requestPriority: "critical",
     });
     jupiterLiveExecutor = new JupiterForecastSwapExecutor({
       predictionClient: jupiterExecutionClient,
@@ -406,8 +453,8 @@ async function main(): Promise<void> {
       privateKey: jupiterPrivateKey,
     });
     const [polymarketReadiness, jupiterReadiness] = await Promise.all([
-      polymarketLiveExecutor.assertReady(minimumVenueBalanceMicroUsd),
-      jupiterLiveExecutor.assertReady(minimumVenueBalanceMicroUsd),
+      retryStartup("Polymarket readiness check", () => polymarketLiveExecutor!.assertReady(minimumVenueBalanceMicroUsd)),
+      retryStartup("Jupiter readiness check", () => jupiterLiveExecutor!.assertReady(minimumVenueBalanceMicroUsd)),
     ]);
     if (checkLiveReadiness) {
       console.log(
@@ -436,6 +483,7 @@ async function main(): Promise<void> {
         initialPolymarketCashMicroUsd: polymarketReadiness.collateralBalanceMicroUsd,
         initialJupiterCashMicroUsd: jupiterReadiness.usdcMicro,
         maximumOpenPositions,
+        exitMode: "hold_until_resolution",
         maximumSlippageBps,
         maximumReusableJupiterQuoteAgeMs,
         maximumJupiterSubmissionQuoteAgeMs,
@@ -445,7 +493,7 @@ async function main(): Promise<void> {
         statePath: liveStatePath,
       },
     });
-    await liveTrader.initialize();
+    await retryStartup("Live trader state initialization", () => liveTrader!.initialize());
   }
   let samplesWritten = 0;
   let opportunitiesWritten = 0;
@@ -493,7 +541,9 @@ async function main(): Promise<void> {
       sampleIntervalMs,
       marketLogIntervalMs,
       jupiterPollMs,
+      maximumPolymarketAgeMs,
       maximumJupiterAgeMs,
+      jupiterRequestIntervalMs: configuredJupiterApiKey ? jupiterRequestIntervalMs : null,
       maximumReusableJupiterQuoteAgeMs,
       maximumConsecutiveJupiterErrors,
       dailyThresholdEnabled,
@@ -513,11 +563,12 @@ async function main(): Promise<void> {
           ? "hybrid_prediction_api_at_or_above_5_usd_else_swap_v2"
           : null,
         maximumJupiterSubmissionQuoteAgeMs: liveTrade ? maximumJupiterSubmissionQuoteAgeMs : null,
-        exactJupiterBuildMinimumIntervalMs: liveTrade ? exactJupiterBuildMinimumIntervalMs : null,
+        jupiterRequestIntervalMs: liveTrade ? jupiterRequestIntervalMs : null,
         maximumEmergencyHedgeLossUsd: liveTrade ? formatUsd(maximumEmergencyHedgeLossMicroUsd) : null,
         minimumEntryEdgeUsdPerContract: formatUsd(minimumEntryEdgePerContractMicroUsd),
         minimumEntryProfitUsd: formatUsd(minimumEntryEdgeTotalMicroUsd),
         minimumExitProfitUsd: formatUsd(minimumExitProfitMicroUsd),
+        exitMode: liveTrade ? "hold_until_resolution" : null,
         maximumOpenPositions,
         maximumSlippageBps: liveTrade ? maximumSlippageBps : null,
         jupiterFillTimeoutMs: liveTrade ? jupiterFillTimeoutMs : null,
@@ -560,7 +611,7 @@ async function main(): Promise<void> {
   console.log("Candidates are not guaranteed: Polymarket settles on TWAP 60s; Jupiter Forecast settles on Chainlink spot.");
   console.log(
     `Jupiter entries use its public Degen price WebSocket; an authenticated exact order build is called only after a ` +
-    `qualified candidate, using Prediction API at $5+ and Swap V2 below $5. Open-position REST exits refresh at ${jupiterPollMs}ms. Repetitive logs are capped at ` +
+    `qualified candidate, using Prediction API at $5+ and Swap V2 below $5. Repetitive logs are capped at ` +
     `${marketLogIntervalMs}ms to ${outputPath}.`,
   );
   if (paperTrader) {
@@ -581,6 +632,7 @@ async function main(): Promise<void> {
       `$${formatUsd(maximumVenueAllocationMicroUsd)} maximum per venue/position, ` +
       `${maximumOpenPositions} concurrent positions maximum.`,
     );
+    console.warn("Automatic profit-taking exits are disabled; balanced positions are held through market resolution.");
     if (liveTestEntry) {
       console.warn(
         `ONE-SHOT TEST ENTRY ENABLED: profitability checks are bypassed for one submission attempt only. ` +
@@ -1088,6 +1140,7 @@ async function monitorDailyThresholdSet(input: {
       lastStatus = signature;
       if (status.status === "connected") console.log(`[daily] Polymarket market-set WebSocket connected`);
       if (status.status === "disconnected") {
+        latestPolymarket.clear();
         console.warn(`[daily] Polymarket market-set WebSocket disconnected: ${status.message ?? "unknown error"}`);
       }
     },
@@ -1104,26 +1157,27 @@ async function monitorDailyThresholdSet(input: {
         pair: DailyThresholdPair;
         polymarketBook: BinaryOrderBook;
         route: EvaluatedCrossVenueRoute | null;
-        openPosition: boolean;
+        needsExitBook: boolean;
       }> = [];
       for (const original of input.pairs) {
         const pair = refreshed.get(original.key) ?? original;
         const polymarketBook = latestPolymarket.get(pair.polymarket.marketId);
         if (!polymarketBook || pair.closeMs <= Date.now()) continue;
+        if (Date.now() - polymarketBook.receivedAtMs > input.configuration.maximumPolymarketAgeMs) continue;
         const pricingBook = dailyPricingBook(pair.jupiter, polymarketBook);
         const route = evaluateCrossVenueRoutes(polymarketBook, pricingBook, DAILY_THRESHOLD_ROUTES)[0] ?? null;
-        const openPosition = input.liveTrader?.hasOpenPosition(pair.key) ?? false;
-        if (route?.isFeeAdjustedCandidate || openPosition) {
+        const needsExitBook = input.liveTrader?.needsExitBook(pair.key) ?? false;
+        if (route?.isFeeAdjustedCandidate || needsExitBook) {
           screened.push({
             pair,
             polymarketBook,
             route,
-            openPosition,
+            needsExitBook,
           });
         }
       }
       screened.sort((left, right) => {
-        if (left.openPosition !== right.openPosition) return left.openPosition ? -1 : 1;
+        if (left.needsExitBook !== right.needsExitBook) return left.needsExitBook ? -1 : 1;
         return compareBigints(
           right.route?.nominalEdgeTotalMicroUsd ?? -1n,
           left.route?.nominalEdgeTotalMicroUsd ?? -1n,
@@ -1131,7 +1185,7 @@ async function monitorDailyThresholdSet(input: {
       });
       const first = screened[0];
       if (!first) continue;
-      const targets = first.openPosition ? [first] : screened.slice(0, 3);
+      const targets = first.needsExitBook ? [first] : screened.slice(0, 3);
       let selected: {
         target: (typeof screened)[number];
         pair: DailyThresholdPair;
@@ -1148,6 +1202,7 @@ async function monitorDailyThresholdSet(input: {
           verified.set(pair.key, pair);
         }
         const jupiterBook = await input.jupiterClient.getOrderBook(pair.jupiter);
+        if (Date.now() - target.polymarketBook.receivedAtMs > input.configuration.maximumPolymarketAgeMs) continue;
         const best = evaluateCrossVenueRoutes(target.polymarketBook, jupiterBook, DAILY_THRESHOLD_ROUTES)[0] ?? null;
         const sequence = input.recordSample();
         await input.writer.append({
@@ -1164,7 +1219,7 @@ async function monitorDailyThresholdSet(input: {
           bestRoute: best ? evaluatedRouteLog(best) : null,
           sharedLiquidity: true,
         });
-        if (target.openPosition || best?.isFeeAdjustedCandidate) {
+        if (target.needsExitBook || best?.isFeeAdjustedCandidate) {
           if (!selected || compareBigints(
             best?.nominalEdgeTotalMicroUsd ?? -1n,
             selected.best?.nominalEdgeTotalMicroUsd ?? -1n,
@@ -1176,7 +1231,7 @@ async function monitorDailyThresholdSet(input: {
       if (!selected) continue;
       const { target, pair, jupiterBook, best } = selected;
 
-      if (target.openPosition) {
+      if (target.needsExitBook) {
         const route = best?.route ?? DAILY_THRESHOLD_ROUTES[0]!;
         const decision = input.liveTrader
           ? await input.liveTrader.consider({
@@ -1271,7 +1326,10 @@ async function monitorQualifiedPair(input: {
   recordOpportunity: () => number;
 }): Promise<{ samples: number; opportunities: number; reason: string }> {
   const controller = new AbortController();
-  const queue = new AsyncEventQueue<PairEvent>();
+  const queue = new CoalescingAsyncQueue<PairEvent>({
+    capacity: 32,
+    coalesceKey: pairEventCoalesceKey,
+  });
   let latestPolymarket: BinaryOrderBook | null = null;
   let latestJupiter: BinaryOrderBook | null = null;
   let samples = 0;
@@ -1301,7 +1359,7 @@ async function monitorQualifiedPair(input: {
     client: input.jupiterClient,
     pair: input.pair,
     outcomes: input.routes.map((route) => route.jupiterOutcome),
-    needsExitBook: () => input.liveTrader?.hasOpenPosition(pairKey(input.pair)) ?? false,
+    needsExitBook: () => input.liveTrader?.needsExitBook(pairKey(input.pair)) ?? false,
     fallbackGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
     intervalMs: input.configuration.jupiterPollMs,
     signal: controller.signal,
@@ -1322,11 +1380,25 @@ async function monitorQualifiedPair(input: {
       if (event.type === "polymarket_status") {
         if (event.status.status === "connected") console.log(`[${input.pair.duration}] Polymarket orderbook WebSocket connected`);
         if (event.status.status === "disconnected") {
+          if (latestPolymarket) {
+            input.statusStore.updateBook(
+              input.pair.duration,
+              "polymarket",
+              bookStatus(latestPolymarket, Date.now(), true),
+            );
+          }
+          latestPolymarket = null;
           console.warn(`[${input.pair.duration}] Polymarket WebSocket disconnected: ${event.status.message ?? "unknown error"}`);
         }
         continue;
       }
       if (event.type === "jupiter_error") {
+        input.statusStore.recordEvent({
+          type: "jupiter_poll_error",
+          level: "warn",
+          duration: input.pair.duration,
+          message: `Jupiter poll error: ${event.message} (attempt ${event.consecutiveErrors})`,
+        });
         await input.writer.append({
           schemaVersion: 2,
           type: "jupiter_poll_error",
@@ -1386,13 +1458,16 @@ async function monitorQualifiedPair(input: {
         continue;
       }
       lastEvaluationAtMs = atMs;
+      const polymarketSnapshotAgeMs = Math.max(0, atMs - latestPolymarket.receivedAtMs);
+      const polymarketSnapshotStale = polymarketSnapshotAgeMs > input.configuration.maximumPolymarketAgeMs;
       const jupiterSnapshotAgeMs = atMs - latestJupiter.receivedAtMs;
       const jupiterSnapshotStale = jupiterSnapshotAgeMs > input.configuration.maximumJupiterAgeMs;
+      const marketDataStale = polymarketSnapshotStale || jupiterSnapshotStale;
       const jupiterPriceWebsocket = latestJupiter.provider === "bisonfi_price_websocket";
       const evaluated = evaluateCrossVenueRoutes(latestPolymarket, latestJupiter, input.routes);
       const best = evaluated[0] ?? null;
       const routeForIdentity = best?.route ?? input.routes[0];
-      const paperDecision = input.paperTrader && !jupiterSnapshotStale
+      const paperDecision = input.paperTrader && !marketDataStale
         ? input.paperTrader.consider({
           pair: paperPairIdentity(input.pair, best?.route.jupiterOutcome ?? "UP"),
           bestRoute: best,
@@ -1401,7 +1476,7 @@ async function monitorQualifiedPair(input: {
           atMs,
         })
         : null;
-      const liveDecision = input.liveTrader && !jupiterSnapshotStale && routeForIdentity
+      const liveDecision = input.liveTrader && !marketDataStale && routeForIdentity
         ? await input.liveTrader.consider({
           pair: livePairIdentity(input.pair, routeForIdentity),
           bestRoute: best,
@@ -1416,18 +1491,20 @@ async function monitorQualifiedPair(input: {
       if (input.liveTrader) updateLiveStrategyStatus(input.statusStore, input.liveTrader);
       input.statusStore.updateDuration(input.pair.duration, {
         phase: "monitoring",
-        message: jupiterSnapshotStale
-          ? `Books received, but the Jupiter snapshot is stale (${jupiterSnapshotAgeMs}ms). No candidate will be recorded.`
+        message: polymarketSnapshotStale
+          ? `Books received, but the Polymarket snapshot is stale (${polymarketSnapshotAgeMs}ms). No candidate will be recorded.`
+          : jupiterSnapshotStale
+            ? `Books received, but the Jupiter snapshot is stale (${jupiterSnapshotAgeMs}ms). No candidate will be recorded.`
           : input.liveTrader && best?.isFeeAdjustedCandidate
             ? liveCandidateStatusMessage(best, liveDecision)
           : input.liveTrader
-            ? "LIVE execution armed. Monitoring fee-adjusted complementary routes and real position exits."
+            ? "LIVE execution armed. Monitoring fee-adjusted complementary routes; balanced positions hold through resolution."
             : "Monitoring fee-adjusted complementary routes. No orders are submitted.",
         books: {
-          polymarket: bookStatus(latestPolymarket, atMs, false),
+          polymarket: bookStatus(latestPolymarket, atMs, polymarketSnapshotStale),
           jupiter: bookStatus(latestJupiter, atMs, jupiterSnapshotStale),
         },
-        bestRoute: best ? routeStatus(best, jupiterSnapshotStale) : null,
+        bestRoute: best ? routeStatus(best, marketDataStale) : null,
         samples,
         opportunities,
       });
@@ -1456,6 +1533,8 @@ async function monitorQualifiedPair(input: {
             polymarket: bookLog(latestPolymarket),
             jupiter: bookLog(latestJupiter),
             jupiterPriceSource: jupiterPriceWebsocket ? "degen_price_websocket" : "orderbook",
+            polymarketSnapshotAgeMs,
+            polymarketSnapshotStale,
             jupiterSnapshotAgeMs,
             jupiterSnapshotStale,
           },
@@ -1471,11 +1550,28 @@ async function monitorQualifiedPair(input: {
               ? ["JUPITER_PUBLIC_DEGEN_PRICE_WEBSOCKET_REQUIRES_ATOMIC_ORDER_PREFLIGHT"]
               : []),
             ...(jupiterSnapshotStale ? ["STALE_JUPITER_SNAPSHOT"] : []),
+            ...(polymarketSnapshotStale ? ["STALE_POLYMARKET_SNAPSHOT"] : []),
           ],
         });
-        printSample(sequence, atMs, input.pair.duration, latestPolymarket, latestJupiter, best, jupiterSnapshotAgeMs);
+        printSample(
+          sequence,
+          atMs,
+          input.pair.duration,
+          latestPolymarket,
+          latestJupiter,
+          best,
+          polymarketSnapshotAgeMs,
+          jupiterSnapshotAgeMs,
+        );
       }
       if (liveDecision?.preflight?.error) {
+        input.statusStore.recordEvent({
+          type: "preflight_failed",
+          level: "warn",
+          duration: input.pair.duration,
+          code: liveDecision.preflight.code,
+          message: liveDecision.preflight.error.message,
+        });
         await input.writer.append({
           schemaVersion: 2,
           type: "live_entry_preflight_failed",
@@ -1521,6 +1617,22 @@ async function monitorQualifiedPair(input: {
       }
       if (liveDecision?.type === "entry" || liveDecision?.type === "exit" || liveDecision?.type === "halt" ||
         liveDecision?.type === "recovery") {
+        input.statusStore.recordEvent({
+          type: liveDecision.type === "entry"
+            ? "live_entry"
+            : liveDecision.type === "exit"
+              ? "live_exit"
+              : liveDecision.type === "recovery" ? "live_recovery" : "live_halt",
+          level: liveDecision.type === "halt" ? "error" : "success",
+          duration: input.pair.duration,
+          message: liveDecision.type === "entry"
+            ? `Filled ${liveDecision.position.id} ${input.pair.duration} position (${formatContracts(liveDecision.position.originalContractsMicro)} contracts)`
+            : liveDecision.type === "exit"
+              ? `Exited ${liveDecision.positionId} (${formatUsd(liveDecision.realizedProfitMicroUsd)} profit)`
+              : liveDecision.type === "halt"
+                ? `Halted: ${liveDecision.reason}`
+                : `Recovery executed`,
+        });
         await input.writer.append({
           schemaVersion: 2,
           type: liveDecision.type === "entry"
@@ -1645,7 +1757,7 @@ async function pollJupiterOrderBook(input: {
   fallbackGrossMicroUsd: bigint;
   intervalMs: number;
   signal: AbortSignal;
-  queue: AsyncEventQueue<PairEvent>;
+  queue: CoalescingAsyncQueue<PairEvent>;
 }): Promise<void> {
   const priceState = new JupiterPredictionPriceBookState({
     upMarketId: input.pair.jupiterUp.marketId,
@@ -2297,6 +2409,7 @@ function updateLiveStrategyStatus(store: ShortWindowStatusStore, trader: ShortWi
     openPositions: snapshot.openPositions,
     awaitingResolution: snapshot.awaitingResolution,
     lastAction: snapshot.lastAction,
+    positions: snapshot.positions,
   });
 }
 
@@ -2617,6 +2730,7 @@ function printSample(
   polymarket: BinaryOrderBook,
   jupiter: BinaryOrderBook,
   best: EvaluatedCrossVenueRoute | null,
+  polymarketAgeMs: number,
   jupiterAgeMs: number,
 ): void {
   console.log(
@@ -2627,7 +2741,7 @@ function printSample(
       ? `ROUTE[${formatRoute(best.route)}] allIn=${formatUsd(best.effectiveAllInMicroUsdPerContract)} ` +
       `edge=${formatUsd(best.effectiveEdgeMicroUsdPerContract)}/contract`
       : "ROUTE[missing ask depth]") +
-    ` jupAge=${jupiterAgeMs}ms`,
+    ` polyAge=${polymarketAgeMs}ms jupAge=${jupiterAgeMs}ms`,
   );
 }
 
@@ -2687,21 +2801,10 @@ function printReferenceStatus(
   if (status.status === "disconnected") console.warn(`${label} RTDS disconnected: ${status.message ?? "unknown error"}`);
 }
 
-class AsyncEventQueue<T> {
-  readonly #items: T[] = [];
-  readonly #waiters: Array<(item: T) => void> = [];
-
-  push(item: T): void {
-    const waiter = this.#waiters.shift();
-    if (waiter) waiter(item);
-    else this.#items.push(item);
-  }
-
-  async next(): Promise<T> {
-    const item = this.#items.shift();
-    if (item !== undefined) return item;
-    return await new Promise<T>((resolveNext) => this.#waiters.push(resolveNext));
-  }
+function pairEventCoalesceKey(event: PairEvent): string | null {
+  if (event.type === "polymarket_book") return "polymarket_book";
+  if (event.type === "jupiter_book") return "jupiter_book";
+  return null;
 }
 
 class JsonlWriter {
@@ -2810,12 +2913,14 @@ Options:
   --any-complementary-route          Ignore reference direction and rank both complementary routes
   --reference-retry-ms=2000         Exact-reference retry interval
   --reference-api-timeout-ms=2000   Polymarket price-to-beat API timeout
-  --sample-interval-ms=100           Minimum interval between WebSocket-triggered strategy evaluations
+  --sample-interval-ms=50            Minimum interval between WebSocket-triggered strategy evaluations
   --market-log-interval-ms=30000     Minimum interval between repetitive snapshots/candidate records
-  --jupiter-poll-ms=1000            Jupiter REST exit refresh target while a position is open
-  --max-jupiter-age-ms=5000         Reject candidates using an older Jupiter snapshot
+  --jupiter-poll-ms=200             Jupiter REST exit refresh target while a position is open
+  --max-polymarket-age-ms=5000      Reject candidates using an older Polymarket snapshot
+  --max-jupiter-age-ms=2000         Reject candidates using an older Jupiter snapshot
+  --jupiter-request-interval-ms=110 Shared Developer-tier API interval; live builds have priority
   --max-consecutive-jupiter-errors=5 Persistent-error warning threshold; never ends a round
-  --daily-threshold-poll-ms=10000    Refresh/rank daily POLY-* ladder pricing
+  --daily-threshold-poll-ms=5000     Refresh/rank daily POLY-* ladder pricing
   --daily-threshold-discovery-refresh-ms=300000 Rebuild the subscribed daily market set
   --no-daily-threshold               Disable daily BTC-above-strike discovery
   --max-samples=0                    Stop after N synchronized samples; 0 is unlimited
@@ -2831,7 +2936,7 @@ Options:
   --check-polymarket-readiness       Read Polymarket balance/allowances, then exit without transactions
   --check-live-readiness             Read both venue balances/readiness, then exit without transactions
   --maximum-slippage-bps=100         Live per-leg price protection; maximum allowed is 500
-  --maximum-jupiter-submit-quote-age-ms=1000 Maximum signed quote age before a post-fill requote
+  --maximum-jupiter-submit-quote-age-ms=500 Maximum signed quote age before a post-fill requote
   --maximum-emergency-hedge-loss-usd=1 Maximum accepted loss when hedging an already-filled first leg
   --jupiter-fill-timeout-ms=20000    Reconcile Jupiter after signed execution submission
   --minimum-venue-balance-usd=50     Minimum real wallet balance required at each venue on startup
@@ -2841,8 +2946,20 @@ Options:
   --jupiter-quote-usd=5              Gross cap used to size websocket entry screening
   --minimum-entry-edge-usd=0.01      Nominal edge required per contract after entry fees
   --minimum-entry-profit-usd=0.10    Nominal total edge required for entry
-  --minimum-exit-profit-usd=0.10     Net green profit required to sell both legs
-  --maximum-open-positions=2         Portfolio-wide concurrent position cap
+  --minimum-exit-profit-usd=0.10     Legacy threshold; live positions hold through resolution
+  --maximum-open-positions=5         Portfolio-wide concurrent position cap
+  --web-port=3210                    Local dashboard status API port
+  --maximum-emergency-hedge-loss-usd=1 Maximum accepted loss when hedging an already-filled first leg
+  --jupiter-fill-timeout-ms=20000    Reconcile Jupiter after signed execution submission
+  --minimum-venue-balance-usd=50     Minimum real wallet balance required at each venue on startup
+  --max-venue-allocation-usd=50      Entry cap at each venue per position
+  --jupiter-minimum-order-usd=0.01   Strategy floor for direct Forecast token swaps
+  --polymarket-minimum-order-usd=1   Minimum Polymarket marketable BUY collateral
+  --jupiter-quote-usd=5              Gross cap used to size websocket entry screening
+  --minimum-entry-edge-usd=0.01      Nominal edge required per contract after entry fees
+  --minimum-entry-profit-usd=0.10    Nominal total edge required for entry
+  --minimum-exit-profit-usd=0.10     Legacy threshold; live positions hold through resolution
+  --maximum-open-positions=5         Portfolio-wide concurrent position cap
   --web-port=3210                    Local dashboard status API port
   --no-web                           Disable the local dashboard status API
   --output=${DEFAULT_OUTPUT}
@@ -2850,6 +2967,6 @@ Options:
 }
 
 main().catch((error: unknown) => {
-  console.error(errorMessage(error));
+  console.error(error instanceof Error ? error.stack || error.message : errorMessage(error));
   process.exitCode = 1;
 });

@@ -171,7 +171,7 @@ export class JupiterSwapClient {
   async #requestJson(method: "GET" | "POST", url: URL | string, body?: unknown): Promise<unknown> {
     const requestUrl = typeof url === "string" ? new URL(url) : url;
     if (this.#requestScheduler && !requestUrl.pathname.endsWith("/execute")) {
-      await this.#requestScheduler.wait();
+      await this.#requestScheduler.wait("critical");
       if (method === "POST") return await this.#http.postJson(requestUrl, body, this.#headers());
       return await this.#http.getJson(requestUrl, this.#headers());
     }

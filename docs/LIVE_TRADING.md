@@ -13,13 +13,13 @@ For each current BTC 5-minute and 15-minute round, the process:
 3. Selects the complementary route implied by the two opening references.
 4. Discovers entries from Jupiter's public Degen top-price WebSocket with a `$5` screening gross cap, then requests one exact executable build only after a candidate reaches preflight. The exact build must preserve an all-in edge of at least `$0.01` per contract and `$0.10` total after fees and price impact.
 5. Uses Jupiter Prediction `/orders` → `/execute` for native Forecast deposits of at least `$5`, matching the recommended website-style path. Smaller native Forecast legs use direct outcome-token Swap V2 because Prediction enforces a `$5` build minimum. Standard `POLY-*` prediction markets always use Prediction.
-6. Limits each leg of each position to `$50`, including modeled/quoted entry fees, and permits at most two concurrent positions.
+6. Limits each leg of each position to `$50`, including modeled/quoted entry fees, and permits at most five concurrent unsettled positions. Real wallet balances can impose a lower practical limit.
 7. Verifies Polymarket balances and approvals before exposing the Jupiter leg. The same read supplies the pre-entry token-balance snapshot, avoiding a redundant API round trip.
 8. Validates and signs the exact Jupiter build while reading the Polymarket balance and signing a protected Polymarket market FOK. The bot rejects a rounded market BUY below `$1` and signed maker/taker amounts outside Polymarket's 2/4-decimal limits. No venue submission happens during this preparation phase.
 9. Submits Polymarket first. A zero FOK fill explicitly skips Jupiter. After a Polymarket fill, the bot immediately executes the already-signed Jupiter build when it is no more than one second old and within the bounded size mismatch; otherwise it requotes and resizes from the observed fill.
 10. Once Polymarket has filled, the normal entry-profit threshold no longer applies. The second leg is exposure management: a Jupiter hedge is submitted whenever its conservative loss is within `--maximum-emergency-hedge-loss-usd` (default `$1`). Larger projected losses trigger the supported Polymarket unwind path instead of an unbounded hedge.
 11. Reconciles both venue results independently and normalizes small observed size differences by selling the excess. Rejected, pending, ambiguous, or unrecoverable exposure halts all new trading and remains durably recorded.
-12. Continuously looks for a full-size exit that remains green after both exit fees and the configured 1% per-leg price protection. Green exits are prepared first and submitted concurrently. Otherwise the bot waits for resolution and processes settlement.
+12. Holds a balanced position through market resolution. Automatic profit-taking exits are disabled; the post-resolution loop still claims or redeems winning legs and records settlement.
 
 Gas and ordinary network fees are not included in strategy P&L, as requested. They still reduce actual wallet balances.
 
@@ -28,15 +28,15 @@ Gas and ordinary network fees are not included in strategy P&L, as requested. Th
 - `--live-trade` alone is insufficient. The exact confirmation phrase `I_ACCEPT_REAL_MONEY_RISK` is also required.
 - Paper execution has been removed from the bot command; use monitor mode for a read-only run.
 - Only native Forecast outcome mints from `bisonfi` markets are accepted for Jupiter Swap V2 execution.
-- Polymarket entry and exit orders are FOK. Native market BUY entry fixes a cent-denominated collateral spend with a protected maximum price; actual share quantity is reconciled against Jupiter after both fills. A rejected FOK does not rest on the book.
-- Entry is Polymarket-first; Jupiter is pre-signed and submitted only after a positive observed Polymarket fill. Green exits remain concurrently prepared/submitted. Submission timing is written to the JSONL/state record.
+- Polymarket entry orders are FOK. Native market BUY entry fixes a cent-denominated collateral spend with a protected maximum price; actual share quantity is reconciled against Jupiter after both fills. A rejected FOK does not rest on the book.
+- Entry is Polymarket-first; Jupiter is pre-signed and submitted only after a positive observed Polymarket fill. Submission timing is written to the JSONL/state record.
 - No one-sided buy top-up is placed after a mismatch. A bounded excess sell may normalize a small fully observed difference.
-- A stale or unavailable Jupiter atomic executable quote cannot trigger an entry. Generic Jupiter orderbook asks never arm live entry; its bids are retained only for early-exit screening.
+- A stale or unavailable Jupiter atomic executable quote cannot trigger an entry. Generic Jupiter orderbook asks never arm live entry, and balanced open positions do not consume REST requests for exit screening.
 - New entries stop in the final 30 seconds of both 5m and 15m rounds.
 - State is atomically persisted with file mode `0600` before and after execution phases.
 - An ambiguous submission, unmatched second leg, or mismatched exit halts all new entries. This is intentional: the process will not guess whether money moved.
 - A terminal entry rejection automatically clears without a recovery trade only after both market-token balances are read back as zero. Structured terminal rejections can recover immediately; a persisted Jupiter terminal failure is retried read-only after the round closes and on later wallet refreshes. A zero-exposure attempt may retry the still-open pair after its short cooldown. Unknown, pending, nonzero, or identity-mismatched exposure remains halted.
-- An entry halted specifically because the two fully observed fills have different sizes automatically advances to resolution after market close. A winning Polymarket balance is redeemed and persisted without placing a catch-up trade. Known Polymarket amount-precision and market-BUY-minimum rejections can also settle an exactly observed Jupiter-only leg and clear the halt.
+- An entry halted specifically because the two fully observed fills have different sizes automatically advances to a quarantined settlement position after market close. Once no ambiguous exposure remains, the global halt clears and new entries resume while redemption/claim retries continue in the background. Known terminal one-sided fills receive the same treatment. Unknown or pending fills remain halted.
 - Entry-preflight failures write a dedicated `live_entry_preflight_failed` record with the failing stage, stable code, retry class, cooldown duration, quote reuse/age, execution path, endpoint, request ID, router/mode, per-stage latency, and nested error metadata. Backoff is per pair: 250ms for changed market conditions, 750ms for transient failures, and 2500ms for likely configuration problems. Execution diagnostics distinguish `skipped` from `rejected` and record whether Jupiter was signed/submitted, which path was used, quote age at submission, transaction signature, fills, and nested venue errors.
 - The setup command submits only Polymarket approval transactions and exits; it cannot continue into market trading.
 
@@ -178,12 +178,12 @@ The JSONL contains public market/order/transaction identifiers but no wallet sec
 | --- | ---: |
 | Minimum real wallet balance per venue at startup | `$50` |
 | Maximum allocation per venue per position | `$50` |
-| Maximum concurrent positions | `2` |
+| Maximum concurrent unsettled positions | `5` |
 | Jupiter strategy floor | `$0.01` |
 | Jupiter websocket entry-screening gross cap | `$5` |
 | Minimum entry edge per contract | `$0.01` |
 | Minimum total entry edge | `$0.10` |
-| Minimum full-exit profit | `$0.10` |
+| Exit policy | Hold through resolution; no automatic profit-taking |
 | Entry cutoff before market close | `30 seconds` |
 | Maximum live slippage per leg | `100 bps` |
 | Maximum signed Jupiter quote age at submission | `1 second` |
@@ -201,8 +201,7 @@ pnpm bot:short-window:live -- \
   --maximum-slippage-bps=50 \
   --maximum-jupiter-submit-quote-age-ms=750 \
   --maximum-emergency-hedge-loss-usd=0.50 \
-  --minimum-entry-profit-usd=0.25 \
-  --minimum-exit-profit-usd=0.20
+  --minimum-entry-profit-usd=0.25
 ```
 
 `--minimum-venue-balance-usd` is a startup readiness requirement, not fake or credited cash. All sizing uses balances read from the two real wallets.
@@ -217,7 +216,7 @@ If the dashboard or terminal says `LIVE TRADER HALTED`:
 2. Inspect both venues using the public order, position, token, and transaction IDs in the JSONL/state file.
 3. If the halt records a terminal Jupiter entry failure and zero recorded exposure, keep the same state file available. The bot will re-read both outcome-token balances after close and automatically clear the halt only when both are zero; a `live_recovery` record explains the proof used.
 4. If Polymarket filled but the Jupiter hedge exceeded the emergency loss budget or failed terminally, the bot first attempts its protected Polymarket unwind. A successful unwind clears the position and writes `live_recovery`; an unsuccessful unwind remains halted with the exact observed balance.
-5. If the halt is a fully observed entry size mismatch, the bot can wait for resolution, auto-redeem a winning Polymarket leg, and record settlement while keeping new entries halted. An exactly observed Jupiter-only leg caused by a known Polymarket rejection is also settled after resolution, then the halt is cleared.
+5. If the halt is a fully observed entry size mismatch or known terminal one-sided fill, the bot waits until market close, quarantines the position for settlement, and re-enables new entries when no ambiguous exposure remains. Redemption and claim retries continue in the background.
 6. If either venue fill remains unknown or is one-sided for any other reason, determine the exact quantity and manually neutralize it if necessary; automatic recovery and redemption will not guess.
 7. Preserve the halted state file as the audit record.
 8. After all exposure is accounted for, start with a new explicit state path, for example `--live-state=logs/live-state-after-manual-recovery.json`.

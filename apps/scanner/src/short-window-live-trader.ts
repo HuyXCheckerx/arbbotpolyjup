@@ -164,11 +164,14 @@ export interface LiveTraderState {
   positions: LivePosition[];
 }
 
+export type LiveExitMode = "hold_until_resolution" | "take_profit";
+
 export interface LiveTraderConfig {
   strategy: ShortWindowStrategyConfig;
   initialPolymarketCashMicroUsd: bigint;
   initialJupiterCashMicroUsd: bigint;
   maximumOpenPositions: number;
+  exitMode: LiveExitMode;
   maximumSlippageBps: number;
   maximumReusableJupiterQuoteAgeMs: number;
   maximumJupiterSubmissionQuoteAgeMs: number;
@@ -341,6 +344,11 @@ export class ShortWindowLiveTrader {
       this.#state.haltReason = ambiguous.lastError ??
         `Recovery required for ${ambiguous.id} in phase ${ambiguous.phase}`;
       await this.#save();
+    } else if (this.#releaseHaltWithoutBlockingExposure()) {
+      this.#lastAction = this.#state.positions.length > 0
+        ? "Known residual exposure is quarantined for settlement; new entries are re-enabled."
+        : "No managed exposure remains; live trading is re-enabled.";
+      await this.#save();
     }
   }
 
@@ -381,6 +389,9 @@ export class ShortWindowLiveTrader {
     }
     const existing = this.#state.positions.find((position) => position.pair.key === input.pair.key);
     if (existing?.phase === "open") {
+      if (this.#config.exitMode === "hold_until_resolution") {
+        return { type: "hold", reason: "HOLDING_UNTIL_RESOLUTION", position: existing };
+      }
       if (this.#busy) return { type: "skip", reason: "LIVE_EXECUTOR_BUSY" };
       return await this.#tryExit(existing, input.polymarketBook, input.jupiterBook);
     }
@@ -476,9 +487,11 @@ export class ShortWindowLiveTrader {
     );
     if (!position) return null;
     position.phase = "awaiting_resolution";
-    this.#lastAction = position.lastError
+    const released = this.#releaseHaltWithoutBlockingExposure();
+    this.#lastAction = (position.lastError
       ? `${position.pair.duration} fully observed halted exposure is awaiting venue resolution.`
-      : `${position.pair.duration} live position is awaiting venue resolution.`;
+      : `${position.pair.duration} live position is awaiting venue resolution.`) +
+      (released ? " New entries are re-enabled while settlement continues." : "");
     await this.#save();
     return position;
   }
@@ -495,6 +508,10 @@ export class ShortWindowLiveTrader {
 
   hasOpenPosition(pairKey: string): boolean {
     return this.#state.positions.some((position) => position.pair.key === pairKey && position.phase === "open");
+  }
+
+  needsExitBook(pairKey: string): boolean {
+    return this.#config.exitMode === "take_profit" && this.hasOpenPosition(pairKey);
   }
 
   updateWalletBalances(polymarketCashMicroUsd: bigint, jupiterCashMicroUsd: bigint): void {
@@ -544,12 +561,10 @@ export class ShortWindowLiveTrader {
     this.#state.realizedProfitMicroUsd += realized;
     this.#state.positions = this.#state.positions.filter((candidate) => candidate.id !== position.id);
     if (!this.#state.completedPairs.includes(position.pair.key)) this.#state.completedPairs.push(position.pair.key);
-    if (recoveredTerminalOneSidedEntry && this.#state.positions.length === 0) {
-      this.#state.halted = false;
-      this.#state.haltReason = null;
-    }
+    const released = this.#releaseHaltWithoutBlockingExposure();
     this.#lastAction = `LIVE RESOLUTION ${position.pair.duration}: realized $${formatUsd(realized)}.` +
-      (recoveredTerminalOneSidedEntry ? " Safely recovered terminal one-sided entry." : "");
+      (recoveredTerminalOneSidedEntry ? " Safely recovered terminal one-sided entry." : "") +
+      (released ? " New entries are re-enabled." : "");
     await this.#save();
     return settlement;
   }
@@ -564,6 +579,31 @@ export class ShortWindowLiveTrader {
     openPositions: number;
     awaitingResolution: number;
     lastAction: string;
+    positions: Array<{
+      id: string;
+      pairKey: string;
+      duration: string;
+      start: string;
+      end: string;
+      polymarketSlug: string;
+      polymarketMarketId: string;
+      jupiterMarketId: string;
+      phase: string;
+      polymarketOutcome: string;
+      jupiterOutcome: string;
+      polymarketContracts: string;
+      jupiterContracts: string;
+      polymarketCostUsd: string;
+      jupiterCostUsd: string;
+      totalCostUsd: string;
+      contractSkew: string;
+      isHedged: boolean;
+      polymarketSettled: boolean;
+      jupiterSettled: boolean;
+      realizedProfitUsd: string;
+      enteredAt: string;
+      lastError: string | null;
+    }>;
   } {
     return {
       mode: "live",
@@ -575,6 +615,41 @@ export class ShortWindowLiveTrader {
       openPositions: this.#state.positions.length,
       awaitingResolution: this.#state.positions.filter((position) => position.phase === "awaiting_resolution").length,
       lastAction: this.#lastAction,
+      positions: this.#state.positions.map((pos) => {
+        const polyContracts = formatContracts(pos.polymarketContractsMicro);
+        const jupContracts = formatContracts(pos.jupiterContractsMicro);
+        const polyMicro = pos.polymarketContractsMicro;
+        const jupMicro = pos.jupiterContractsMicro;
+        const diffMicro = polyMicro > jupMicro ? polyMicro - jupMicro : jupMicro - polyMicro;
+        const isHedged = diffMicro <= CONTRACT_TOLERANCE_MICRO &&
+          (pos.phase === "open" || pos.phase === "awaiting_resolution") &&
+          !pos.lastError;
+        return {
+          id: pos.id,
+          pairKey: pos.pair.key,
+          duration: pos.pair.duration,
+          start: new Date(pos.pair.startMs).toISOString(),
+          end: new Date(pos.pair.endMs).toISOString(),
+          polymarketSlug: pos.pair.polymarketSlug,
+          polymarketMarketId: pos.pair.polymarketMarketId,
+          jupiterMarketId: pos.pair.jupiterMarketId,
+          phase: pos.phase,
+          polymarketOutcome: pos.pair.polymarketOutcome,
+          jupiterOutcome: pos.pair.jupiterOutcome,
+          polymarketContracts: polyContracts,
+          jupiterContracts: jupContracts,
+          polymarketCostUsd: formatUsd(pos.polymarketEntryCostMicroUsd),
+          jupiterCostUsd: formatUsd(pos.jupiterEntryCostMicroUsd),
+          totalCostUsd: formatUsd(pos.polymarketEntryCostMicroUsd + pos.jupiterEntryCostMicroUsd),
+          contractSkew: formatContracts(diffMicro),
+          isHedged,
+          polymarketSettled: pos.polymarketSettled,
+          jupiterSettled: pos.jupiterSettled,
+          realizedProfitUsd: formatUsd(pos.realizedProfitMicroUsd),
+          enteredAt: new Date(pos.enteredAtMs).toISOString(),
+          lastError: pos.lastError,
+        };
+      }),
     };
   }
 
@@ -1759,6 +1834,17 @@ export class ShortWindowLiveTrader {
     this.#lastAction = `HALTED: ${reason}`;
     await this.#save();
     return { type: "halt", reason, position };
+  }
+
+  #releaseHaltWithoutBlockingExposure(): boolean {
+    if (!this.#state.halted) return false;
+    const blockingExposure = this.#state.positions.some((position) =>
+      position.phase !== "open" && position.phase !== "awaiting_resolution"
+    );
+    if (blockingExposure) return false;
+    this.#state.halted = false;
+    this.#state.haltReason = null;
+    return true;
   }
 
   #polymarketCash(): bigint {

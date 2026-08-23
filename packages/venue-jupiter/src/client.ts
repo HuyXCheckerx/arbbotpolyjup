@@ -2,7 +2,7 @@ import { ONE_USD_MICRO, parseContracts, parseUsd } from "../../domain/src/fixed.
 import { HttpClient } from "../../domain/src/http.ts";
 import { asArray, asNumber, asString, isRecord } from "../../domain/src/json.ts";
 import type { BinaryOrderBook, BookLevel, MarketPricing, VenueMarket } from "../../domain/src/types.ts";
-import type { JupiterRequestScheduler } from "./request-scheduler.ts";
+import type { JupiterRequestPriority, JupiterRequestScheduler } from "./request-scheduler.ts";
 
 const DEFAULT_PREDICTION_URL = "https://api.jup.ag/prediction/v1";
 
@@ -12,6 +12,7 @@ export interface JupiterClientOptions {
   http?: HttpClient;
   minRequestIntervalMs?: number;
   requestScheduler?: JupiterRequestScheduler;
+  requestPriority?: JupiterRequestPriority;
 }
 
 export interface JupiterDiscoveryOptions {
@@ -103,6 +104,7 @@ export class JupiterClient {
   readonly #http: HttpClient;
   readonly #minRequestIntervalMs: number;
   readonly #requestScheduler: JupiterRequestScheduler | undefined;
+  readonly #requestPriority: JupiterRequestPriority;
   #lastRequestAtMs = 0;
   #requestQueue: Promise<void> = Promise.resolve();
 
@@ -112,6 +114,7 @@ export class JupiterClient {
     this.#http = options.http ?? new HttpClient();
     this.#minRequestIntervalMs = options.minRequestIntervalMs ?? (this.#apiKey ? 0 : 2_100);
     this.#requestScheduler = options.requestScheduler;
+    this.#requestPriority = options.requestPriority ?? "normal";
   }
 
   async getMarkets(options: JupiterDiscoveryOptions): Promise<VenueMarket[]> {
@@ -347,7 +350,7 @@ export class JupiterClient {
     // execute endpoints are not discovery polling and must not sit behind a
     // later candidate's order-build reservation.
     if (this.#requestScheduler && !requestUrl.pathname.endsWith("/execute")) {
-      await this.#requestScheduler.wait();
+      await this.#requestScheduler.wait(this.#requestPriority);
       if (method === "POST") return await this.#http.postJson(requestUrl, body, this.#headers());
       if (method === "DELETE") return await this.#http.deleteJson(requestUrl, body, this.#headers());
       return await this.#http.getJson(requestUrl, this.#headers());

@@ -25,6 +25,7 @@ import {
   loadLiveState,
   saveLiveState,
   ShortWindowLiveTrader,
+  type LiveExitMode,
   type LiveJupiterGateway,
   type LivePairIdentity,
   type LivePolymarketGateway,
@@ -212,6 +213,54 @@ test("live trader signs a fresh exact Jupiter build before Polymarket and execut
   assert.ok(Number(trader.snapshot().realizedProfitUsd) >= 0.10);
   assert.equal(events.filter((event) => event === "polymarket:submit-buy").length, 1);
   assert.equal(events.filter((event) => event === "polymarket:submit-sell").length, 1);
+});
+
+test("resolution-only mode does not prepare or submit an automatic profit-taking exit", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-resolution-only-"));
+  const events: string[] = [];
+  const jupiter = new MockJupiter(events);
+  const polymarket = new MockPolymarket(events);
+  const trader = createTrader(
+    jupiter,
+    polymarket,
+    join(directory, "state.json"),
+    false,
+    5_000_000n,
+    "hold_until_resolution",
+  );
+  await trader.initialize();
+
+  const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
+  const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarketBook,
+    jupiterBook,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  assert.ok(route);
+  const identity = pair(route.route.polymarketOutcome, route.route.jupiterOutcome);
+  assert.equal((await trader.consider({
+    pair: identity,
+    bestRoute: route,
+    polymarketBook,
+    jupiterBook,
+    atMs: 1_000,
+  })).type, "entry");
+
+  const decision = await trader.consider({
+    pair: identity,
+    bestRoute: route,
+    polymarketBook: book("polymarket", 510_000n, 500_000n, 500_000n, 490_000n),
+    jupiterBook: book("jupiter", 460_000n, 560_000n, 450_000n, 550_000n),
+    atMs: 2_000,
+  });
+
+  assert.equal(decision.type, "hold");
+  assert.equal(decision.reason, "HOLDING_UNTIL_RESOLUTION");
+  assert.equal(trader.needsExitBook(identity.key), false);
+  assert.equal(trader.snapshot().openPositions, 1);
+  assert.equal(events.includes("jupiter:prepare-close"), false);
+  assert.equal(events.includes("polymarket:submit-sell"), false);
 });
 
 test("live trader accepts a favorable size quote above the old five-percent tolerance", async () => {
@@ -1243,6 +1292,7 @@ test("persisted killed Polymarket FOK safely moves the observed Jupiter-only leg
 
   assert.equal(trader.awaitingResolution().length, 1);
   assert.equal(trader.awaitingResolution()[0]?.phase, "awaiting_resolution");
+  assert.equal(trader.snapshot().halted, false);
 });
 
 test("persisted Jupiter 6001 safely settles the observed Polymarket-only leg and clears the halt", async () => {
@@ -1294,11 +1344,69 @@ test("persisted Jupiter 6001 safely settles the observed Polymarket-only leg and
   await trader.initialize();
 
   assert.equal(trader.awaitingResolution().length, 1);
+  assert.equal(trader.snapshot().halted, false);
   const settlement = await trader.settleAwaiting(identity.key, false, false);
   assert.equal(settlement?.realizedProfitMicroUsd, -1_562_880n);
   assert.equal(trader.snapshot().openPositions, 0);
   assert.equal(trader.snapshot().halted, false);
   assert.equal(trader.snapshot().haltReason, null);
+});
+
+test("a fully observed size mismatch releases the global halt while settlement remains quarantined", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-size-mismatch-release-"));
+  const statePath = join(directory, "state.json");
+  const identity = {
+    ...pair("UP", "DOWN"),
+    key: "15m:known-size-mismatch",
+    endMs: Date.now() - 1_000,
+  };
+  const reason = "Venue fills are size-mismatched; no one-sided buy top-up was attempted: " +
+    "Polymarket FOK sell rejected (400): order couldn't be fully filled";
+  await writeFile(statePath, JSON.stringify({
+    schemaVersion: 1,
+    sequence: 1,
+    halted: true,
+    haltReason: reason,
+    realizedProfitMicroUsd: "0n",
+    polymarketCashMicroUsd: "96500000n",
+    jupiterCashMicroUsd: "96500000n",
+    forcedEntrySubmissionAttempted: false,
+    completedPairs: [],
+    positions: [{
+      id: "live-1",
+      pair: identity,
+      phase: "exposure_error",
+      enteredAtMs: Date.now() - 60_000,
+      jupiterOrderPubkey: null,
+      jupiterPositionPubkey: "swap-v2:jup-down:down-mint",
+      jupiterContractsMicro: "6923824n",
+      polymarketContractsMicro: "7062500n",
+      jupiterEntryCostMicroUsd: "3534782n",
+      polymarketEntryCostMicroUsd: "3513382n",
+      remainingEntryCostMicroUsd: "7048164n",
+      originalContractsMicro: "0n",
+      realizedProfitMicroUsd: "0n",
+      polymarketSettled: false,
+      jupiterSettled: false,
+      polymarketSettlementPayoutMicroUsd: "0n",
+      jupiterSettlementPayoutMicroUsd: "0n",
+      entrySubmissionSkewMs: 919,
+      exitSubmissionSkewMs: null,
+      diagnosticTestEntry: false,
+      lastError: reason,
+    }],
+  }));
+  const trader = createTrader(new MockJupiter([]), new MockPolymarket([]), statePath);
+
+  await trader.initialize();
+
+  assert.equal(trader.awaitingResolution().length, 1);
+  assert.equal(trader.snapshot().halted, false);
+  assert.equal(trader.snapshot().openPositions, 1);
+  const settlement = await trader.settleAwaiting(identity.key, false, false);
+  assert.ok(settlement);
+  assert.equal(trader.snapshot().openPositions, 0);
+  assert.equal(trader.snapshot().halted, false);
 });
 
 test("ambiguous halted exposure does not enter automatic redemption", async () => {
@@ -1335,6 +1443,7 @@ test("ambiguous halted exposure does not enter automatic redemption", async () =
   const restarted = createTrader(jupiter, polymarket, statePath);
   await restarted.initialize();
   assert.equal(restarted.awaitingResolution().length, 0);
+  assert.equal(restarted.snapshot().halted, true);
   assert.equal(events.includes("polymarket:redeem"), false);
 });
 
@@ -1418,6 +1527,7 @@ function createTrader(
   statePath: string,
   forceOneEntry = false,
   jupiterMinimumGrossOrderMicroUsd = 5_000_000n,
+  exitMode: LiveExitMode = "take_profit",
 ): ShortWindowLiveTrader {
   return new ShortWindowLiveTrader({
     jupiter,
@@ -1436,6 +1546,7 @@ function createTrader(
       initialPolymarketCashMicroUsd: 100_000_000n,
       initialJupiterCashMicroUsd: 100_000_000n,
       maximumOpenPositions: 2,
+      exitMode,
       maximumSlippageBps: 100,
       maximumReusableJupiterQuoteAgeMs: 3_000,
       maximumJupiterSubmissionQuoteAgeMs: 1_000,
