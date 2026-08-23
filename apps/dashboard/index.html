@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JUPOL // ARB TERMINAL</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div class="terminal-layout">
+      <!-- Top Navigation & System Status Bar -->
+      <header class="top-nav">
+        <div class="nav-left">
+          <div class="brand">JUPOL <span class="dim">//</span> ARB ENGINE</div>
+          <span class="mode-tag" id="modeTag">INITIALIZING</span>
+          <span class="halt-tag" id="haltTag" style="display: none;">ENGINE HALTED</span>
+        </div>
+        <div class="nav-metrics">
+          <div class="metric-item">
+            <span class="m-label">REALIZED PNL</span>
+            <span class="m-val pnl-val" id="topPnl">$0.00</span>
+          </div>
+          <div class="metric-item">
+            <span class="m-label">OPEN POS</span>
+            <span class="m-val" id="topOpenPos">0</span>
+          </div>
+          <div class="metric-item">
+            <span class="m-label">POLY USDC</span>
+            <span class="m-val" id="topPolyBal">—</span>
+          </div>
+          <div class="metric-item">
+            <span class="m-label">JUP USDC</span>
+            <span class="m-val" id="topJupBal">—</span>
+          </div>
+          <div class="metric-item">
+            <span class="m-label">JUP SOL</span>
+            <span class="m-val" id="topSolBal">—</span>
+          </div>
+        </div>
+        <div class="nav-right">
+          <div class="conn-pill" id="connPill">
+            <span class="dot"></span>
+            <span id="connLabel">CONNECTING</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Main Terminal Content Grid -->
+      <main class="terminal-body">
+
+        <!-- Left Column: Active Positions & Market Monitoring -->
+        <div class="body-col main-col">
+
+          <!-- POSITIONS SECTION -->
+          <section class="panel">
+            <div class="panel-header">
+              <div class="panel-title">
+                <span>ACTIVE POSITIONS</span>
+                <span class="count-badge" id="posCount">0</span>
+              </div>
+              <div class="panel-meta" id="resolutionMeta">0 awaiting settlement</div>
+            </div>
+
+            <div class="positions-container" id="positionsList">
+              <div class="empty-state" id="noPositions">NO ACTIVE EXPOSURE — ENGINE SCANNING FOR OPPORTUNITIES</div>
+            </div>
+          </section>
+
+          <!-- MARKETS SCANNER SECTION (5m & 15m) -->
+          <section class="panel">
+            <div class="panel-header">
+              <div class="panel-title">MARKET PAIRS MONITOR</div>
+              <div class="panel-meta">MAX REF DIFF LIMIT: $30.00</div>
+            </div>
+
+            <div class="markets-row">
+              <!-- 5M Market -->
+              <div class="market-box" id="box5m">
+                <div class="box-head">
+                  <div class="box-tag">BTC 5-MIN</div>
+                  <span class="phase-chip" id="phase5m">DISCOVERING</span>
+                </div>
+                <div class="box-sub" id="msg5m">Initializing...</div>
+
+                <!-- Reference Price Comparison -->
+                <div class="ref-grid">
+                  <div class="ref-cell">
+                    <span class="cell-label">POLY REF (TWAP)</span>
+                    <span class="cell-val" id="polyRef5m">—</span>
+                  </div>
+                  <div class="ref-cell center">
+                    <span class="cell-label">DIFF</span>
+                    <span class="cell-val" id="diff5m">—</span>
+                  </div>
+                  <div class="ref-cell right">
+                    <span class="cell-label">JUP REF (SPOT)</span>
+                    <span class="cell-val" id="jupRef5m">—</span>
+                  </div>
+                </div>
+
+                <!-- Top Orderbooks -->
+                <div class="books-table">
+                  <div class="book-row head">
+                    <span>VENUE</span>
+                    <span>UP ASK</span>
+                    <span>DOWN ASK</span>
+                  </div>
+                  <div class="book-row">
+                    <span class="venue-name">POLY</span>
+                    <span id="polyUp5m">—</span>
+                    <span id="polyDown5m">—</span>
+                  </div>
+                  <div class="book-row">
+                    <span class="venue-name">JUP</span>
+                    <span id="jupUp5m">—</span>
+                    <span id="jupDown5m">—</span>
+                  </div>
+                </div>
+
+                <!-- Route Edge -->
+                <div class="edge-banner" id="edgeBox5m">
+                  <div class="edge-line">
+                    <span class="route-target" id="routeLabel5m">NO QUALIFIED ROUTE</span>
+                    <span class="edge-profit" id="routeEdge5m">—</span>
+                  </div>
+                  <div class="edge-details" id="routeDetails5m">All-in: — | Depth: —</div>
+                </div>
+              </div>
+
+              <!-- 15M Market -->
+              <div class="market-box" id="box15m">
+                <div class="box-head">
+                  <div class="box-tag">BTC 15-MIN</div>
+                  <span class="phase-chip" id="phase15m">DISCOVERING</span>
+                </div>
+                <div class="box-sub" id="msg15m">Initializing...</div>
+
+                <!-- Reference Price Comparison -->
+                <div class="ref-grid">
+                  <div class="ref-cell">
+                    <span class="cell-label">POLY REF (TWAP)</span>
+                    <span class="cell-val" id="polyRef15m">—</span>
+                  </div>
+                  <div class="ref-cell center">
+                    <span class="cell-label">DIFF</span>
+                    <span class="cell-val" id="diff15m">—</span>
+                  </div>
+                  <div class="ref-cell right">
+                    <span class="cell-label">JUP REF (SPOT)</span>
+                    <span class="cell-val" id="jupRef15m">—</span>
+                  </div>
+                </div>
+
+                <!-- Top Orderbooks -->
+                <div class="books-table">
+                  <div class="book-row head">
+                    <span>VENUE</span>
+                    <span>UP ASK</span>
+                    <span>DOWN ASK</span>
+                  </div>
+                  <div class="book-row">
+                    <span class="venue-name">POLY</span>
+                    <span id="polyUp15m">—</span>
+                    <span id="polyDown15m">—</span>
+                  </div>
+                  <div class="book-row">
+                    <span class="venue-name">JUP</span>
+                    <span id="jupUp15m">—</span>
+                    <span id="jupDown15m">—</span>
+                  </div>
+                </div>
+
+                <!-- Route Edge -->
+                <div class="edge-banner" id="edgeBox15m">
+                  <div class="edge-line">
+                    <span class="route-target" id="routeLabel15m">NO QUALIFIED ROUTE</span>
+                    <span class="edge-profit" id="routeEdge15m">—</span>
+                  </div>
+                  <div class="edge-details" id="routeDetails15m">All-in: — | Depth: —</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+        </div>
+
+        <!-- Right Column: Live Feed Health & Event Log / Errors -->
+        <div class="body-col side-col">
+
+          <!-- FEEDS STATUS -->
+          <section class="panel">
+            <div class="panel-header">
+              <div class="panel-title">REAL-TIME FEEDS</div>
+            </div>
+            <div class="feed-list">
+              <div class="feed-row">
+                <div class="feed-name">
+                  <span class="dot-sm" id="polyFeedDot"></span>
+                  <span>Poly TWAP 60s RTDS</span>
+                </div>
+                <div class="feed-stat" id="polyFeedStatus">DISCONNECTED</div>
+              </div>
+              <div class="feed-row">
+                <div class="feed-name">
+                  <span class="dot-sm" id="jupFeedDot"></span>
+                  <span>Jupiter Spot RTDS</span>
+                </div>
+                <div class="feed-stat" id="jupFeedStatus">DISCONNECTED</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ENGINE EVENTS & ERROR STREAM -->
+          <section class="panel fill-flex">
+            <div class="panel-header">
+              <div class="panel-title">
+                <span>DIAGNOSTICS & EVENTS</span>
+                <span class="count-badge" id="eventCount">0</span>
+              </div>
+              <div class="filter-group">
+                <button class="filter-btn active" data-filter="all">ALL</button>
+                <button class="filter-btn" data-filter="warn">WARNS</button>
+                <button class="filter-btn" data-filter="error">ERRORS</button>
+              </div>
+            </div>
+
+            <div class="events-scroll" id="eventsContainer">
+              <div class="empty-state">Waiting for engine logs...</div>
+            </div>
+          </section>
+
+        </div>
+
+      </main>
+
+      <!-- Footer Bar with Last Engine Action -->
+      <footer class="footer-bar">
+        <div class="foot-label">LAST ACTION:</div>
+        <div class="foot-text" id="lastActionText">Engine initializing...</div>
+        <div class="foot-time" id="lastActionTime">—</div>
+      </footer>
+    </div>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

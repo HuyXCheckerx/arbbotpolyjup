@@ -1,0 +1,17 @@
+{
+  "name": "jupol-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 3000 --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.4.14"
+  },
+  "dependencies": {
+    "jupol": "file:../.."
+  }
+}
