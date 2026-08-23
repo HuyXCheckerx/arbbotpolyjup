@@ -1,0 +1,205 @@
+# BTC Polymarket / Jupiter Forecast short-window monitor
+
+This read-only scanner runs two separate cross-venue comparisons:
+
+- Polymarket BTC 5-minute Up/Down versus native Jupiter Forecast BTC 5-minute Up/Down.
+- Polymarket BTC 15-minute Up/Down versus native Jupiter Forecast BTC 15-minute Up/Down.
+
+It never pairs a 5-minute market with a 15-minute market. Every pair must have the same scheduled start and end timestamps.
+
+## Pair qualification
+
+For each duration, the scanner discovers:
+
+- Polymarket slug `btc-updown-<duration>-<start epoch>`;
+- Jupiter events from `provider=bisonfi`, not Jupiter's mirrored Polymarket provider;
+- Jupiter's native `BISON-...-UP` and `BISON-...-DOWN` outcome markets.
+
+It records the exact Polymarket TWAP opening reference and exact Jupiter Chainlink spot opening reference. Monitoring begins only when:
+
+```text
+abs(Polymarket reference - Jupiter reference) < $20
+```
+
+The comparison is strict: exactly `$20.00` is rejected.
+
+The reference ordering selects the complementary route:
+
+| Opening references | Route evaluated |
+| --- | --- |
+| Polymarket lower | Buy Polymarket Up + Jupiter Down |
+| Polymarket higher | Buy Polymarket Down + Jupiter Up |
+| Equal | Evaluate both directions |
+
+## Important oracle-basis warning
+
+These are not guaranteed arbitrages. The markets share the same start and end times, but their closing observations differ:
+
+- Polymarket: Chainlink BTC/USD TWAP 60-second stream.
+- Jupiter Forecast: Chainlink BTC/USD spot data stream.
+
+The two closing values can land on opposite sides of their respective references, including a state where both purchased outcomes lose. Every qualification, sample, and opportunity record therefore includes `NOT_GUARANTEED_ORACLE_BASIS` and `guaranteed: false`.
+
+## Books and fees
+
+Polymarket top-of-book changes arrive over its market WebSocket. Jupiter entry prices arrive from the public price WebSocket used by the Degen UI; each duration subscribes to its selected Bison UP/DOWN market IDs in one connection. The socket is used only for ask discovery and does not consume authenticated Swap `/order` quota. Because it exposes top prices rather than executable depth, the scanner caps synthetic Jupiter screening depth to `--jupiter-quote-usd` and applies the documented prediction fee estimate. When a live candidate reaches preflight, the bot requests a fresh unsigned Swap V2 build for the exact Forecast `outcomeMint`, rechecks all-in profitability and slippage, and prepares a protected native Polymarket market FOK. Strategy sizing and exact-quote preflight both require rounded Polymarket market-BUY collateral of at least `$1`; invalid maker/taker precision is rejected before submission. Once a position is open, the bot polls Jupiter's REST orderbook for executable exit bids because it never treats websocket bid prices as depth.
+
+Entry-preflight backoff is isolated per round. A market-change rejection waits 250ms, a transient venue/network failure waits 750ms, and a likely configuration/readiness error waits 2500ms. A failure on the 5m pair therefore cannot suppress the 15m pair. Cooldown decisions state the affected pair, remaining time, previous stage, and stable error code.
+
+Without `JUPITER_API_KEY`, Jupiter requests are serialized to respect the keyless rate limit; because 5m and 15m are both active, each duration may refresh less often than the configured target.
+
+The scanner evaluates the smaller size available at the two selected top asks and includes:
+
+- Polymarket crypto taker fee: `0.07 × price × (1-price)`, with the documented per-contract rounding.
+- Jupiter generic-orderbook taker-fee estimate: `contracts × 0.07 × price × (1-price)`, rounded up to the nearest cent per order.
+- Jupiter live Swap V2 quote: the effective ask is `input USDC / output outcome-token units`. The returned amounts already include Swap V2's platform fee and price impact, so the scanner does not add a second prediction-market fee.
+
+An `arb_opportunity` record is written only when the nominal complementary payout exceeds the fee-adjusted asks and the Jupiter websocket snapshot is fresh. In live mode, that indicative candidate cannot be submitted until a fresh atomic Swap `/order` preflight confirms the exact executable size and price. The record remains a non-guaranteed candidate because of oracle basis and non-atomic cross-chain execution.
+
+## Run
+
+```bash
+cd /Users/perycent/Downloads/Jupol
+pnpm install
+pnpm check
+pnpm monitor:short-window
+```
+
+To run the explicitly gated real-money strategy:
+
+```bash
+pnpm bot:short-window
+```
+
+This is not a paper command. It can submit real orders after the required wallet checks and confirmation phrase. Complete [the live-trading runbook](LIVE_TRADING.md) before using it. Use `pnpm monitor:short-window` when you only want read-only market monitoring.
+
+Press `Ctrl-C` once for a graceful stop.
+
+The scanner also starts a local read-only status API at:
+
+```text
+http://127.0.0.1:3210/api/status
+```
+
+In a second terminal, start the dashboard:
+
+```bash
+cd /Users/perycent/Downloads/Jupol
+pnpm dashboard:dev
+```
+
+Then open `http://localhost:3000`. The dashboard makes a missed startup boundary explicit, shows the next boundary countdown, and displays books and the best fee-adjusted route after qualification.
+
+The append-only log is:
+
+```text
+/Users/perycent/Downloads/Jupol/logs/btc-poly-jup-short-window-arb.jsonl
+```
+
+Start the scanner before a new 5m/15m boundary when possible. It maintains two exact Chainlink streams:
+
+- TWAP 60s for Polymarket's opening reference;
+- spot Chainlink BTC/USD for Jupiter Forecast's opening reference.
+
+The Polymarket and Jupiter website price-to-beat endpoints are also tried as fallbacks. The Jupiter fallback supplies the round event ID and exact opening timestamp, and the scanner rejects any response whose returned timestamp differs. If either exact reference is unavailable, the scanner skips the round instead of substituting a nearby tick.
+
+If the scanner starts mid-round, `RTDS connected` only means new observations are flowing. The scanner now queries both venues' website price-to-beat services to backfill the exact opening references; it falls back to waiting for the next boundary only when an exact timestamp-validated response is unavailable.
+
+The scanner also requires continuing valid observations after a WebSocket opens. If either RTDS socket remains connected but stops delivering its subscribed BTC feed for six seconds, the scanner marks it stale, closes it, and reconnects. The dashboard shows the age of the last valid TWAP and spot observations beside each feed.
+
+## Options
+
+```bash
+pnpm monitor:short-window -- --help
+```
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--max-reference-difference-usd` | `30` | Strict opening-reference difference limit |
+| `--reference-retry-ms` | `2000` | Retry interval while references are unavailable |
+| `--reference-api-timeout-ms` | `2000` | Polymarket web reference timeout |
+| `--sample-interval-ms` | `100` | Minimum interval between WebSocket-triggered route evaluations; execution remains responsive at this cadence |
+| `--market-log-interval-ms` | `5000` | Minimum interval per duration between repetitive `book_sample` and changed `arb_opportunity` records |
+| `--jupiter-poll-ms` | `1000` | REST orderbook refresh target only while a live position needs exit screening |
+| `--max-jupiter-age-ms` | `5000` | Maximum Jupiter snapshot age for candidate logging |
+| `--max-consecutive-jupiter-errors` | `5` | Persistent-error warning threshold; the pair remains active with exponential backoff |
+| `--max-samples` | `0` | Stop after N synchronized samples; zero is unlimited |
+| `--max-opportunities` | `0` | Stop after N distinct candidate records; zero is unlimited |
+| `--once` | off | Stop after the first synchronized sample across either duration |
+| `--live-trade` | off | Enable explicitly confirmed real-money execution |
+| `--confirm-live-trading` | none | Exact required real-money confirmation phrase |
+| `--live-state` | `logs/btc-poly-jup-short-window-live-state.json` | Durable live execution/exposure state |
+| `--setup-trading-approvals` | off | Submit Polymarket approvals and exit without market orders |
+| `--maximum-slippage-bps` | `100` | Live per-leg price protection |
+| `--jupiter-fill-timeout-ms` | `20000` | Jupiter execution reconciliation timeout |
+| `--minimum-venue-balance-usd` | `50` | Minimum real wallet balance required at each venue on startup |
+| `--max-venue-allocation-usd` | `50` | Maximum entry cost at each venue per position |
+| `--jupiter-minimum-order-usd` | `0.01` | Strategy floor for the direct Forecast token swap; this is not a Jupiter Prediction minimum |
+| `--polymarket-minimum-order-usd` | `1` | Minimum collateral for a marketable Polymarket BUY; sizing scales cheap legs up to this floor |
+| `--jupiter-quote-usd` | `5` | Gross cap used to synthesize entry-screening depth from Degen top prices |
+| `--minimum-entry-edge-usd` | `0.01` | Minimum nominal entry edge per contract after entry fees |
+| `--minimum-entry-profit-usd` | `0.10` | Minimum nominal total entry edge |
+| `--minimum-exit-profit-usd` | `0.10` | Minimum net profit for a full two-leg early exit |
+| `--maximum-open-positions` | `2` | Portfolio-wide concurrent position cap |
+| `--web-port` | `3210` | Local dashboard status API port |
+| `--no-web` | off | Disable the local dashboard status API |
+| `--output` | `logs/btc-poly-jup-short-window-arb.jsonl` | Append-only JSONL path |
+
+Short-window entry discovery uses the same public top-price WebSocket as Jupiter's Degen UI. It subscribes to the selected Bison UP/DOWN market IDs in one connection and does not call authenticated Swap `/order` while merely watching prices. A candidate must still pass a fresh atomic Swap V2 build before the bot prepares or submits the Polymarket leg. While a position is open, the bot switches to Jupiter's REST orderbook for exit bids because the top-price socket does not expose executable depth.
+
+The Degen price service is a public frontend dependency but is not part of Jupiter's documented Prediction API contract. The stream reconnects with exponential backoff after errors or 30 seconds without messages. If Jupiter moves the service before this beta stabilizes, override it with `JUPITER_PREDICTION_PRICE_WEBSOCKET_URL` while updating the integration.
+
+## Examine the log
+
+Watch fee-adjusted candidates:
+
+```bash
+tail -f logs/btc-poly-jup-short-window-arb.jsonl | \
+  jq --unbuffered -c 'select(.type == "arb_opportunity") | {
+    time: .detectedAt,
+    duration,
+    guaranteed,
+    references,
+    route,
+    warnings
+  }'
+```
+
+Summarize a completed log:
+
+```bash
+jq -s '{
+  qualifiedPairs: map(select(.type == "pair_qualified")) | length,
+  rejectedPairs: map(select(.type == "pair_rejected")) | length,
+  opportunities: map(select(.type == "arb_opportunity")) | length,
+  errors: map(select(.type == "pair_error")) | length
+}' logs/btc-poly-jup-short-window-arb.jsonl
+```
+
+## Record types
+
+| Type | Meaning |
+| --- | --- |
+| `session_start` / `session_end` | Configuration and totals |
+| `pair_discovered` | Same-duration native Jupiter and Polymarket records passed identity checks |
+| `pair_qualified` | Exact opening references were strictly less than the limit apart |
+| `pair_rejected` | Opening references were too far apart |
+| `book_sample` | Periodic synchronized top asks, sizes, fee evaluation, freshness, and basis warnings; also emitted immediately for material trading decisions |
+| `arb_opportunity` | Rate-limited fee-adjusted non-guaranteed candidate update |
+| `jupiter_poll_error` | Jupiter REST refresh failed |
+| `pair_error` | Discovery or exact-reference data was unavailable |
+| `pair_end` | Market closed, error limit was reached, or the session stopped |
+| `live_entry` / `live_exit` | Confirmed real-money entry or green exit; entries include preflight and per-venue execution diagnostics |
+| `live_entry_preflight_failed` | Structured preflight stage, stable code, retry class, cooldown, per-stage timings, quote inputs/results, router/mode, and nested error details |
+| `live_recovery` | Read-only balance reconciliation proved a terminal entry failure left zero exposure; no recovery trade was submitted |
+| `live_halt` | Execution became ambiguous; new entries stopped, with independent Jupiter/Polymarket result, fill, transaction/order, and nested-error fields |
+| `live_position_awaiting_resolution` / `live_settlement` | Resolution fallback and automatic Forecast/Polymarket redemption accounting, including fully observed halted mismatches |
+
+References:
+
+- Jupiter Forecast: <https://developers.jup.ag/docs/prediction/forecast.md>
+- Jupiter Swap V2 order and execute: <https://developers.jup.ag/docs/swap/order-and-execute>
+- Jupiter prediction markets and fees: <https://developers.jup.ag/docs/prediction>
+- Polymarket Chainlink TWAP: <https://docs.polymarket.com/market-data/chainlink-twap>
+- Polymarket market WebSocket: <https://docs.polymarket.com/api-reference/wss/market>
+- Polymarket fees: <https://docs.polymarket.com/trading/fees>

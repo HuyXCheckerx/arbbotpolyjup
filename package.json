@@ -1,0 +1,37 @@
+{
+  "name": "jupol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "scan": "node apps/scanner/src/cli.ts",
+    "book": "node apps/scanner/src/book-cli.ts",
+    "monitor:btc-aug21": "node apps/scanner/src/btc-aug21-monitor.ts",
+    "monitor:short-window": "node apps/scanner/src/btc-short-window-monitor.ts",
+    "monitor:short-window:any-route": "node apps/scanner/src/btc-short-window-monitor.ts --any-complementary-route --output=logs/btc-poly-jup-short-window-any-route.jsonl",
+    "bot:short-window": "node --env-file-if-exists=.env apps/scanner/src/btc-short-window-monitor.ts --live-trade --max-reference-difference-usd=30",
+    "bot:short-window:live": "node --env-file-if-exists=.env apps/scanner/src/btc-short-window-monitor.ts --live-trade --max-reference-difference-usd=30",
+    "bot:short-window:any-route": "node --env-file-if-exists=.env apps/scanner/src/btc-short-window-monitor.ts --live-trade --any-complementary-route --max-reference-difference-usd=30 --output=logs/btc-poly-jup-short-window-any-route.jsonl",
+    "check:live:readiness": "node --env-file-if-exists=.env apps/scanner/src/btc-short-window-monitor.ts --live-trade --check-live-readiness",
+    "check:polymarket:live": "node --env-file-if-exists=.env apps/scanner/src/btc-short-window-monitor.ts --live-trade --check-polymarket-readiness",
+    "setup:polymarket:live": "node --env-file-if-exists=.env apps/scanner/src/btc-short-window-monitor.ts --live-trade --setup-trading-approvals",
+    "dashboard:dev": "npm --prefix apps/dashboard run dev",
+    "dashboard:build": "npm --prefix apps/dashboard run build",
+    "test": "node --test packages/*/test/*.test.ts apps/scanner/test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@polymarket/client": "0.6.0",
+    "@solana/web3.js": "1.98.4",
+    "bs58": "6.0.0",
+    "viem": "^2.55.19"
+  }
+}
