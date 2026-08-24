@@ -28,6 +28,9 @@ export interface JupiterDiscoveryOptions {
 }
 
 export interface JupiterPredictionOrderBuild {
+  /** Client-side execution metadata. Forecast builds carry the token whose
+   * on-chain balance delta is the authoritative filled contract quantity. */
+  outcomeMint?: string | null;
   transaction: string;
   txMeta: { blockhash: string; lastValidBlockHeight: number };
   externalOrderId: string | null;
@@ -73,6 +76,9 @@ export interface JupiterPredictionOrderStatus {
   averageFillPriceMicroUsd: bigint;
   sizeMicroUsd: bigint;
   settled: boolean;
+  /** Distinguishes an API/quote-derived status from a confirmed chain delta. */
+  reconciliationSource?: "prediction_api" | "swap_execute" | "onchain_token_deltas";
+  quotedContractsMicro?: bigint;
 }
 
 export interface JupiterPredictionPosition {

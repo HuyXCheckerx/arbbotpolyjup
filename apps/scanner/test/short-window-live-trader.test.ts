@@ -37,6 +37,7 @@ test("live state saves serialize concurrent atomic replacements", async () => {
   const statePath = join(directory, "state.json");
   const state = (sequence: number): LiveTraderState => ({
     schemaVersion: 1,
+    accountingVersion: 2,
     sequence,
     halted: false,
     haltReason: null,
@@ -63,6 +64,7 @@ test("live trader replaces persisted cash with real wallet balances and accepts 
   const statePath = join(directory, "state.json");
   const persisted = {
     schemaVersion: 1,
+    accountingVersion: 2,
     sequence: 0,
     halted: false,
     haltReason: null,
@@ -83,6 +85,33 @@ test("live trader replaces persisted cash with real wallet balances and accepts 
   trader.updateWalletBalances(59_984_632n, 51_825_334n);
   assert.equal(trader.snapshot().polymarketCashUsd, "59.984632");
   assert.equal(trader.snapshot().jupiterCashUsd, "51.825334");
+});
+
+test("startup archives legacy quote-derived P&L and starts verified accounting at zero", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-accounting-migration-"));
+  const statePath = join(directory, "state.json");
+  await writeFile(statePath, JSON.stringify({
+    schemaVersion: 1,
+    sequence: 22,
+    halted: false,
+    haltReason: null,
+    realizedProfitMicroUsd: "11502350n",
+    polymarketCashMicroUsd: "74840000n",
+    jupiterCashMicroUsd: "100030391n",
+    forcedEntrySubmissionAttempted: false,
+    completedPairs: [],
+    positions: [],
+  }));
+  const trader = createTrader(new MockJupiter([]), new MockPolymarket([]), statePath);
+
+  await trader.initialize();
+
+  assert.equal(trader.snapshot().realizedProfitUsd, "0");
+  assert.equal(trader.snapshot().legacyUnverifiedRealizedProfitUsd, "11.50235");
+  const migrated = await loadLiveState(statePath);
+  assert.equal(migrated.accountingVersion, 2);
+  assert.equal(migrated.realizedProfitMicroUsd, 0n);
+  assert.equal(migrated.legacyUnverifiedRealizedProfitMicroUsd, 11_502_350n);
 });
 
 test("live trader uses a 30-second entry cutoff for both durations", async () => {
@@ -1011,7 +1040,7 @@ test("a transient post-fill Jupiter 429 is retried before unwinding Polymarket",
   assert.equal(trader.snapshot().halted, false);
 });
 
-test("a filled Polymarket leg is hedged when the fresh Jupiter edge is positive but below entry minimums", async () => {
+test("a filled Polymarket leg is hedged but quarantined when actual payoff misses entry minimums", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-emergency-positive-hedge-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -1037,15 +1066,16 @@ test("a filled Polymarket leg is hedged when the fresh Jupiter edge is positive 
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "entry");
+  assert.equal(decision.type, "halt");
   assert.equal(decision.execution?.jupiter.submissionAttempted, true);
   assert.equal(decision.execution?.jupiter.result, "fulfilled");
   assert.equal(decision.execution?.jupiter.usedPreflightBuild, false);
   assert.equal(events.includes("jupiter:submit"), true);
-  assert.equal(trader.snapshot().halted, false);
+  assert.equal(trader.snapshot().halted, true);
+  assert.match(trader.snapshot().haltReason ?? "", /actual Poly-win P&L/);
 });
 
-test("a post-fill Jupiter hedge beyond the base loss budget is submitted when it reduces naked stake risk", async () => {
+test("an emergency Jupiter hedge is submitted but never reported as a profitable arb", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-emergency-loss-cap-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -1080,12 +1110,12 @@ test("a post-fill Jupiter hedge beyond the base loss budget is submitted when it
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "entry");
+  assert.equal(decision.type, "halt");
   assert.equal(decision.execution?.jupiter.submissionAttempted, true);
   assert.equal(decision.execution?.jupiter.result, "fulfilled");
   assert.equal(events.includes("jupiter:submit"), true);
   assert.equal(events.includes("polymarket:submit-sell"), false);
-  assert.equal(trader.snapshot().halted, false);
+  assert.equal(trader.snapshot().halted, true);
 });
 
 test("terminal entry failure remains halted when balance reconciliation finds exposure", async () => {
@@ -1304,6 +1334,7 @@ test("startup retries a failed Polymarket-only unwind after the bought balance b
     "allowance: the balance is not enough → balance: 0, order amount: 8310000";
   await writeFile(statePath, JSON.stringify({
     schemaVersion: 1,
+    accountingVersion: 2,
     sequence: 19,
     halted: true,
     haltReason: reason,
@@ -1397,7 +1428,7 @@ test("a larger-than-quoted Jupiter execution retains the excess outcome tokens",
   assert.equal(events.includes("polymarket:submit-sell"), false);
 });
 
-test("a smaller-than-quoted Jupiter execution retains the Polymarket excess", async () => {
+test("a smaller-than-quoted Jupiter execution is quarantined from successful arbs", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-polymarket-excess-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -1422,13 +1453,16 @@ test("a smaller-than-quoted Jupiter execution retains the Polymarket excess", as
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "entry");
+  assert.equal(decision.type, "halt");
+  assert.ok(decision.position);
   assert.equal(events.filter((event) => event === "polymarket:submit-sell").length, 0);
   assert.equal(
     absoluteForTest(decision.position.polymarketContractsMicro - decision.position.jupiterContractsMicro) > 10_000n,
     true,
   );
-  assert.equal(trader.snapshot().halted, false);
+  assert.equal(decision.position?.jupiterQuotedContractsMicro !== undefined, true);
+  assert.equal(trader.snapshot().halted, true);
+  assert.ok(Number(trader.snapshot().positions[0]?.jupiterWinPnlUsd) < 0);
 });
 
 test("a Polymarket precision rejection never submits the Jupiter leg", async () => {
@@ -1512,6 +1546,7 @@ test("persisted killed Polymarket FOK safely moves the observed Jupiter-only leg
   };
   const persisted = {
     schemaVersion: 1,
+    accountingVersion: 2,
     sequence: 1,
     halted: true,
     haltReason: "Polymarket concurrent-entry response was ambiguous: Polymarket FOK buy rejected (400): order couldn't be fully filled. FOK orders are fully filled or killed.",
@@ -1566,6 +1601,7 @@ test("persisted Jupiter 6001 safely settles the observed Polymarket-only leg and
     "Jupiter Forecast Swap execution failed (6001): Slippage tolerance exceeded";
   await writeFile(statePath, JSON.stringify({
     schemaVersion: 1,
+    accountingVersion: 2,
     sequence: 1,
     halted: true,
     haltReason: reason,
@@ -1623,6 +1659,7 @@ test("a fully observed size mismatch releases the global halt while settlement r
     "Polymarket FOK sell rejected (400): order couldn't be fully filled";
   await writeFile(statePath, JSON.stringify({
     schemaVersion: 1,
+    accountingVersion: 2,
     sequence: 1,
     halted: true,
     haltReason: reason,
@@ -1668,7 +1705,7 @@ test("a fully observed size mismatch releases the global halt while settlement r
   assert.equal(trader.snapshot().halted, false);
 });
 
-test("startup retains a pre-close legacy size mismatch as an open position", async () => {
+test("startup keeps a negative-payoff legacy size mismatch quarantined", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-size-mismatch-retain-"));
   const statePath = join(directory, "state.json");
   const identity = {
@@ -1680,6 +1717,7 @@ test("startup retains a pre-close legacy size mismatch as an open position", asy
     "Jupiter Prediction API does not support partial position closes";
   await writeFile(statePath, JSON.stringify({
     schemaVersion: 1,
+    accountingVersion: 2,
     sequence: 4,
     halted: true,
     haltReason: reason,
@@ -1718,10 +1756,9 @@ test("startup retains a pre-close legacy size mismatch as an open position", asy
   await trader.initialize();
 
   const retained = (await loadLiveState(statePath)).positions[0];
-  assert.equal(retained?.phase, "open");
-  assert.equal(retained?.lastError, null);
-  assert.equal(retained?.originalContractsMicro, 7_964_284n);
-  assert.equal(trader.snapshot().halted, false);
+  assert.equal(retained?.phase, "exposure_error");
+  assert.equal(retained?.lastError, reason);
+  assert.equal(trader.snapshot().halted, true);
   const hold = await trader.consider({
     pair: identity,
     bestRoute: null,
@@ -1730,7 +1767,7 @@ test("startup retains a pre-close legacy size mismatch as an open position", asy
     atMs: Date.now(),
   });
   assert.equal(hold.type, "hold");
-  assert.equal(hold.reason, "VENUE_SIZE_MISMATCH_HELD_TO_RESOLUTION");
+  assert.equal(hold.reason, reason);
   assert.deepEqual(events, []);
 });
 
@@ -1801,8 +1838,46 @@ test("live trader persists and claims both winning legs after resolution", async
   assert.ok(settlement);
   assert.equal(events.includes("polymarket:redeem"), true);
   assert.equal(events.includes("jupiter:claim"), true);
+  assert.equal(events.includes("jupiter:reclaim-rent"), true);
   assert.equal(trader.snapshot().openPositions, 0);
   assert.ok(settlement.realizedProfitMicroUsd > 0n);
+});
+
+test("Forecast settlement books the verified USDC credit and reclaims token-account rent", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-verified-settlement-"));
+  const events: string[] = [];
+  const jupiter = new MockJupiter(events);
+  jupiter.claimPayoutMicroUsd = 7_123_456n;
+  const polymarket = new MockPolymarket(events);
+  const trader = createTrader(jupiter, polymarket, join(directory, "state.json"));
+  await trader.initialize();
+  const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
+  const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarketBook,
+    jupiterBook,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  assert.ok(route);
+  const identity = pair(route.route.polymarketOutcome, route.route.jupiterOutcome);
+  assert.equal((await trader.consider({
+    pair: identity,
+    bestRoute: route,
+    polymarketBook,
+    jupiterBook,
+    atMs: 1_000,
+  })).type, "entry");
+  assert.ok(await trader.markPairEnded(identity.key));
+
+  const settlement = await trader.settleAwaiting(identity.key, false, true);
+
+  assert.equal(settlement?.jupiterPayoutMicroUsd, 7_123_456n);
+  assert.equal(settlement?.jupiterSettlementTransactionSignature, "claim-signature");
+  assert.deepEqual(settlement?.jupiterRentReclaimTransactionSignatures, ["rent-signature"]);
+  assert.equal(settlement?.jupiterRentReclaimedLamports, 2_074_080n);
+  assert.equal(events.includes("jupiter:claim"), true);
+  assert.equal(events.includes("jupiter:reclaim-rent"), true);
+  assert.equal(trader.snapshot().openPositions, 0);
 });
 
 test("live trader persists observed exposure when a Polymarket exit response is ambiguous", async () => {
@@ -1900,6 +1975,8 @@ class MockJupiter implements LiveJupiterGateway {
   submitError: Error | null = null;
   submitFailuresRemaining: number | null = null;
   positionContractsMicro: bigint | null = null;
+  claimPayoutMicroUsd: bigint | null = null;
+  reclaimedLamports = 2_074_080n;
   lastBuyIsYes: boolean | null = null;
   #lastBuild: JupiterPredictionOrderBuild | null = null;
   #submittedContractsMicro = 0n;
@@ -2025,7 +2102,18 @@ class MockJupiter implements LiveJupiterGateway {
     this.#events.push("jupiter:claim");
     return {
       transactionSignature: "claim-signature",
-      payoutMicroUsd: this.#lastBuild?.order.contractsMicro ?? 0n,
+      payoutMicroUsd: this.claimPayoutMicroUsd ?? this.#submittedContractsMicro,
+    };
+  }
+
+  async reclaimPositionRent(): Promise<{
+    transactionSignatures: string[];
+    reclaimedLamports: bigint;
+  }> {
+    this.#events.push("jupiter:reclaim-rent");
+    return {
+      transactionSignatures: ["rent-signature"],
+      reclaimedLamports: this.reclaimedLamports,
     };
   }
 }

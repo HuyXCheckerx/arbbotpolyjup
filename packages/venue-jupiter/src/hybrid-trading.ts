@@ -35,6 +35,7 @@ type ForecastExecutionGateway = Pick<
   | "submitPreparedAndWait"
   | "getPosition"
   | "claimPosition"
+  | "reclaimPositionRent"
 >;
 
 /**
@@ -138,6 +139,15 @@ export class JupiterHybridLiveExecutor {
     return isForecastSwapPosition(positionPubkey)
       ? await this.#forecast.claimPosition(positionPubkey, expectedPayoutMicroUsd)
       : await this.#prediction.claimPosition(positionPubkey, expectedPayoutMicroUsd);
+  }
+
+  async reclaimPositionRent(
+    positionPubkey: string,
+  ): Promise<{ transactionSignatures: string[]; reclaimedLamports: bigint }> {
+    if (!isForecastSwapPosition(positionPubkey)) {
+      return { transactionSignatures: [], reclaimedLamports: 0n };
+    }
+    return await this.#forecast.reclaimPositionRent(positionPubkey);
   }
 }
 

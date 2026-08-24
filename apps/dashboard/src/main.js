@@ -135,6 +135,9 @@ function renderPositions(positions = [], awaitingCount = 0) {
     const jupiterOutcome = escapeHtml(pos.jupiterOutcome);
     const polymarketContracts = escapeHtml(pos.polymarketContracts);
     const jupiterContracts = escapeHtml(pos.jupiterContracts);
+    const jupiterQuotedContracts = pos.jupiterQuotedContracts == null
+      ? "—"
+      : escapeHtml(pos.jupiterQuotedContracts);
     const polymarketCostUsd = escapeHtml(pos.polymarketCostUsd);
     const jupiterCostUsd = escapeHtml(pos.jupiterCostUsd);
     const skewVal = escapeHtml(pos.contractSkew || "0.00");
@@ -197,8 +200,12 @@ function renderPositions(positions = [], awaitingCount = 0) {
               <span class="leg-side ${jupSideClass}">${jupiterOutcome}</span>
             </div>
             <div class="leg-row">
-              <span>Contracts:</span>
+              <span>Executed Contracts:</span>
               <b>${jupiterContracts}</b>
+            </div>
+            <div class="leg-row">
+              <span>Quoted Contracts:</span>
+              <b>${jupiterQuotedContracts}</b>
             </div>
             <div class="leg-row">
               <span>Cost Basis:</span>
@@ -215,6 +222,9 @@ function renderPositions(positions = [], awaitingCount = 0) {
           <div>Delta Skew: <b style="color:${skewColor}">${skewVal} contracts</b></div>
           <div>Total Capital: <b>${totalOutlay}</b></div>
           <div>Min Aligned PnL: <b style="color:${minimumAlignedPnlColor}">${minimumAlignedPnlLabel}</b></div>
+          <div>Poly-win PnL: <b>$${escapeHtml(pos.polymarketWinPnlUsd || "0")}</b></div>
+          <div>Jup-win PnL: <b>$${escapeHtml(pos.jupiterWinPnlUsd || "0")}</b></div>
+          <div>Jup Rent Reclaimed: <b>${pos.jupiterRentReclaimed ? `✔ ${escapeHtml(pos.jupiterRentReclaimedSol || "0")} SOL` : "⏳ PENDING"}</b></div>
           <div>Realized PnL: <b>$${realizedProfitUsd}</b></div>
           <div>Entered: <b>${enteredAt}</b></div>
         </div>
@@ -350,8 +360,12 @@ async function fetchStatus() {
 
     // Top Metrics
     const pnl = Number(data.strategy?.realizedProfitUsd || 0);
+    const legacyPnl = Number(data.strategy?.legacyUnverifiedRealizedProfitUsd || 0);
     el.topPnl.textContent = formatUsd(pnl);
     el.topPnl.className = pnl < 0 ? "m-val pnl-val negative" : "m-val pnl-val";
+    el.topPnl.title = legacyPnl === 0
+      ? "Confirmed-fill and verified-settlement accounting"
+      : `${formatUsd(legacyPnl)} archived from legacy quote-derived accounting (not verified profit)`;
 
     el.topOpenPos.textContent = data.strategy?.openPositions || 0;
 

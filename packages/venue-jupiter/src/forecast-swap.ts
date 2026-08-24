@@ -2,8 +2,11 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  TransactionInstruction,
+  TransactionMessage,
   VersionedTransaction,
   type Commitment,
+  type Finality,
 } from "@solana/web3.js";
 
 import { ONE_CONTRACT_MICRO, ONE_USD_MICRO } from "../../domain/src/fixed.ts";
@@ -26,6 +29,8 @@ import type { JupiterRequestPriority, JupiterRequestScheduler } from "./request-
 const DEFAULT_SWAP_URL = "https://api.jup.ag/swap/v2";
 const AUTO_SETTLEMENT_TOLERANCE_MICRO = 10_000n;
 const SWAP_POSITION_PREFIX = "swap-v2";
+const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const CLOSE_TOKEN_ACCOUNT_INSTRUCTION = 9;
 
 export interface JupiterSwapOrder {
   transaction: string;
@@ -401,11 +406,77 @@ export class JupiterForecastSwapExecutor {
     expectedPayoutMicroUsd = 0n,
   ): Promise<{ transactionSignature: string; payoutMicroUsd: bigint }> {
     const position = parseSwapPositionId(positionPubkey);
-    const remaining = await this.#tokenBalance(position.outcomeMint);
+    const accounts = await this.#tokenAccounts(position.outcomeMint);
+    const remaining = accounts.reduce((total, account) => total + account.amount, 0n);
     if (remaining > AUTO_SETTLEMENT_TOLERANCE_MICRO) {
       throw new Error(`Forecast winning token ${position.outcomeMint} has not auto-settled yet`);
     }
-    return { transactionSignature: "forecast-auto-settled", payoutMicroUsd: expectedPayoutMicroUsd };
+    const settlement = await this.#findAutoSettlement(
+      accounts.map((account) => account.pubkey),
+      position.outcomeMint,
+      expectedPayoutMicroUsd,
+    );
+    if (!settlement) {
+      throw new Error(
+        `Forecast winning token ${position.outcomeMint} is empty, but no confirmed USDC ` +
+        `settlement credit was found on-chain`,
+      );
+    }
+    return settlement;
+  }
+
+  async reclaimPositionRent(
+    positionPubkey: string,
+  ): Promise<{ transactionSignatures: string[]; reclaimedLamports: bigint }> {
+    const position = parseSwapPositionId(positionPubkey);
+    const accounts = await this.#tokenAccounts(position.outcomeMint);
+    const nonEmpty = accounts.filter((account) => account.amount > 0n);
+    if (nonEmpty.length > 0) {
+      throw new Error(
+        `Forecast token account ${position.outcomeMint} still contains ` +
+        `${nonEmpty.reduce((total, account) => total + account.amount, 0n)} raw tokens`,
+      );
+    }
+    const closable = accounts.filter((account) => account.programId === TOKEN_2022_PROGRAM_ID.toBase58());
+    const transactionSignatures: string[] = [];
+    let reclaimedLamports = 0n;
+    for (const account of closable) {
+      const lamports = BigInt(await this.#connection.getBalance(account.pubkey, this.#commitment));
+      const latest = await this.#connection.getLatestBlockhash(this.#commitment);
+      const instruction = new TransactionInstruction({
+        programId: TOKEN_2022_PROGRAM_ID,
+        keys: [
+          { pubkey: account.pubkey, isSigner: false, isWritable: true },
+          { pubkey: this.#keypair.publicKey, isSigner: false, isWritable: true },
+          { pubkey: this.#keypair.publicKey, isSigner: true, isWritable: false },
+        ],
+        data: Buffer.from([CLOSE_TOKEN_ACCOUNT_INSTRUCTION]),
+      });
+      const transaction = new VersionedTransaction(new TransactionMessage({
+        payerKey: this.#keypair.publicKey,
+        recentBlockhash: latest.blockhash,
+        instructions: [instruction],
+      }).compileToV0Message());
+      transaction.sign([this.#keypair]);
+      const signature = await this.#connection.sendRawTransaction(transaction.serialize(), {
+        maxRetries: 3,
+        preflightCommitment: this.#commitment,
+        skipPreflight: false,
+      });
+      const confirmation = await this.#connection.confirmTransaction({
+        signature,
+        blockhash: latest.blockhash,
+        lastValidBlockHeight: latest.lastValidBlockHeight,
+      }, this.#commitment);
+      if (confirmation.value.err) {
+        throw new Error(
+          `Forecast token-account close failed: ${JSON.stringify(confirmation.value.err)}`,
+        );
+      }
+      transactionSignatures.push(signature);
+      reclaimedLamports += lamports;
+    }
+    return { transactionSignatures, reclaimedLamports };
   }
 
   async #outcomeMint(marketId: string): Promise<string> {
@@ -417,16 +488,77 @@ export class JupiterForecastSwapExecutor {
   }
 
   async #tokenBalance(mint: string): Promise<bigint> {
+    const tokenAccounts = await this.#tokenAccounts(mint);
+    return tokenAccounts.reduce((total, account) => total + account.amount, 0n);
+  }
+
+  async #tokenAccounts(mint: string): Promise<Array<{
+    pubkey: PublicKey;
+    amount: bigint;
+    programId: string;
+  }>> {
     const tokenAccounts = await this.#connection.getParsedTokenAccountsByOwner(
       this.#keypair.publicKey,
       { mint: new PublicKey(mint) },
       this.#commitment,
     );
-    return tokenAccounts.value.reduce((total, account) => {
-      const parsed = account.account.data.parsed as { info?: { tokenAmount?: { amount?: string } } };
+    return tokenAccounts.value.map((account) => {
+      const parsed = account.account.data.parsed as {
+        info?: { owner?: string; tokenAmount?: { amount?: string } };
+      };
+      if (parsed.info?.owner !== this.ownerPubkey) {
+        throw new Error(`Forecast token account ${account.pubkey.toBase58()} has an unexpected owner`);
+      }
       const amount = parsed.info?.tokenAmount?.amount;
-      return total + (amount && /^\d+$/.test(amount) ? BigInt(amount) : 0n);
-    }, 0n);
+      return {
+        pubkey: account.pubkey,
+        amount: amount && /^\d+$/.test(amount) ? BigInt(amount) : 0n,
+        programId: account.account.owner.toBase58(),
+      };
+    });
+  }
+
+  async #findAutoSettlement(
+    tokenAccounts: readonly PublicKey[],
+    outcomeMint: string,
+    expectedPayoutMicroUsd: bigint,
+  ): Promise<{ transactionSignature: string; payoutMicroUsd: bigint } | null> {
+    const signatures = new Map<string, number>();
+    for (const tokenAccount of tokenAccounts) {
+      for (const record of await this.#connection.getSignaturesForAddress(
+        tokenAccount,
+        { limit: 25 },
+        transactionReadFinality(this.#commitment),
+      )) {
+        if (record.err === null) signatures.set(record.signature, record.slot);
+      }
+    }
+    const tolerance = maximum(AUTO_SETTLEMENT_TOLERANCE_MICRO, expectedPayoutMicroUsd / 1_000n);
+    for (const [signature] of [...signatures.entries()].sort((left, right) => right[1] - left[1])) {
+      const transaction = await this.#connection.getTransaction(signature, {
+        commitment: transactionReadFinality(this.#commitment),
+        maxSupportedTransactionVersion: 0,
+      });
+      if (!transaction?.meta || transaction.meta.err) continue;
+      const outcomeDebit = -tokenDeltaForOwner(
+        transaction.meta.preTokenBalances ?? [],
+        transaction.meta.postTokenBalances ?? [],
+        this.ownerPubkey,
+        outcomeMint,
+      );
+      const usdcDelta = tokenDeltaForOwner(
+        transaction.meta.preTokenBalances ?? [],
+        transaction.meta.postTokenBalances ?? [],
+        this.ownerPubkey,
+        USDC_MINT,
+      );
+      const payoutMismatch = absolute(outcomeDebit - usdcDelta);
+      if (outcomeDebit >= maximum(0n, expectedPayoutMicroUsd - tolerance) &&
+        usdcDelta > 0n && payoutMismatch <= tolerance) {
+        return { transactionSignature: signature, payoutMicroUsd: usdcDelta };
+      }
+    }
+    return null;
   }
 }
 
@@ -449,6 +581,7 @@ export function forecastSwapBuild(input: {
   }
   const positionPubkey = forecastSwapPositionId(input.marketId, input.outcomeMint);
   return {
+    outcomeMint: input.outcomeMint,
     transaction: input.order.transaction,
     txMeta: { blockhash: "managed-by-swap-v2", lastValidBlockHeight: input.order.lastValidBlockHeight },
     externalOrderId: input.order.requestId,
@@ -529,6 +662,8 @@ function swapExecutionStatus(
     averageFillPriceMicroUsd,
     sizeMicroUsd,
     settled: true,
+    reconciliationSource: "swap_execute",
+    quotedContractsMicro: build.order.newContractsMicro,
   };
 }
 
@@ -553,6 +688,56 @@ function parseUnsignedInteger(value: unknown, field: string): bigint {
 function ceilDivide(numerator: bigint, denominator: bigint): bigint {
   if (denominator <= 0n) throw new Error("Cannot divide by a non-positive quantity");
   return (numerator + denominator - 1n) / denominator;
+}
+
+interface SettlementTokenBalance {
+  accountIndex: number;
+  mint: string;
+  owner?: string;
+  uiTokenAmount: { amount: string };
+}
+
+function tokenDeltaForOwner(
+  pre: readonly SettlementTokenBalance[],
+  post: readonly SettlementTokenBalance[],
+  ownerPubkey: string,
+  mint: string,
+): bigint {
+  return settlementBalance(post, pre, post, ownerPubkey, mint) -
+    settlementBalance(pre, pre, post, ownerPubkey, mint);
+}
+
+function settlementBalance(
+  balances: readonly SettlementTokenBalance[],
+  pre: readonly SettlementTokenBalance[],
+  post: readonly SettlementTokenBalance[],
+  ownerPubkey: string,
+  mint: string,
+): bigint {
+  const indexes = new Set(
+    [...pre, ...post]
+      .filter((balance) => balance.mint === mint && balance.owner === ownerPubkey)
+      .map((balance) => balance.accountIndex),
+  );
+  return balances.reduce((total, balance) => {
+    if (balance.mint !== mint ||
+      (balance.owner !== ownerPubkey && !indexes.has(balance.accountIndex))) return total;
+    return total + (/^\d+$/.test(balance.uiTokenAmount.amount)
+      ? BigInt(balance.uiTokenAmount.amount)
+      : 0n);
+  }, 0n);
+}
+
+function transactionReadFinality(commitment: Commitment): Finality {
+  return commitment === "finalized" || commitment === "confirmed" ? commitment : "confirmed";
+}
+
+function maximum(left: bigint, right: bigint): bigint {
+  return left > right ? left : right;
+}
+
+function absolute(value: bigint): bigint {
+  return value < 0n ? -value : value;
 }
 
 function trimSlash(value: string): string {

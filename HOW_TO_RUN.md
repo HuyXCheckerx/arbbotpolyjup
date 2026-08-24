@@ -176,6 +176,9 @@ For native Jupiter Forecast markets, live execution is hybrid:
 
 - Jupiter Prediction `/orders` → `/execute` is used when the Jupiter deposit is at least `$5`, matching Jupiter's recommended website-style path;
 - direct outcome-token Swap V2 is used below `$5`, because Prediction rejects smaller builds;
+- Prediction `/execute` amounts are never treated as fills: the bot confirms the transaction and measures the wallet's real outcome-token credit and USDC debit;
+- after both legs execute, the bot checks the Poly-win and Jupiter-win P&L separately. A quote that looked profitable but executed unprofitably is halted and shown as exposure, not realized profit;
+- Forecast winners are credited from the confirmed settlement USDC delta, and empty Token-2022 outcome accounts are closed automatically to reclaim SOL rent;
 - live mode continuously rolls unsigned executable builds through a shared `125ms` scheduler (`8 RPS`), leaving headroom below the Developer plan's `10 RPS` limit; critical entry/recovery work jumps ahead of discovery;
 - out-of-order responses cannot replace a newer build, and the selected exact build is signed during Polymarket preparation only while it remains within the configured submission-age limit.
 
@@ -309,7 +312,9 @@ tail -f logs/btc-poly-jup-short-window-arb.jsonl | \
   jq --unbuffered -c 'select(.type == "live_entry" or .type == "live_exit" or .type == "live_recovery" or .type == "live_halt")'
 ```
 
-Every live-entry execution record distinguishes `jupiter.result: "skipped"` from an actual rejection and includes `submissionAttempted`, `signed`, `executionPath`, `endpoint`, `requestId`, `usedPreflightBuild`, `quoteAgeAtSubmissionMs`, and any transaction signature.
+Every live-entry execution record distinguishes `jupiter.result: "skipped"` from an actual rejection and includes `submissionAttempted`, `signed`, `executionPath`, `endpoint`, `requestId`, `usedPreflightBuild`, `quoteAgeAtSubmissionMs`, `quotedContractsMicro`, `filledContractsMicro`, `contractShortfallMicro`, `quotedCostMicroUsd`, `executedCostMicroUsd`, `reconciliationSource`, and the transaction signature.
+
+The first run after upgrading archives the old quote-derived realized P&L as `legacyUnverifiedRealizedProfitMicroUsd` and displays verified realized P&L from zero. Do not treat the archived figure as wallet profit. A legacy state containing an open Jupiter fill halts with `LEGACY_UNVERIFIED_JUPITER_FILL` for manual transaction reconciliation.
 
 The JSONL and durable state contain public order, transaction, and exposure information but should still be protected.
 
@@ -323,7 +328,7 @@ Press `Ctrl-C` once and wait for the session-end message. The live bot persists 
 2. Check the actual Polymarket conditional-token balance and Jupiter outcome-token balance for the recorded markets.
 3. Preserve the JSONL and state file as the exposure audit trail.
 4. Restart with the same command and state file when you want the bot to attempt its supported automatic read-only reconciliation and post-resolution recovery.
-5. Fully observed residual exposure is quarantined after market close and no longer blocks new entries while settlement continues. If either venue's fill is unknown or pending, determine the exact exposure and neutralize it manually if necessary; the bot deliberately will not guess.
+5. A bounded, profitable residual can continue to settlement. An excessive or negative-payoff residual stays quarantined; after close, settlement uses confirmed credits and reclaims the empty Forecast token-account rent. If either venue's fill is unknown or pending, determine the exact exposure and neutralize it manually if necessary; the bot deliberately will not guess.
 6. Use a new `--live-state` only after every old exposure is accounted for on both venues.
 
 Example after fully completed manual recovery:

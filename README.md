@@ -87,7 +87,7 @@ pnpm bot:short-window
 pnpm bot:short-window:live
 ```
 
-Do not run either command before completing the setup, approval, funding, and recovery instructions in [Real-money live trader](docs/LIVE_TRADING.md). Native Jupiter Forecast execution uses Swap V2 against the market's Token-2022 `outcomeMint`, while the cross-chain pair as a whole is still not atomic and is not guaranteed arbitrage. Live sizing and the dashboard's available cash are refreshed from the real Polymarket collateral and Jupiter USDC wallet balances; there is no seeded paper balance.
+Do not run either command before completing the setup, approval, funding, and recovery instructions in [Real-money live trader](docs/LIVE_TRADING.md). Native Jupiter Forecast execution uses Prediction for deposits of at least `$5` and opt-in Swap V2 below that minimum. Prediction fills are reconciled from confirmed on-chain outcome-token and USDC deltas rather than quoted output. The cross-chain pair is still not atomic and is not guaranteed arbitrage. Live sizing and the dashboard's available cash are refreshed from the real Polymarket collateral and Jupiter USDC wallet balances; there is no seeded paper balance.
 
 Run the live dashboard in another terminal:
 
@@ -103,5 +103,5 @@ Add `--json` to the scanner for machine-readable output. `JUPITER_API_KEY` is op
 
 ## Live execution boundary
 
-The live adapter is restricted to native `bisonfi` Jupiter Forecast markets discovered as `BISON-...` outcomes. It rejects Jupiter's Polymarket-routed markets as shared liquidity. Prediction API remains the market-discovery and resolution source. Native Forecast entries default to the `$5` Prediction order minimum; smaller Swap V2 legs require the explicit `--allow-sub-five-jupiter-swap` opt-in. Swap V2 omits manual slippage so Jupiter can use RTSE, and the bot validates its guaranteed `otherAmountThreshold`. The Polymarket entry is an exact-share, marketable FOK built from a final REST book read, with a 20% displayed-depth haircut and a maximum price capped by the remaining profit budget. Balanced live positions are held through market resolution rather than closed by automatic profit-taking. Ambiguous responses are reconciled against wallet balances; a definitive Jupiter 6001 receives only one fresh bounded retry. No software guard can make Polygon and Solana execution atomic.
+The live adapter is restricted to native `bisonfi` Jupiter Forecast markets discovered as `BISON-...` outcomes. It rejects Jupiter's Polymarket-routed markets as shared liquidity. Prediction API remains the market-discovery and resolution source. Native Forecast entries default to the `$5` Prediction order minimum; smaller Swap V2 legs require the explicit `--allow-sub-five-jupiter-swap` opt-in. After execution, the bot checks the two payoff cases using confirmed quantities and quarantines any excessive skew or negative actual edge. Forecast settlement is booked from the real USDC credit, and empty Token-2022 accounts are closed to reclaim rent. No software guard can make Polygon and Solana execution atomic.
 # arbbotpolyjup

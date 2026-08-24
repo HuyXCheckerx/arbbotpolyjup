@@ -2315,6 +2315,12 @@ async function runLiveSettlementLoop(input: {
           polymarketPayoutUsd: formatUsd(settlement.polymarketPayoutMicroUsd),
           jupiterPayoutUsd: formatUsd(settlement.jupiterPayoutMicroUsd),
           realizedProfitUsd: formatUsd(settlement.realizedProfitMicroUsd),
+          polymarketSettlementTransactionSignature:
+            settlement.polymarketSettlementTransactionSignature,
+          jupiterSettlementTransactionSignature: settlement.jupiterSettlementTransactionSignature,
+          jupiterRentReclaimTransactionSignatures:
+            settlement.jupiterRentReclaimTransactionSignatures,
+          jupiterRentReclaimedLamports: settlement.jupiterRentReclaimedLamports.toString(),
           portfolio: input.trader.snapshot(),
           guaranteed: false,
           warnings: BASIS_WARNINGS,
@@ -2790,6 +2796,7 @@ function updateLiveStrategyStatus(store: ShortWindowStatusStore, trader: ShortWi
     polymarketCashUsd: snapshot.polymarketCashUsd,
     jupiterCashUsd: snapshot.jupiterCashUsd,
     realizedProfitUsd: snapshot.realizedProfitUsd,
+    legacyUnverifiedRealizedProfitUsd: snapshot.legacyUnverifiedRealizedProfitUsd,
     openPositions: snapshot.openPositions,
     awaitingResolution: snapshot.awaitingResolution,
     lastAction: snapshot.lastAction,

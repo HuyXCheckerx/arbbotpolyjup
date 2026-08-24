@@ -55,6 +55,9 @@ const POLYMARKET_MARKET_AMOUNT_PRECISION_REJECTION =
 const POLYMARKET_MARKETABLE_BUY_MINIMUM_REJECTION =
   "invalid amount for a marketable buy order";
 const POLYMARKET_PRICE_TICK_MICRO_USD = 10_000n;
+const VERIFIED_ACCOUNTING_VERSION = 2;
+const LEGACY_UNVERIFIED_FILL_REASON =
+  "LEGACY_UNVERIFIED_JUPITER_FILL: position predates on-chain Forecast fill reconciliation";
 const liveStateSaveQueues = new Map<string, Promise<void>>();
 
 export interface LivePairIdentity {
@@ -92,6 +95,9 @@ export interface LiveJupiterGateway {
     positionPubkey: string,
     expectedPayoutMicroUsd?: bigint,
   ): Promise<{ transactionSignature: string; payoutMicroUsd: bigint }>;
+  reclaimPositionRent?(
+    positionPubkey: string,
+  ): Promise<{ transactionSignatures: string[]; reclaimedLamports: bigint }>;
 }
 
 export interface LivePolymarketGateway {
@@ -137,6 +143,8 @@ export interface LivePosition {
   jupiterOrderPubkey: string | null;
   jupiterPositionPubkey: string;
   jupiterEntryPositionPubkey?: string | null;
+  jupiterQuotedContractsMicro?: bigint;
+  jupiterExecutionReconciliationSource?: JupiterPredictionOrderStatus["reconciliationSource"] | null;
   jupiterContractsMicro: bigint;
   polymarketContractsMicro: bigint;
   jupiterEntryCostMicroUsd: bigint;
@@ -148,6 +156,11 @@ export interface LivePosition {
   jupiterSettled: boolean;
   polymarketSettlementPayoutMicroUsd: bigint;
   jupiterSettlementPayoutMicroUsd: bigint;
+  polymarketSettlementTransactionSignature?: string | null;
+  jupiterSettlementTransactionSignature?: string | null;
+  jupiterRentReclaimed?: boolean;
+  jupiterRentReclaimedLamports?: bigint;
+  jupiterRentReclaimTransactionSignatures?: string[];
   entrySubmissionSkewMs: number | null;
   exitSubmissionSkewMs: number | null;
   diagnosticTestEntry: boolean;
@@ -162,10 +175,16 @@ export interface LiveSettlement {
   polymarketPayoutMicroUsd: bigint;
   jupiterPayoutMicroUsd: bigint;
   realizedProfitMicroUsd: bigint;
+  polymarketSettlementTransactionSignature: string | null;
+  jupiterSettlementTransactionSignature: string | null;
+  jupiterRentReclaimTransactionSignatures: string[];
+  jupiterRentReclaimedLamports: bigint;
 }
 
 export interface LiveTraderState {
   schemaVersion: 1;
+  accountingVersion?: 2;
+  legacyUnverifiedRealizedProfitMicroUsd?: bigint;
   sequence: number;
   halted: boolean;
   haltReason: string | null;
@@ -263,7 +282,12 @@ export interface LiveEntryExecutionDiagnostics {
     initialError: LiveErrorDiagnostic | null;
     transactionSignature: string | null;
     orderStatus: JupiterPredictionOrderStatus["status"] | null;
+    reconciliationSource: JupiterPredictionOrderStatus["reconciliationSource"] | null;
+    quotedContractsMicro: bigint;
     filledContractsMicro: bigint;
+    contractShortfallMicro: bigint;
+    quotedCostMicroUsd: bigint;
+    executedCostMicroUsd: bigint;
     error: LiveErrorDiagnostic | null;
   };
   polymarket: {
@@ -333,6 +357,19 @@ export class ShortWindowLiveTrader {
   async initialize(): Promise<void> {
     this.#state = await loadLiveState(this.#config.statePath);
     let stateMigrated = false;
+    if (this.#state.accountingVersion !== VERIFIED_ACCOUNTING_VERSION) {
+      this.#state.legacyUnverifiedRealizedProfitMicroUsd =
+        (this.#state.legacyUnverifiedRealizedProfitMicroUsd ?? 0n) + this.#state.realizedProfitMicroUsd;
+      this.#state.realizedProfitMicroUsd = 0n;
+      this.#state.accountingVersion = VERIFIED_ACCOUNTING_VERSION;
+      for (const position of this.#state.positions) {
+        if (position.jupiterContractsMicro <= CONTRACT_TOLERANCE_MICRO) continue;
+        position.phase = "exposure_error";
+        position.lastError = LEGACY_UNVERIFIED_FILL_REASON;
+      }
+      this.#lastAction = "Archived legacy quote-derived P&L; verified realized P&L now starts at $0.";
+      stateMigrated = true;
+    }
     const persistedPolymarketCashMicroUsd = this.#state.polymarketCashMicroUsd;
     // Wallet collateral is the source of truth. Persisted cash fields are only
     // a crash-recovery snapshot and must never restore a simulated bankroll.
@@ -356,10 +393,15 @@ export class ShortWindowLiveTrader {
       position.jupiterSettled ??= false;
       position.polymarketSettlementPayoutMicroUsd ??= 0n;
       position.jupiterSettlementPayoutMicroUsd ??= 0n;
+      position.polymarketSettlementTransactionSignature ??= null;
+      position.jupiterSettlementTransactionSignature ??= null;
+      position.jupiterRentReclaimed ??= position.pair.jupiterOutcomeMint === undefined;
+      position.jupiterRentReclaimedLamports ??= 0n;
+      position.jupiterRentReclaimTransactionSignatures ??= [];
       position.entrySubmissionSkewMs ??= null;
       position.exitSubmissionSkewMs ??= null;
       position.diagnosticTestEntry ??= false;
-      if (isRetainableFullyObservedSizeMismatch(position)) {
+      if (isRetainableFullyObservedSizeMismatch(position, this.#config.strategy)) {
         position.originalContractsMicro = minimum(
           position.polymarketContractsMicro,
           position.jupiterContractsMicro,
@@ -608,7 +650,10 @@ export class ShortWindowLiveTrader {
     if (!position.polymarketSettled) {
       if (polymarketWon && position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO) {
         const balance = await this.#polymarket.getTokenBalance(position.pair.polymarketTokenId);
-        if (balance > CONTRACT_TOLERANCE_MICRO) await this.#polymarket.redeemMarket(position.pair.polymarketMarketId);
+        if (balance > CONTRACT_TOLERANCE_MICRO) {
+          position.polymarketSettlementTransactionSignature =
+            await this.#polymarket.redeemMarket(position.pair.polymarketMarketId);
+        }
         position.polymarketSettlementPayoutMicroUsd = position.polymarketContractsMicro;
       }
       this.#state.polymarketCashMicroUsd = this.#polymarketCash() + position.polymarketSettlementPayoutMicroUsd;
@@ -622,12 +667,22 @@ export class ShortWindowLiveTrader {
           position.jupiterContractsMicro,
         );
         position.jupiterSettlementPayoutMicroUsd = claim.payoutMicroUsd;
+        position.jupiterSettlementTransactionSignature = claim.transactionSignature;
       }
       this.#state.jupiterCashMicroUsd = this.#jupiterCash() + position.jupiterSettlementPayoutMicroUsd;
       position.jupiterSettled = true;
       await this.#save();
     }
-    if (!position.polymarketSettled || !position.jupiterSettled) return null;
+    if (!position.jupiterRentReclaimed) {
+      const reclaimed = this.#jupiter.reclaimPositionRent
+        ? await this.#jupiter.reclaimPositionRent(position.jupiterPositionPubkey)
+        : { transactionSignatures: [], reclaimedLamports: 0n };
+      position.jupiterRentReclaimed = true;
+      position.jupiterRentReclaimedLamports = reclaimed.reclaimedLamports;
+      position.jupiterRentReclaimTransactionSignatures = reclaimed.transactionSignatures;
+      await this.#save();
+    }
+    if (!position.polymarketSettled || !position.jupiterSettled || !position.jupiterRentReclaimed) return null;
     const recoveredTerminalOneSidedEntry = isKnownTerminalOneSidedEntry(position);
     const realized = position.polymarketSettlementPayoutMicroUsd + position.jupiterSettlementPayoutMicroUsd -
       position.remainingEntryCostMicroUsd;
@@ -638,6 +693,12 @@ export class ShortWindowLiveTrader {
       polymarketPayoutMicroUsd: position.polymarketSettlementPayoutMicroUsd,
       jupiterPayoutMicroUsd: position.jupiterSettlementPayoutMicroUsd,
       realizedProfitMicroUsd: realized,
+      polymarketSettlementTransactionSignature:
+        position.polymarketSettlementTransactionSignature ?? null,
+      jupiterSettlementTransactionSignature: position.jupiterSettlementTransactionSignature ?? null,
+      jupiterRentReclaimTransactionSignatures:
+        position.jupiterRentReclaimTransactionSignatures ?? [],
+      jupiterRentReclaimedLamports: position.jupiterRentReclaimedLamports ?? 0n,
     };
     this.#state.realizedProfitMicroUsd += realized;
     this.#state.positions = this.#state.positions.filter((candidate) => candidate.id !== position.id);
@@ -657,6 +718,7 @@ export class ShortWindowLiveTrader {
     polymarketCashUsd: string;
     jupiterCashUsd: string;
     realizedProfitUsd: string;
+    legacyUnverifiedRealizedProfitUsd: string;
     openPositions: number;
     awaitingResolution: number;
     lastAction: string;
@@ -674,16 +736,21 @@ export class ShortWindowLiveTrader {
       jupiterOutcome: string;
       polymarketContracts: string;
       jupiterContracts: string;
+      jupiterQuotedContracts: string | null;
       polymarketCostUsd: string;
       jupiterCostUsd: string;
       totalCostUsd: string;
       minimumAlignedPnlUsd: string;
+      polymarketWinPnlUsd: string;
+      jupiterWinPnlUsd: string;
       contractSkew: string;
       contractSkewBps: string | null;
       hedgeStatus: "perfect" | "bounded_residual" | "exposure_error";
       isHedged: boolean;
       polymarketSettled: boolean;
       jupiterSettled: boolean;
+      jupiterRentReclaimed: boolean;
+      jupiterRentReclaimedSol: string;
       realizedProfitUsd: string;
       enteredAt: string;
       lastError: string | null;
@@ -697,6 +764,9 @@ export class ShortWindowLiveTrader {
       polymarketCashUsd: formatUsd(this.#polymarketCash()),
       jupiterCashUsd: formatUsd(this.#jupiterCash()),
       realizedProfitUsd: formatUsd(this.#state.realizedProfitMicroUsd),
+      legacyUnverifiedRealizedProfitUsd: formatUsd(
+        this.#state.legacyUnverifiedRealizedProfitMicroUsd ?? 0n,
+      ),
       openPositions: this.#state.positions.length,
       awaitingResolution: this.#state.positions.filter((position) => position.phase === "awaiting_resolution").length,
       lastAction: this.#lastAction,
@@ -708,6 +778,7 @@ export class ShortWindowLiveTrader {
         const diffMicro = polyMicro > jupMicro ? polyMicro - jupMicro : jupMicro - polyMicro;
         const matchedMicro = minimum(polyMicro, jupMicro);
         const totalCostMicroUsd = pos.polymarketEntryCostMicroUsd + pos.jupiterEntryCostMicroUsd;
+        const payoff = actualEntryPayoffs(pos);
         const contractSkewBps = matchedMicro > 0n ? diffMicro * 10_000n / matchedMicro : null;
         const isHedged = diffMicro <= CONTRACT_TOLERANCE_MICRO &&
           (pos.phase === "open" || pos.phase === "awaiting_resolution") &&
@@ -733,16 +804,23 @@ export class ShortWindowLiveTrader {
           jupiterOutcome: pos.pair.jupiterOutcome,
           polymarketContracts: polyContracts,
           jupiterContracts: jupContracts,
+          jupiterQuotedContracts: pos.jupiterQuotedContractsMicro === undefined
+            ? null
+            : formatContracts(pos.jupiterQuotedContractsMicro),
           polymarketCostUsd: formatUsd(pos.polymarketEntryCostMicroUsd),
           jupiterCostUsd: formatUsd(pos.jupiterEntryCostMicroUsd),
           totalCostUsd: formatUsd(totalCostMicroUsd),
-          minimumAlignedPnlUsd: formatUsd(matchedMicro - totalCostMicroUsd),
+          minimumAlignedPnlUsd: formatUsd(payoff.minimumPnlMicroUsd),
+          polymarketWinPnlUsd: formatUsd(payoff.polymarketWinPnlMicroUsd),
+          jupiterWinPnlUsd: formatUsd(payoff.jupiterWinPnlMicroUsd),
           contractSkew: formatContracts(diffMicro),
           contractSkewBps: contractSkewBps === null ? null : contractSkewBps.toString(),
           hedgeStatus: isHedged ? "perfect" : isBoundedResidual ? "bounded_residual" : "exposure_error",
           isHedged,
           polymarketSettled: pos.polymarketSettled,
           jupiterSettled: pos.jupiterSettled,
+          jupiterRentReclaimed: pos.jupiterRentReclaimed ?? false,
+          jupiterRentReclaimedSol: formatSolLamports(pos.jupiterRentReclaimedLamports ?? 0n),
           realizedProfitUsd: formatUsd(pos.realizedProfitMicroUsd),
           enteredAt: new Date(pos.enteredAtMs).toISOString(),
           lastError: pos.lastError,
@@ -980,6 +1058,8 @@ export class ShortWindowLiveTrader {
       jupiterOrderPubkey: build.order.orderPubkey,
       jupiterPositionPubkey: managedJupiterPositionPubkey(pair, build.order.positionPubkey),
       jupiterEntryPositionPubkey: build.order.positionPubkey,
+      jupiterQuotedContractsMicro: build.order.newContractsMicro,
+      jupiterExecutionReconciliationSource: null,
       jupiterContractsMicro: 0n,
       polymarketContractsMicro: 0n,
       jupiterEntryCostMicroUsd: 0n,
@@ -991,6 +1071,11 @@ export class ShortWindowLiveTrader {
       jupiterSettled: false,
       polymarketSettlementPayoutMicroUsd: 0n,
       jupiterSettlementPayoutMicroUsd: 0n,
+      polymarketSettlementTransactionSignature: null,
+      jupiterSettlementTransactionSignature: null,
+      jupiterRentReclaimed: pair.jupiterOutcomeMint === undefined,
+      jupiterRentReclaimedLamports: 0n,
+      jupiterRentReclaimTransactionSignatures: [],
       entrySubmissionSkewMs: null,
       exitSubmissionSkewMs: null,
       diagnosticTestEntry: forcedTestEntry,
@@ -1061,6 +1146,7 @@ export class ShortWindowLiveTrader {
         position.jupiterOrderPubkey = build.order.orderPubkey;
         position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, build.order.positionPubkey);
         position.jupiterEntryPositionPubkey = build.order.positionPubkey;
+        position.jupiterQuotedContractsMicro = build.order.newContractsMicro;
         await this.#save();
         quoteAgeAtSubmissionMs = buildAtMs === null ? null : Math.max(0, Date.now() - buildAtMs);
         jupiterSubmissionAttempted = true;
@@ -1088,6 +1174,7 @@ export class ShortWindowLiveTrader {
           position.jupiterOrderPubkey = build.order.orderPubkey;
           position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, build.order.positionPubkey);
           position.jupiterEntryPositionPubkey = build.order.positionPubkey;
+          position.jupiterQuotedContractsMicro = build.order.newContractsMicro;
           await this.#save();
           quoteAgeAtSubmissionMs = Math.max(0, Date.now() - buildAtMs);
           submitted = await this.#jupiter.submitPreparedAndWait(preparedJupiter, {
@@ -1144,7 +1231,15 @@ export class ShortWindowLiveTrader {
           ? jupiterResult.value.transactionSignature
           : null,
         orderStatus: status?.status ?? null,
+        reconciliationSource: status?.reconciliationSource ?? null,
+        quotedContractsMicro: build.order.newContractsMicro,
         filledContractsMicro: status?.filledContractsMicro ?? 0n,
+        contractShortfallMicro: maximum(
+          0n,
+          build.order.newContractsMicro - (status?.filledContractsMicro ?? 0n),
+        ),
+        quotedCostMicroUsd: build.order.orderCostMicroUsd + build.order.estimatedTotalFeeMicroUsd,
+        executedCostMicroUsd: status?.sizeMicroUsd ?? 0n,
         error: jupiterResult.status === "rejected" ? errorDiagnostic(jupiterResult.reason) : null,
       },
       polymarket: {
@@ -1214,8 +1309,16 @@ export class ShortWindowLiveTrader {
     }
     if (status.filledContractsMicro > 0n) {
       position.jupiterContractsMicro = status.filledContractsMicro;
-      const jupiterCost = maximum(status.sizeMicroUsd, build.order.orderCostMicroUsd) +
-        build.order.estimatedTotalFeeMicroUsd;
+      position.jupiterExecutionReconciliationSource = status.reconciliationSource ?? null;
+      // Atomic chain deltas and Swap /execute totals already contain the real
+      // wallet debit. For keeper statuses, retain the conservative quoted fee
+      // ceiling without adding that fee twice to a reconciled debit.
+      const jupiterCost = isExecutedAmountReconciled(status)
+        ? status.sizeMicroUsd
+        : maximum(
+            status.sizeMicroUsd,
+            build.order.orderCostMicroUsd + build.order.estimatedTotalFeeMicroUsd,
+          );
       position.jupiterEntryCostMicroUsd = jupiterCost;
       this.#state.jupiterCashMicroUsd = this.#jupiterCash() - jupiterCost;
     }
@@ -1275,6 +1378,32 @@ export class ShortWindowLiveTrader {
     const retainedSizeMismatch = absolute(
       position.jupiterContractsMicro - position.polymarketContractsMicro,
     );
+    const matchedContractsMicro = minimum(
+      position.jupiterContractsMicro,
+      position.polymarketContractsMicro,
+    );
+    const retainedSizeMismatchBps = matchedContractsMicro > 0n
+      ? retainedSizeMismatch * 10_000n / matchedContractsMicro
+      : 10_000n;
+    const actualPayoffs = actualEntryPayoffs(position);
+    const actualEdgePerContract = matchedContractsMicro > 0n
+      ? actualPayoffs.minimumPnlMicroUsd * ONE_CONTRACT_MICRO / matchedContractsMicro
+      : -ONE_USD_MICRO;
+    if (!forcedTestEntry && (
+      retainedSizeMismatchBps > MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS ||
+      actualPayoffs.minimumPnlMicroUsd < this.#config.strategy.minimumEntryEdgeTotalMicroUsd ||
+      actualEdgePerContract < this.#config.strategy.minimumEntryEdgeMicroUsdPerContract
+    )) {
+      return await haltWithDiagnostics(
+        `${OBSERVED_ENTRY_SIZE_MISMATCH}: quoted Jupiter ` +
+        `${formatContracts(position.jupiterQuotedContractsMicro ?? 0n)}, executed Jupiter ` +
+        `${formatContracts(position.jupiterContractsMicro)}, executed Polymarket ` +
+        `${formatContracts(position.polymarketContractsMicro)}, actual Poly-win P&L ` +
+        `$${formatUsd(actualPayoffs.polymarketWinPnlMicroUsd)}, actual Jupiter-win P&L ` +
+        `$${formatUsd(actualPayoffs.jupiterWinPnlMicroUsd)}, skew ` +
+        `${Number(retainedSizeMismatchBps) / 100}%`,
+      );
+    }
     position.originalContractsMicro = minimum(position.jupiterContractsMicro, position.polymarketContractsMicro);
     position.phase = "open";
     this.#lastAction = `LIVE ENTRY ${pair.duration}: ${formatContracts(position.originalContractsMicro)} contracts, ` +
@@ -1606,9 +1735,14 @@ export class ShortWindowLiveTrader {
       const jupiterEntryPortion = jupiterContractsBefore > 0n
         ? position.jupiterEntryCostMicroUsd * sold / jupiterContractsBefore
         : position.jupiterEntryCostMicroUsd;
-      const jupiterGross = tradeGross(status.averageFillPriceMicroUsd, sold);
+      const jupiterExecutionFeeMicroUsd = isExecutedAmountReconciled(status)
+        ? 0n
+        : build.order.estimatedTotalFeeMicroUsd;
+      const jupiterGross = isExecutedAmountReconciled(status)
+        ? status.sizeMicroUsd
+        : tradeGross(status.averageFillPriceMicroUsd, sold);
       if (sold > 0n) {
-        this.#state.jupiterCashMicroUsd = this.#jupiterCash() + jupiterGross - build.order.estimatedTotalFeeMicroUsd;
+        this.#state.jupiterCashMicroUsd = this.#jupiterCash() + jupiterGross - jupiterExecutionFeeMicroUsd;
         position.jupiterContractsMicro = maximum(0n, position.jupiterContractsMicro - sold);
         position.jupiterEntryCostMicroUsd = maximum(0n, position.jupiterEntryCostMicroUsd - jupiterEntryPortion);
         position.remainingEntryCostMicroUsd = maximum(
@@ -1638,7 +1772,7 @@ export class ShortWindowLiveTrader {
         return await this.#halt(position, "Concurrent exit fills do not have matching sizes");
       }
       const entryPortion = jupiterEntryPortion + polyExit.entryPortionMicroUsd;
-      const realized = jupiterGross + polyExit.grossMicroUsd - build.order.estimatedTotalFeeMicroUsd -
+      const realized = jupiterGross + polyExit.grossMicroUsd - jupiterExecutionFeeMicroUsd -
         polyExit.feeMicroUsd - entryPortion;
       position.originalContractsMicro = maximum(0n, position.originalContractsMicro - sold);
       position.realizedProfitMicroUsd += realized;
@@ -2084,6 +2218,8 @@ export async function saveLiveState(path: string, state: LiveTraderState): Promi
 function emptyState(): LiveTraderState {
   return {
     schemaVersion: 1,
+    accountingVersion: VERIFIED_ACCOUNTING_VERSION,
+    legacyUnverifiedRealizedProfitMicroUsd: 0n,
     sequence: 0,
     halted: false,
     haltReason: null,
@@ -2109,11 +2245,44 @@ function canSafelyAwaitResolution(position: LivePosition, atMs: number): boolean
     position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
 }
 
-function isRetainableFullyObservedSizeMismatch(position: LivePosition): boolean {
+function isRetainableFullyObservedSizeMismatch(
+  position: LivePosition,
+  strategy: ShortWindowStrategyConfig,
+): boolean {
+  const matched = minimum(position.polymarketContractsMicro, position.jupiterContractsMicro);
+  const mismatch = absolute(position.polymarketContractsMicro - position.jupiterContractsMicro);
+  const mismatchBps = matched > 0n ? mismatch * 10_000n / matched : 10_000n;
+  const payoff = actualEntryPayoffs(position);
+  const edgePerContract = matched > 0n
+    ? payoff.minimumPnlMicroUsd * ONE_CONTRACT_MICRO / matched
+    : -ONE_USD_MICRO;
   return position.phase === "exposure_error" &&
     position.lastError?.startsWith(OBSERVED_ENTRY_SIZE_MISMATCH) === true &&
     position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO &&
-    position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
+    position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO &&
+    mismatchBps <= MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS &&
+    payoff.minimumPnlMicroUsd >= strategy.minimumEntryEdgeTotalMicroUsd &&
+    edgePerContract >= strategy.minimumEntryEdgeMicroUsdPerContract;
+}
+
+function actualEntryPayoffs(position: LivePosition): {
+  polymarketWinPnlMicroUsd: bigint;
+  jupiterWinPnlMicroUsd: bigint;
+  minimumPnlMicroUsd: bigint;
+} {
+  const totalCostMicroUsd = position.polymarketEntryCostMicroUsd + position.jupiterEntryCostMicroUsd;
+  const polymarketWinPnlMicroUsd = position.polymarketContractsMicro - totalCostMicroUsd;
+  const jupiterWinPnlMicroUsd = position.jupiterContractsMicro - totalCostMicroUsd;
+  return {
+    polymarketWinPnlMicroUsd,
+    jupiterWinPnlMicroUsd,
+    minimumPnlMicroUsd: minimum(polymarketWinPnlMicroUsd, jupiterWinPnlMicroUsd),
+  };
+}
+
+function isExecutedAmountReconciled(status: JupiterPredictionOrderStatus): boolean {
+  return status.reconciliationSource === "onchain_token_deltas" ||
+    status.reconciliationSource === "swap_execute";
 }
 
 function isRejectedPolymarketPrecisionEntry(position: LivePosition): boolean {
@@ -2656,6 +2825,12 @@ function conservativeEntryCapacity(hardCapacityMicroUsd: bigint, maximumSlippage
   // entry uses the largest base amount whose bounded post-fill growth still
   // fits beneath that ceiling.
   return hardCapacityMicroUsd * 10_000n / (10_000n + reserveBps);
+}
+
+function formatSolLamports(lamports: bigint): string {
+  const whole = lamports / 1_000_000_000n;
+  const fraction = (lamports % 1_000_000_000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole.toString();
 }
 
 function bigintReplacer(_key: string, value: unknown): unknown {

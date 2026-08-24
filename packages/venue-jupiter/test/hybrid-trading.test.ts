@@ -82,12 +82,15 @@ test("hybrid executor routes normalized Forecast positions to token settlement",
 
   await hybrid.getPosition(forecastPosition);
   await hybrid.claimPosition(forecastPosition, 7_000_000n);
+  await hybrid.reclaimPositionRent(forecastPosition);
   await hybrid.getPosition("prediction-position");
   await hybrid.claimPosition("prediction-position", 7_000_000n);
+  await hybrid.reclaimPositionRent("prediction-position");
 
   assert.deepEqual(calls, [
     "forecast:get-position",
     "forecast:claim",
+    "forecast:reclaim-rent",
     "prediction:get-position",
     "prediction:claim",
   ]);
@@ -135,6 +138,9 @@ interface MockGateway {
     positionPubkey: string,
     expectedPayoutMicroUsd?: bigint,
   ): Promise<{ transactionSignature: string; payoutMicroUsd: bigint }>;
+  reclaimPositionRent(
+    positionPubkey: string,
+  ): Promise<{ transactionSignatures: string[]; reclaimedLamports: bigint }>;
 }
 
 function gateway(
@@ -186,6 +192,10 @@ function gateway(
         transactionSignature: `${label}-claim`,
         payoutMicroUsd: expected,
       };
+    },
+    reclaimPositionRent: async () => {
+      calls.push(`${label}:reclaim-rent`);
+      return { transactionSignatures: [], reclaimedLamports: 0n };
     },
   };
 }

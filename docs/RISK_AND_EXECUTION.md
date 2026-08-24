@@ -24,11 +24,11 @@ Use a protected market order with `FOK`:
 
 ### Jupiter
 
-The live path accepts only native Forecast order builds whose documented execution model is `atomic_swap`. The order build returns a maximum buy price, estimated fees, exact fractional contract quantity, and an execution model.
+The live path accepts only native Forecast order builds whose documented execution model is `atomic_swap`. The order build returns an executable quote, not proof of the final fractional contract quantity.
 
 Consequences:
 
-- `executionModel=atomic_swap` is treated as filled only after transaction confirmation and output validation.
+- `executionModel=atomic_swap` is treated as filled only after transaction confirmation and reconciliation of the owner's real outcome-token and USDC balance deltas.
 - A null or keeper execution model does not satisfy the strict taker-only requirement and is rejected before signing.
 
 ## Execution strategy
@@ -51,13 +51,13 @@ Failure branches lead to `ABORTING`, `UNWINDING`, `MANUAL_REVIEW`, or `HALTED`.
 1. Acquire a per-market execution lock.
 2. Verify reviewed rule hashes, distinct provider identity, venue status, geographic eligibility, balances, allowances, clock health, and data freshness.
 3. Calculate executable depth and fees for both directions over allowed clip sizes.
-4. Build the Jupiter order without submitting it. Validate the returned transaction and exact `contractsMicro`, price protection, fees, signer set, automatic settlement, and `atomic_swap` execution model.
+4. Build the Jupiter order without submitting it. Validate its quoted `contractsMicro`, price protection, fees, signer set, automatic settlement, and `atomic_swap` execution model. Never treat the quote as an executed fill.
 5. Build and sign the protected Polymarket FOK using the same quote snapshot and quantity target.
 6. Sign and simulate the Jupiter transaction. No venue order has been submitted yet.
 7. Persist the complete two-leg intent and prepared identities.
 8. Release both submission functions through the same in-process barrier and record their submission-start timestamps.
-9. Reconcile the Jupiter transaction/order and Polymarket order/balance independently, regardless of which response completes first.
-10. Mark the position open only when both final quantities are complementary and equal within dust tolerance. Otherwise halt all new trading without submitting a sequential catch-up order.
+9. Reconcile the Jupiter transaction's actual token deltas and Polymarket order/balance independently.
+10. Recompute the Poly-win and Jupiter-win payoff from final quantities and costs. Mark the position open only when the residual is bounded and both cases still meet the entry floors. Otherwise quarantine it and halt new trading without pretending the quote was earned.
 
 Concurrent release reduces systematic leg delay but does not make two chains atomic. Network scheduling, venue acceptance, and settlement can still leave one-sided or ambiguous exposure.
 

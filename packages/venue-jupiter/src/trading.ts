@@ -4,6 +4,7 @@ import {
   PublicKey,
   VersionedTransaction,
   type Commitment,
+  type Finality,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 
@@ -117,7 +118,7 @@ export class JupiterLiveExecutor {
     if (!build.order.isBuy || build.order.isYes !== (input.isYes ?? true) || build.order.marketId !== input.marketId) {
       throw new Error("Jupiter returned a buy order for an unexpected market or side");
     }
-    return build;
+    return { ...build, outcomeMint: input.outcomeMint ?? null };
   }
 
   async prepareClose(positionPubkey: string): Promise<JupiterPredictionOrderBuild> {
@@ -190,10 +191,23 @@ export class JupiterLiveExecutor {
     const transactionSignature = execution.signature;
     let status: JupiterPredictionOrderStatus;
     if (build.executionModel === "atomic_swap") {
-      // /execute is the managed landing path and Forecast positions are
-      // available as soon as it returns. Avoid a redundant RPC confirmation
-      // on the latency-sensitive hedge path.
-      status = atomicExecutionStatus(build);
+      // Forecast's /execute response contains a signature but no executed
+      // quantity. The order-build amounts are only a quote and can differ
+      // materially from the atomic swap's real token output. Confirm and read
+      // the transaction deltas before exposing a fill to risk/P&L accounting.
+      const confirmation = await this.#connection.confirmTransaction({
+        signature: transactionSignature,
+        blockhash: build.txMeta.blockhash,
+        lastValidBlockHeight: build.txMeta.lastValidBlockHeight,
+      }, this.#commitment);
+      if (confirmation.value.err) {
+        throw new Error(`Jupiter atomic transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+      }
+      status = await this.#waitForAtomicExecutionStatus(
+        transactionSignature,
+        build,
+        options,
+      );
     } else {
       const confirmation = await this.#connection.confirmTransaction({
         signature: transactionSignature,
@@ -251,6 +265,47 @@ export class JupiterLiveExecutor {
     return { transactionSignature, payoutMicroUsd: build.payoutMicroUsd };
   }
 
+  async #waitForAtomicExecutionStatus(
+    transactionSignature: string,
+    build: JupiterPredictionOrderBuild,
+    options: { timeoutMs: number; pollMs?: number },
+  ): Promise<JupiterPredictionOrderStatus> {
+    const outcomeMint = build.outcomeMint;
+    if (!outcomeMint) {
+      throw new Error(
+        "Jupiter atomic Forecast execution cannot be reconciled without its outcome mint",
+      );
+    }
+    const deadline = Date.now() + Math.max(0, options.timeoutMs);
+    while (true) {
+      const transaction = await this.#connection.getTransaction(transactionSignature, {
+        commitment: transactionReadFinality(this.#commitment),
+        maxSupportedTransactionVersion: 0,
+      });
+      if (transaction?.meta) {
+        if (transaction.meta.err) {
+          throw new Error(
+            `Jupiter atomic transaction failed: ${JSON.stringify(transaction.meta.err)}`,
+          );
+        }
+        return reconcileAtomicExecutionStatus({
+          build,
+          ownerPubkey: this.ownerPubkey,
+          outcomeMint,
+          preTokenBalances: transaction.meta.preTokenBalances ?? [],
+          postTokenBalances: transaction.meta.postTokenBalances ?? [],
+        });
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Jupiter atomic transaction ${transactionSignature} was confirmed but its token deltas ` +
+          `were unavailable before the reconciliation timeout`,
+        );
+      }
+      await sleep(Math.min(options.pollMs ?? 250, Math.max(1, deadline - Date.now())));
+    }
+  }
+
   async #submitClaim(build: JupiterPredictionClaimBuild): Promise<string> {
     const transaction = VersionedTransaction.deserialize(Buffer.from(build.transaction, "base64"));
     transaction.sign([this.#keypair]);
@@ -278,27 +333,109 @@ export class JupiterLiveExecutor {
   }
 }
 
-function atomicExecutionStatus(build: JupiterPredictionOrderBuild): JupiterPredictionOrderStatus {
-  const filledContractsMicro = build.order.contractsMicro > 0n
-    ? build.order.contractsMicro
-    : build.order.newContractsMicro;
-  const grossMicroUsd = build.order.isBuy ? build.order.orderCostMicroUsd : build.order.payoutMicroUsd;
-  const averageFillPriceMicroUsd = build.order.isBuy && build.order.newAveragePriceMicroUsd !== null
-    ? build.order.newAveragePriceMicroUsd
-    : filledContractsMicro > 0n ? grossMicroUsd * 1_000_000n / filledContractsMicro : 0n;
+interface ReconciledTokenBalance {
+  accountIndex: number;
+  mint: string;
+  owner?: string;
+  uiTokenAmount: { amount: string };
+}
+
+export function reconcileAtomicExecutionStatus(input: {
+  build: JupiterPredictionOrderBuild;
+  ownerPubkey: string;
+  outcomeMint: string;
+  preTokenBalances: readonly ReconciledTokenBalance[];
+  postTokenBalances: readonly ReconciledTokenBalance[];
+}): JupiterPredictionOrderStatus {
+  const outcomeBefore = ownedMintBalance(
+    input.preTokenBalances,
+    input.preTokenBalances,
+    input.postTokenBalances,
+    input.ownerPubkey,
+    input.outcomeMint,
+  );
+  const outcomeAfter = ownedMintBalance(
+    input.postTokenBalances,
+    input.preTokenBalances,
+    input.postTokenBalances,
+    input.ownerPubkey,
+    input.outcomeMint,
+  );
+  const usdcBefore = ownedMintBalance(
+    input.preTokenBalances,
+    input.preTokenBalances,
+    input.postTokenBalances,
+    input.ownerPubkey,
+    USDC_MINT,
+  );
+  const usdcAfter = ownedMintBalance(
+    input.postTokenBalances,
+    input.preTokenBalances,
+    input.postTokenBalances,
+    input.ownerPubkey,
+    USDC_MINT,
+  );
+  const filledContractsMicro = input.build.order.isBuy
+    ? outcomeAfter - outcomeBefore
+    : outcomeBefore - outcomeAfter;
+  const grossMicroUsd = input.build.order.isBuy
+    ? usdcBefore - usdcAfter
+    : usdcAfter - usdcBefore;
+  if (filledContractsMicro <= 0n || grossMicroUsd <= 0n) {
+    throw new Error(
+      `Jupiter atomic fill has invalid on-chain deltas: contracts=${filledContractsMicro}, ` +
+      `USDC=${grossMicroUsd}`,
+    );
+  }
+  const averageFillPriceMicroUsd = input.build.order.isBuy
+    ? ceilDivide(grossMicroUsd * 1_000_000n, filledContractsMicro)
+    : grossMicroUsd * 1_000_000n / filledContractsMicro;
   return {
-    orderPubkey: build.order.orderPubkey,
-    positionPubkey: build.order.positionPubkey,
-    marketId: build.order.marketId,
-    status: filledContractsMicro > 0n ? "filled" : "failed",
-    isBuy: build.order.isBuy,
-    isYes: build.order.isYes,
+    orderPubkey: input.build.order.orderPubkey,
+    positionPubkey: input.build.order.positionPubkey,
+    marketId: input.build.order.marketId,
+    status: "filled",
+    isBuy: input.build.order.isBuy,
+    isYes: input.build.order.isYes,
     contractsMicro: filledContractsMicro,
     filledContractsMicro,
     averageFillPriceMicroUsd,
     sizeMicroUsd: grossMicroUsd,
     settled: true,
+    reconciliationSource: "onchain_token_deltas",
+    quotedContractsMicro: input.build.order.newContractsMicro,
   };
+}
+
+function ownedMintBalance(
+  balances: readonly ReconciledTokenBalance[],
+  preTokenBalances: readonly ReconciledTokenBalance[],
+  postTokenBalances: readonly ReconciledTokenBalance[],
+  ownerPubkey: string,
+  mint: string,
+): bigint {
+  const ownedAccountIndexes = new Set(
+    [...preTokenBalances, ...postTokenBalances]
+      .filter((balance) => balance.mint === mint && balance.owner === ownerPubkey)
+      .map((balance) => balance.accountIndex),
+  );
+  return balances.reduce((total, balance) => {
+    if (balance.mint !== mint ||
+      (balance.owner !== ownerPubkey && !ownedAccountIndexes.has(balance.accountIndex))) {
+      return total;
+    }
+    const amount = balance.uiTokenAmount.amount;
+    return total + (/^\d+$/.test(amount) ? BigInt(amount) : 0n);
+  }, 0n);
+}
+
+function transactionReadFinality(commitment: Commitment): Finality {
+  return commitment === "finalized" || commitment === "confirmed" ? commitment : "confirmed";
+}
+
+function ceilDivide(numerator: bigint, denominator: bigint): bigint {
+  if (denominator <= 0n) throw new Error("Cannot divide by a non-positive quantity");
+  return (numerator + denominator - 1n) / denominator;
 }
 
 export function predictionExecutionRequestId(build: JupiterPredictionOrderBuild): string {
