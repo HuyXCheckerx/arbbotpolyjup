@@ -2984,7 +2984,7 @@ Options:
   --maximum-slippage-bps=100         Polymarket and recovery price protection; Jupiter uses RTSE
   --polymarket-depth-haircut-bps=2000 Ignore the final 20% of displayed CLOB depth when sizing
   --maximum-jupiter-submit-quote-age-ms=500 Maximum signed quote age before a post-fill requote
-  --maximum-emergency-hedge-loss-usd=1 Maximum accepted loss when hedging an already-filled first leg
+  --maximum-emergency-hedge-loss-usd=1 Base accepted loss after first-leg fill; may expand to the naked first-leg stake
   --jupiter-fill-timeout-ms=20000    Reconcile Jupiter after signed execution submission
   --minimum-venue-balance-usd=50     Minimum real wallet balance required at each venue on startup
   --max-venue-allocation-usd=50      Entry cap at each venue per position

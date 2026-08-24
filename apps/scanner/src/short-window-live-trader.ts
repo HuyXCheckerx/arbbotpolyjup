@@ -1334,10 +1334,23 @@ export class ShortWindowLiveTrader {
     ) / 10_000n;
     const conservativeEdge = matchedContractsMicro - matchedPolymarketCost - matchedJupiterCost -
       normalizationRisk;
-    if (!allowEmergencyLoss && conservativeEdge < -this.#config.maximumEmergencyHedgeLossMicroUsd) {
+    // Once Polymarket has filled, its entry cost is already at risk. Treat the
+    // configured emergency-loss value as the normal recovery budget, but do
+    // not reject a size-matched Jupiter hedge that limits the modeled loss to
+    // no more than the naked Polymarket stake. This avoids leaving a much
+    // larger directional exposure because a locked hedge loss missed the soft
+    // budget by a few cents. Cash, allocation, identity and size limits above
+    // remain hard gates.
+    const maximumPostFillHedgeLossMicroUsd = maximum(
+      this.#config.maximumEmergencyHedgeLossMicroUsd,
+      polymarketEntryCostMicroUsd,
+    );
+    if (!allowEmergencyLoss && conservativeEdge < -maximumPostFillHedgeLossMicroUsd) {
       throw new Error(
         `POST_FILL_HEDGE_LOSS_LIMIT_EXCEEDED: edge=$${formatUsd(conservativeEdge)}, ` +
-        `maximumLoss=$${formatUsd(this.#config.maximumEmergencyHedgeLossMicroUsd)}`,
+        `maximumLoss=$${formatUsd(maximumPostFillHedgeLossMicroUsd)}, ` +
+        `configuredBase=$${formatUsd(this.#config.maximumEmergencyHedgeLossMicroUsd)}, ` +
+        `nakedPolymarketStake=$${formatUsd(polymarketEntryCostMicroUsd)}`,
       );
     }
     // Reject a clearly loss-making partial quote immediately. Otherwise, a

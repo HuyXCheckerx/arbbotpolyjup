@@ -17,7 +17,7 @@ For each current BTC 5-minute and 15-minute round, the process:
 7. Verifies Polymarket balances and approvals before exposing the Jupiter leg. The same read supplies the pre-entry token-balance snapshot, avoiding a redundant API round trip.
 8. Re-reads the selected Polymarket CLOB immediately before signing, ignores the final 20% of displayed depth by default, and signs an exact-share marketable FOK. Its maximum price is the smaller of the configured price buffer and the price that preserves both profit floors. The Jupiter validation uses Swap V2's guaranteed `otherAmountThreshold`, not only optimistic output. No venue submission happens during this preparation phase.
 9. Submits Polymarket first. A zero FOK fill explicitly skips Jupiter. After a fill, the bot executes the already-signed Jupiter build when fresh and conservatively size-matched; otherwise it requotes. An ambiguous `/execute` response resubmits the identical signed transaction and request ID once. A definitive 6001 no-fill builds and submits at most one fresh bounded transaction.
-10. Once Polymarket has filled, the normal entry-profit threshold no longer applies. The second leg is exposure management: a Jupiter hedge is submitted whenever its conservative loss is within `--maximum-emergency-hedge-loss-usd` (default `$1`). Larger projected losses trigger the supported Polymarket unwind path instead of an unbounded hedge.
+10. Once Polymarket has filled, the normal entry-profit threshold no longer applies. The second leg is exposure management: the Jupiter hedge-loss budget is the larger of `--maximum-emergency-hedge-loss-usd` (default `$1`) and the already-at-risk Polymarket entry cost. Wallet, allocation, identity, and size limits remain hard gates. A projected loss beyond that recovery budget triggers the supported Polymarket unwind path instead of an unbounded hedge.
 11. Reconciles both venue results independently and normalizes small observed size differences by selling the excess. Rejected, pending, ambiguous, or unrecoverable exposure halts all new trading and remains durably recorded.
 12. Holds a balanced position through market resolution. Automatic profit-taking exits are disabled; the post-resolution loop still claims or redeems winning legs and records settlement.
 
@@ -187,7 +187,7 @@ The JSONL contains public market/order/transaction identifiers but no wallet sec
 | Entry cutoff before market close | `30 seconds` |
 | Maximum live slippage per leg | `100 bps` |
 | Maximum signed Jupiter quote age at submission | `1 second` |
-| Maximum emergency hedge loss after first-leg fill | `$1` |
+| Base emergency hedge loss after first-leg fill | `$1`; may expand to the already-at-risk Polymarket entry cost |
 | Jupiter execution wait | `20 seconds` |
 | Opening-reference difference | strictly `< $30` |
 

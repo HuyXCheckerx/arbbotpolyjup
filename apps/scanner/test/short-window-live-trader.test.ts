@@ -1007,14 +1007,23 @@ test("a filled Polymarket leg is hedged when the fresh Jupiter edge is positive 
   assert.equal(trader.snapshot().halted, false);
 });
 
-test("a post-fill Jupiter hedge beyond the emergency loss budget is not submitted", async () => {
+test("a post-fill Jupiter hedge beyond the base loss budget is submitted when it reduces naked stake risk", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-emergency-loss-cap-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
   jupiter.postScreeningBuyPriceMicroUsd = 800_000n;
   const polymarket = new MockPolymarket(events);
   polymarket.fillContractMultiplierBps = 10_600n;
-  const trader = createTrader(jupiter, polymarket, join(directory, "state.json"));
+  const trader = createTrader(
+    jupiter,
+    polymarket,
+    join(directory, "state.json"),
+    false,
+    5_000_000n,
+    "take_profit",
+    0,
+    50_000_000n,
+  );
   await trader.initialize();
   const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
   const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
@@ -1033,12 +1042,11 @@ test("a post-fill Jupiter hedge beyond the emergency loss budget is not submitte
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "recovery");
-  assert.equal(decision.execution?.jupiter.submissionAttempted, false);
-  assert.equal(decision.execution?.jupiter.result, "rejected");
-  assert.match(decision.execution?.jupiter.error?.message ?? "", /POST_FILL_HEDGE_LOSS_LIMIT_EXCEEDED/);
-  assert.equal(events.includes("jupiter:submit"), false);
-  assert.equal(events.includes("polymarket:submit-sell"), true);
+  assert.equal(decision.type, "entry");
+  assert.equal(decision.execution?.jupiter.submissionAttempted, true);
+  assert.equal(decision.execution?.jupiter.result, "fulfilled");
+  assert.equal(events.includes("jupiter:submit"), true);
+  assert.equal(events.includes("polymarket:submit-sell"), false);
   assert.equal(trader.snapshot().halted, false);
 });
 
@@ -1808,14 +1816,15 @@ function createTrader(
   jupiterMinimumGrossOrderMicroUsd = 5_000_000n,
   exitMode: LiveExitMode = "take_profit",
   polymarketDepthHaircutBps = 0,
+  maximumAllocationMicroUsd = 25_000_000n,
 ): ShortWindowLiveTrader {
   return new ShortWindowLiveTrader({
     jupiter,
     polymarket,
     config: {
       strategy: {
-        polymarketMaximumAllocationMicroUsd: 25_000_000n,
-        jupiterMaximumAllocationMicroUsd: 25_000_000n,
+        polymarketMaximumAllocationMicroUsd: maximumAllocationMicroUsd,
+        jupiterMaximumAllocationMicroUsd: maximumAllocationMicroUsd,
         jupiterMinimumGrossOrderMicroUsd,
         polymarketMinimumGrossOrderMicroUsd: 1_000_000n,
         polymarketMinimumContractsMicro: 5_000_000n,

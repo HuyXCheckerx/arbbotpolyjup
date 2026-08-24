@@ -217,7 +217,7 @@ Common controls:
 | Exit policy | hold until resolution | Automatic profit-taking exits are disabled; recovery hedges and settlement remain enabled |
 | `--maximum-slippage-bps=100` | `100 bps` | Maximum live price protection per leg; allowed range is 1–500 bps |
 | `--maximum-jupiter-submit-quote-age-ms=500` | `0.5 seconds` | Requotes instead of submitting an older signed Jupiter build after Polymarket fills |
-| `--maximum-emergency-hedge-loss-usd=1` | `$1` | Maximum modeled loss accepted to hedge an already-filled first leg; it does not relax pre-entry profit checks |
+| `--maximum-emergency-hedge-loss-usd=1` | `$1` | Base post-fill hedge-loss budget; after Polymarket fills, it may expand to that leg's already-at-risk entry cost. It does not relax pre-entry profit checks or hard allocation limits |
 | `--jupiter-quote-usd=5` | `$5` | Gross cap used for websocket entry screening |
 | `--jupiter-fill-timeout-ms=20000` | `20 seconds` | Jupiter fill/reconciliation timeout |
 | `--market-log-interval-ms=30000` | `30 seconds` | Suppresses repetitive snapshots without slowing execution evaluation |
@@ -339,7 +339,7 @@ A new state file does not close or forget positions on-chain; it only tells the 
 
 - `ENTRY_CUTOFF_REACHED`: fewer than 30 seconds remain, so the bot correctly refuses a new position.
 - `ENTRY_PREFLIGHT_COOLDOWN`: a recent exact-quote or venue preflight failed; the affected pair is waiting for its short classified retry delay.
-- `POST_FILL_HEDGE_LOSS_LIMIT_EXCEEDED`: one venue already filled, but the available Jupiter hedge exceeded `--maximum-emergency-hedge-loss-usd`; the bot attempts the supported first-leg unwind and otherwise halts with the reconciled exposure.
+- `POST_FILL_HEDGE_LOSS_LIMIT_EXCEEDED`: one venue already filled, but the available Jupiter hedge exceeded both `--maximum-emergency-hedge-loss-usd` and the already-at-risk Polymarket entry cost; the bot attempts the supported first-leg unwind and otherwise halts with the reconciled exposure.
 - `REFERENCE_DIFFERENCE_NOT_STRICTLY_BELOW_LIMIT`: the venues' opening references did not satisfy `--max-reference-difference-usd`.
 - No candidates: displayed raw asks may cease to qualify after taker fees, minimum collateral, exact Swap pricing, available depth, or the configured profit floors.
 - Port `3210` already occupied: another scanner/live bot may be running. Inspect it before choosing another port; never bypass the live lock to run two bots against the same state.
