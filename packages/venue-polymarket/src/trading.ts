@@ -10,6 +10,7 @@ import { fetchBalanceAllowance, fetchTickSize, updateBalanceAllowance } from "@p
 import { privateKey } from "@polymarket/client/viem";
 
 import { formatContracts, formatUsd, parseContracts, parseUsd } from "../../domain/src/fixed.ts";
+import type { BookLevel } from "../../domain/src/types.ts";
 
 type OfficialSecureClient = Awaited<ReturnType<typeof createSecureClient>>;
 type OfficialSignedOrder = Awaited<ReturnType<OfficialSecureClient["createMarketOrder"]>>;
@@ -36,6 +37,12 @@ export interface PolymarketLiveFill {
 export interface PreparedPolymarketFokOrder {
   kind: "buy" | "sell";
   signedOrder: OfficialSignedOrder;
+}
+
+export interface PolymarketExecutableAsks {
+  asks: BookLevel[];
+  receivedAtMs: number;
+  sourceTimestampMs: number | null;
 }
 
 export class PolymarketFokSubmissionError extends Error {
@@ -171,6 +178,20 @@ export class PolymarketLiveExecutor {
     await this.#tickSize(tokenId);
   }
 
+  async fetchBuyAsks(tokenId: string): Promise<PolymarketExecutableAsks> {
+    const book = await this.#client.fetchOrderBook({ tokenId });
+    return {
+      asks: book.asks.map((level) => ({
+        priceMicroUsd: parseUsd(String(level.price)),
+        contractsMicro: parseContracts(String(level.size)),
+      })),
+      receivedAtMs: Date.now(),
+      sourceTimestampMs: book.timestamp === null || book.timestamp === undefined
+        ? null
+        : Number(book.timestamp),
+    };
+  }
+
   async prepareBuyFok(input: {
     tokenId: string;
     contractsMicro: bigint;
@@ -181,19 +202,18 @@ export class PolymarketLiveExecutor {
     assertPolymarketMarketableBuyMinimum(grossAmountMicroUsd);
     const tickSizeMicroUsd = await this.#tickSize(input.tokenId);
     const maximumLimitPriceMicroUsd = ceilToTick(input.maximumPriceMicroUsd, tickSizeMicroUsd);
-    // Polymarket market BUYs are quote-denominated: `amount` is the exact USD
-    // notional to spend, while `maxPrice` is only the worst acceptable price.
-    // Consequently the filled share count can be larger than the indicative
-    // target when the CLOB provides price improvement. The live trader always
-    // sizes its second venue from the returned fill instead of assuming this
-    // requested contract count is exact.
-    const signedOrder = await this.#client.createMarketOrder({
+    // Sign a share-denominated marketable limit, then post it with FOK
+    // time-in-force. In CLOB V2 orderType is a posting parameter rather than a
+    // field in the EIP-712 order hash, so this preserves the exact requested
+    // share count while retaining all-or-nothing execution.
+    const limitOrder = await this.#client.createLimitOrder({
       tokenId: input.tokenId,
       side: OrderSide.BUY,
-      amount: formatUsd(grossAmountMicroUsd),
-      maxPrice: formatUsd(maximumLimitPriceMicroUsd),
-      orderType: OrderType.FOK,
+      size: formatContracts(input.contractsMicro),
+      price: formatUsd(maximumLimitPriceMicroUsd),
+      postOnly: false,
     });
+    const signedOrder: OfficialSignedOrder = { ...limitOrder, orderType: OrderType.FOK, postOnly: false };
     assertPolymarketMarketOrderPrecision(signedOrder);
     return { kind: "buy", signedOrder };
   }

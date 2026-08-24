@@ -202,7 +202,7 @@ async function main(): Promise<void> {
   const sampleIntervalMs = args.integer("sample-interval-ms", 50);
   const marketLogIntervalMs = args.integer("market-log-interval-ms", DEFAULT_MARKET_LOG_INTERVAL_MS);
   const jupiterPollMs = args.integer("jupiter-poll-ms", 200);
-  const maximumPolymarketAgeMs = args.integer("max-polymarket-age-ms", 5_000);
+  const maximumPolymarketAgeMs = args.integer("max-polymarket-age-ms", 750);
   const maximumJupiterAgeMs = args.integer("max-jupiter-age-ms", 2_000);
   const maximumConsecutiveJupiterErrors = args.integer("max-consecutive-jupiter-errors", 5);
   const dailyThresholdEnabled = !args.has("no-daily-threshold");
@@ -218,12 +218,14 @@ async function main(): Promise<void> {
   const checkLiveReadiness = args.has("check-live-readiness");
   const liveStatePath = resolve(process.cwd(), args.string("live-state", DEFAULT_LIVE_STATE));
   const maximumSlippageBps = args.integer("maximum-slippage-bps", 100);
+  const polymarketDepthHaircutBps = args.integer("polymarket-depth-haircut-bps", 2_000);
+  const allowSubFiveJupiterSwap = args.has("allow-sub-five-jupiter-swap");
   const maximumJupiterSubmissionQuoteAgeMs = args.integer("maximum-jupiter-submit-quote-age-ms", 500);
   const maximumEmergencyHedgeLossMicroUsd = parseUsd(args.string("maximum-emergency-hedge-loss-usd", "1"));
   const jupiterFillTimeoutMs = args.integer("jupiter-fill-timeout-ms", 20_000);
   const minimumVenueBalanceMicroUsd = parseUsd(args.string("minimum-venue-balance-usd", "50"));
   const maximumVenueAllocationMicroUsd = parseUsd(args.string("max-venue-allocation-usd", "50"));
-  const jupiterMinimumOrderMicroUsd = parseUsd(args.string("jupiter-minimum-order-usd", "0.01"));
+  const jupiterMinimumOrderMicroUsd = parseUsd(args.string("jupiter-minimum-order-usd", "5"));
   const polymarketMinimumOrderMicroUsd = parseUsd(args.string("polymarket-minimum-order-usd", "1"));
   const configuredJupiterQuoteGrossMicroUsd = parseUsd(
     args.string("jupiter-quote-usd", formatUsd(maximumVenueAllocationMicroUsd)),
@@ -270,8 +272,8 @@ async function main(): Promise<void> {
   if (jupiterPollMs < minimumJupiterPollMs) {
     throw new Error(`--jupiter-poll-ms must be at least ${minimumJupiterPollMs}`);
   }
-  if (maximumPolymarketAgeMs < 500 || maximumPolymarketAgeMs > 30_000) {
-    throw new Error("--max-polymarket-age-ms must be between 500 and 30000");
+  if (maximumPolymarketAgeMs < 250 || maximumPolymarketAgeMs > 30_000) {
+    throw new Error("--max-polymarket-age-ms must be between 250 and 30000");
   }
   if (maximumJupiterAgeMs < jupiterPollMs) throw new Error("--max-jupiter-age-ms must be at least --jupiter-poll-ms");
   if (jupiterRequestIntervalMs < 100 || jupiterRequestIntervalMs > 5_000) {
@@ -293,6 +295,11 @@ async function main(): Promise<void> {
     throw new Error("--max-venue-allocation-usd must be greater than zero and no larger than the required live balance");
   }
   if (jupiterMinimumOrderMicroUsd <= 0n) throw new Error("--jupiter-minimum-order-usd must be greater than zero");
+  if (jupiterMinimumOrderMicroUsd < 5_000_000n && !allowSubFiveJupiterSwap) {
+    throw new Error(
+      "--jupiter-minimum-order-usd below 5 requires the explicit --allow-sub-five-jupiter-swap opt-in",
+    );
+  }
   if (polymarketMinimumOrderMicroUsd < 1_000_000n) {
     throw new Error("--polymarket-minimum-order-usd must be at least 1");
   }
@@ -303,6 +310,9 @@ async function main(): Promise<void> {
   if (maximumOpenPositions < 1) throw new Error("--maximum-open-positions must be at least 1");
   if (maximumSlippageBps < 1 || maximumSlippageBps > 500) {
     throw new Error("--maximum-slippage-bps must be between 1 and 500");
+  }
+  if (polymarketDepthHaircutBps < 0 || polymarketDepthHaircutBps > 5_000) {
+    throw new Error("--polymarket-depth-haircut-bps must be between 0 and 5000");
   }
   if (maximumJupiterSubmissionQuoteAgeMs < 100 || maximumJupiterSubmissionQuoteAgeMs > 5_000) {
     throw new Error("--maximum-jupiter-submit-quote-age-ms must be between 100 and 5000");
@@ -481,6 +491,7 @@ async function main(): Promise<void> {
       jupiter: new JupiterHybridLiveExecutor({
         forecast: jupiterLiveExecutor,
         prediction: jupiterPredictionLiveExecutor,
+        allowSubMinimumForecastSwap: allowSubFiveJupiterSwap,
       }),
       polymarket: polymarketLiveExecutor,
       config: {
@@ -490,6 +501,7 @@ async function main(): Promise<void> {
         maximumOpenPositions,
         exitMode: "hold_until_resolution",
         maximumSlippageBps,
+        polymarketDepthHaircutBps,
         maximumReusableJupiterQuoteAgeMs,
         maximumJupiterSubmissionQuoteAgeMs,
         maximumEmergencyHedgeLossMicroUsd,
@@ -565,7 +577,9 @@ async function main(): Promise<void> {
         polymarketMinimumOrderUsd: formatUsd(polymarketMinimumOrderMicroUsd),
         jupiterScreeningQuoteUsd: formatUsd(jupiterQuoteGrossMicroUsd),
         jupiterExecutionPath: liveTrade
-          ? "hybrid_prediction_api_at_or_above_5_usd_else_swap_v2"
+          ? allowSubFiveJupiterSwap
+            ? "prediction_api_at_or_above_5_usd_else_opt_in_rtse_swap_v2"
+            : "prediction_api_minimum_5_usd"
           : null,
         maximumJupiterSubmissionQuoteAgeMs: liveTrade ? maximumJupiterSubmissionQuoteAgeMs : null,
         jupiterRequestIntervalMs: liveTrade ? jupiterRequestIntervalMs : null,
@@ -576,6 +590,8 @@ async function main(): Promise<void> {
         exitMode: liveTrade ? "hold_until_resolution" : null,
         maximumOpenPositions,
         maximumSlippageBps: liveTrade ? maximumSlippageBps : null,
+        polymarketDepthHaircutBps: liveTrade ? polymarketDepthHaircutBps : null,
+        allowSubFiveJupiterSwap: liveTrade ? allowSubFiveJupiterSwap : null,
         jupiterFillTimeoutMs: liveTrade ? jupiterFillTimeoutMs : null,
         forceOneEntry: liveTrade ? liveTestEntry : null,
         liveStatePath: liveTrade ? liveStatePath : null,
@@ -584,7 +600,7 @@ async function main(): Promise<void> {
     feeModel: {
       polymarket: "0.07 * price * (1-price), per-contract fee rounded to 0.00001 USDC",
       jupiter: liveTrade
-        ? "Public Degen websocket discovery uses the documented fee estimate; live preflight uses Prediction API at $5+ and direct Swap V2 below $5"
+        ? "Public Degen websocket discovery is indicative; live preflight uses Prediction at $5+ and RTSE Swap V2 only with explicit sub-$5 opt-in"
         : "0.07 * price * (1-price) * contracts, order fee rounded up to 0.01 USDC",
     },
     warnings: [
@@ -616,7 +632,7 @@ async function main(): Promise<void> {
   console.log("Candidates are not guaranteed: Polymarket settles on TWAP 60s; Jupiter Forecast settles on Chainlink spot.");
   console.log(
     `Jupiter entries use its public Degen price WebSocket; an authenticated exact order build is called only after a ` +
-    `qualified candidate, using Prediction API at $5+ and Swap V2 below $5. Repetitive logs are capped at ` +
+    `qualified candidate, using Prediction API at $5+ and opt-in RTSE Swap V2 below $5. Repetitive logs are capped at ` +
     `${marketLogIntervalMs}ms to ${outputPath}.`,
   );
   if (paperTrader) {
@@ -2930,7 +2946,7 @@ Behavior:
   - --any-complementary-route evaluates both complementary directions and selects the best qualifying net edge.
   - Streams Polymarket books and Jupiter's public Degen top-of-book prices.
   - Reserves authenticated exact Jupiter builds for qualified live-entry preflight/execution.
-  - Uses Prediction API at $5+ and direct Forecast outcome-token Swap V2 below $5.
+  - Uses Prediction API at $5+; direct Forecast outcome-token Swap V2 below $5 requires explicit opt-in.
   - Includes Polymarket and Jupiter taker-fee estimates before logging arb_opportunity records.
   - Marks every record as non-guaranteed because the closing oracle sampling differs.
   - Monitor mode is read-only. The bot command uses --live-trade and can submit irreversible real-money orders.
@@ -2945,7 +2961,7 @@ Options:
   --sample-interval-ms=50            Minimum interval between WebSocket-triggered strategy evaluations
   --market-log-interval-ms=30000     Minimum interval between repetitive snapshots/candidate records
   --jupiter-poll-ms=200             Jupiter REST exit refresh target while a position is open
-  --max-polymarket-age-ms=5000      Reject candidates using an older Polymarket snapshot
+  --max-polymarket-age-ms=750       Reject candidates using an older Polymarket snapshot
   --max-jupiter-age-ms=2000         Reject candidates using an older Jupiter snapshot
   --jupiter-request-interval-ms=110 Shared Developer-tier API interval; live builds have priority
   --max-consecutive-jupiter-errors=5 Persistent-error warning threshold; never ends a round
@@ -2956,6 +2972,7 @@ Options:
   --max-opportunities=0              Stop after N candidate records; 0 is unlimited
   --once                             Alias for --max-samples=1
   --live-trade                       Enable gated real-money execution
+  --allow-sub-five-jupiter-swap     Explicitly permit direct Swap V2 Forecast orders below $5
   --confirm-live-trading=PHRASE      Must exactly equal ${LIVE_CONFIRMATION}
   --live-test-entry                  Bypass entry profit minimums for one real submission attempt
   --confirm-live-test-entry=PHRASE   Must exactly equal ${LIVE_TEST_ENTRY_CONFIRMATION}
@@ -2964,25 +2981,14 @@ Options:
   --setup-trading-approvals          Submit Polymarket approvals, then exit without market orders
   --check-polymarket-readiness       Read Polymarket balance/allowances, then exit without transactions
   --check-live-readiness             Read both venue balances/readiness, then exit without transactions
-  --maximum-slippage-bps=100         Live per-leg price protection; maximum allowed is 500
+  --maximum-slippage-bps=100         Polymarket and recovery price protection; Jupiter uses RTSE
+  --polymarket-depth-haircut-bps=2000 Ignore the final 20% of displayed CLOB depth when sizing
   --maximum-jupiter-submit-quote-age-ms=500 Maximum signed quote age before a post-fill requote
   --maximum-emergency-hedge-loss-usd=1 Maximum accepted loss when hedging an already-filled first leg
   --jupiter-fill-timeout-ms=20000    Reconcile Jupiter after signed execution submission
   --minimum-venue-balance-usd=50     Minimum real wallet balance required at each venue on startup
   --max-venue-allocation-usd=50      Entry cap at each venue per position
-  --jupiter-minimum-order-usd=0.01   Strategy floor for direct Forecast token swaps
-  --polymarket-minimum-order-usd=1   Minimum Polymarket marketable BUY collateral
-  --jupiter-quote-usd=MAX_ALLOCATION Gross cap for websocket screening; defaults to the per-venue allocation
-  --minimum-entry-edge-usd=0.01      Nominal edge required per contract after entry fees
-  --minimum-entry-profit-usd=0.10    Nominal total edge required for entry
-  --minimum-exit-profit-usd=0.10     Legacy threshold; live positions hold through resolution
-  --maximum-open-positions=5         Portfolio-wide concurrent position cap
-  --web-port=3210                    Local dashboard status API port
-  --maximum-emergency-hedge-loss-usd=1 Maximum accepted loss when hedging an already-filled first leg
-  --jupiter-fill-timeout-ms=20000    Reconcile Jupiter after signed execution submission
-  --minimum-venue-balance-usd=50     Minimum real wallet balance required at each venue on startup
-  --max-venue-allocation-usd=50      Entry cap at each venue per position
-  --jupiter-minimum-order-usd=0.01   Strategy floor for direct Forecast token swaps
+  --jupiter-minimum-order-usd=5      Strategy floor matching Jupiter Prediction minimum
   --polymarket-minimum-order-usd=1   Minimum Polymarket marketable BUY collateral
   --jupiter-quote-usd=MAX_ALLOCATION Gross cap for websocket screening; defaults to the per-venue allocation
   --minimum-entry-edge-usd=0.01      Nominal edge required per contract after entry fees

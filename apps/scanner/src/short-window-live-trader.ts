@@ -93,6 +93,11 @@ export interface LiveJupiterGateway {
 
 export interface LivePolymarketGateway {
   primeBuyToken(tokenId: string): Promise<void>;
+  fetchBuyAsks(tokenId: string): Promise<{
+    asks: BookLevel[];
+    receivedAtMs: number;
+    sourceTimestampMs: number | null;
+  }>;
   redeemMarket(marketId: string): Promise<string>;
   prepareBuyFok(input: {
     tokenId: string;
@@ -178,6 +183,7 @@ export interface LiveTraderConfig {
   maximumOpenPositions: number;
   exitMode: LiveExitMode;
   maximumSlippageBps: number;
+  polymarketDepthHaircutBps: number;
   maximumReusableJupiterQuoteAgeMs: number;
   maximumJupiterSubmissionQuoteAgeMs: number;
   maximumEmergencyHedgeLossMicroUsd: bigint;
@@ -250,6 +256,8 @@ export interface LiveEntryExecutionDiagnostics {
     requestId: string | null;
     usedPreflightBuild: boolean;
     quoteAgeAtSubmissionMs: number | null;
+    retryCount: number;
+    initialError: LiveErrorDiagnostic | null;
     transactionSignature: string | null;
     orderStatus: JupiterPredictionOrderStatus["status"] | null;
     filledContractsMicro: bigint;
@@ -448,8 +456,17 @@ export class ShortWindowLiveTrader {
       this.#config.maximumSlippageBps,
     );
     const forcedTestEntry = this.#config.forceOneEntry;
+    const conservativeBestRoute = input.bestRoute
+      ? {
+          ...input.bestRoute,
+          polymarketAsks: haircutBookLevels(
+            input.bestRoute.polymarketAsks,
+            this.#config.polymarketDepthHaircutBps,
+          ),
+        }
+      : null;
     const entry = forcedTestEntry ? null : evaluateShortWindowEntry({
-      route: input.bestRoute,
+      route: conservativeBestRoute,
       polymarketAvailableMicroUsd: entryPolymarketCapacity,
       jupiterAvailableMicroUsd: entryJupiterCapacity,
       config: this.#config.strategy,
@@ -484,7 +501,7 @@ export class ShortWindowLiveTrader {
           build: input.jupiterEntryBuild,
           builtAtMs: input.jupiterEntryBuildAtMs,
           pair: input.pair,
-          polymarketAsks: input.bestRoute.polymarketAsks,
+          polymarketAsks: conservativeBestRoute?.polymarketAsks ?? [],
           polymarketAvailableMicroUsd: entryPolymarketCapacity,
           jupiterAvailableMicroUsd: entryJupiterCapacity,
           config: this.#config,
@@ -493,7 +510,9 @@ export class ShortWindowLiveTrader {
         // Matching the hedge to its full output avoids a second quote request,
         // API-rate-limit contention, and hundreds of milliseconds of drift.
         entryJupiterGrossMicroUsd = input.jupiterEntryBuild.order.orderCostMicroUsd;
-        entryContractsMicro = input.jupiterEntryBuild.order.newContractsMicro;
+        entryContractsMicro = floorToPolymarketSharePrecision(
+          guaranteedJupiterOutputContracts(input.jupiterEntryBuild),
+        );
       }
       const decision = await this.#enter(
         input.pair,
@@ -715,8 +734,12 @@ export class ShortWindowLiveTrader {
     reusableJupiterBuildAtMs: number | null,
     forcedTestEntry: boolean,
   ): Promise<LiveDecision> {
-    const proposedPolymarketQuote = quoteBuyAcrossLevels(
+    let executablePolymarketAsks = haircutBookLevels(
       polymarketAsks,
+      this.#config.polymarketDepthHaircutBps,
+    );
+    const proposedPolymarketQuote = quoteBuyAcrossLevels(
+      executablePolymarketAsks,
       proposedContractsMicro,
       "polymarket",
     );
@@ -811,12 +834,26 @@ export class ShortWindowLiveTrader {
         });
       buildAtMs = reusedJupiterQuote ? reusableJupiterBuildAtMs : Date.now();
       quotedContractsMicro = build.order.newContractsMicro;
+      // Refresh the selected token's executable CLOB immediately before
+      // signing. The websocket book is useful for discovery but should not be
+      // the final authority for an irreversible FOK.
+      const freshPolymarketBook = await this.#polymarket.fetchBuyAsks(pair.polymarketTokenId);
+      executablePolymarketAsks = haircutBookLevels(
+        freshPolymarketBook.asks,
+        this.#config.polymarketDepthHaircutBps,
+      );
       // Marketable Polymarket BUYs permit four share decimals. Hedge only that
       // executable precision; the sub-0.0001 Jupiter remainder is well below
       // the explicit one-cent cross-venue tolerance.
-      const polymarketContractsMicro = floorToPolymarketSharePrecision(quotedContractsMicro);
+      const polymarketContractsMicro = floorToPolymarketSharePrecision(
+        guaranteedJupiterOutputContracts(build),
+      );
       moveToStage("cross_venue_validation");
-      polymarketQuote = quoteBuyAcrossLevels(polymarketAsks, polymarketContractsMicro, "polymarket");
+      polymarketQuote = quoteBuyAcrossLevels(
+        executablePolymarketAsks,
+        polymarketContractsMicro,
+        "polymarket",
+      );
       if (!polymarketQuote) {
         rejectEntryPreflight(
           "POLYMARKET_DEPTH_CHANGED",
@@ -824,11 +861,15 @@ export class ShortWindowLiveTrader {
           "market_changed",
         );
       }
-      maximumPolymarketPrice = applyBps(
-        polymarketQuote.limitPriceMicroUsd,
-        this.#config.maximumSlippageBps,
-        "up",
-      );
+      maximumPolymarketPrice = maximumConservativelyProfitablePolymarketPrice({
+        quantityMicro: polymarketContractsMicro,
+        jupiterAllInMicroUsd: build.order.orderCostMicroUsd + build.order.estimatedTotalFeeMicroUsd,
+        displayedLimitPriceMicroUsd: polymarketQuote.limitPriceMicroUsd,
+        maximumSlippageBps: this.#config.maximumSlippageBps,
+        minimumEdgeMicroUsdPerContract: this.#config.strategy.minimumEntryEdgeMicroUsdPerContract,
+        minimumEdgeTotalMicroUsd: this.#config.strategy.minimumEntryEdgeTotalMicroUsd,
+        allowUnprofitable: forcedTestEntry,
+      });
       validateJupiterEntryBuild({
         build,
         pair,
@@ -925,6 +966,8 @@ export class ShortWindowLiveTrader {
     let jupiterSigned = preparedJupiter !== null;
     let usedPreflightBuild = false;
     let quoteAgeAtSubmissionMs: number | null = null;
+    let jupiterExecutionRetryCount = 0;
+    let initialJupiterExecutionError: unknown | null = null;
     if (observedPolymarket <= CONTRACT_TOLERANCE_MICRO) {
       jupiterResult = {
         status: "rejected",
@@ -962,9 +1005,36 @@ export class ShortWindowLiveTrader {
         await this.#save();
         quoteAgeAtSubmissionMs = buildAtMs === null ? null : Math.max(0, Date.now() - buildAtMs);
         jupiterSubmissionAttempted = true;
-        const submitted = await this.#jupiter.submitPreparedAndWait(preparedJupiter, {
-          timeoutMs: this.#config.jupiterFillTimeoutMs,
-        });
+        let submitted: SubmittedJupiterOrder;
+        try {
+          submitted = await this.#jupiter.submitPreparedAndWait(preparedJupiter, {
+            timeoutMs: this.#config.jupiterFillTimeoutMs,
+          });
+        } catch (error) {
+          if (!isExplicitJupiterSlippageFailure(error)) throw error;
+          // 6001 is a definitive no-fill, so it is safe to build one new,
+          // bounded transaction. Ambiguous transport failures are handled by
+          // resubmitting the same requestId inside the Swap executor instead.
+          initialJupiterExecutionError = error;
+          jupiterExecutionRetryCount = 1;
+          build = await this.#prepareFreshJupiterHedge(
+            pair,
+            observedPolymarket,
+            build,
+            position.polymarketEntryCostMicroUsd,
+            forcedTestEntry,
+          );
+          buildAtMs = Date.now();
+          preparedJupiter = await this.#jupiter.prepareSubmission(build);
+          position.jupiterOrderPubkey = build.order.orderPubkey;
+          position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, build.order.positionPubkey);
+          position.jupiterEntryPositionPubkey = build.order.positionPubkey;
+          await this.#save();
+          quoteAgeAtSubmissionMs = Math.max(0, Date.now() - buildAtMs);
+          submitted = await this.#jupiter.submitPreparedAndWait(preparedJupiter, {
+            timeoutMs: this.#config.jupiterFillTimeoutMs,
+          });
+        }
         jupiterResult = { status: "fulfilled", value: submitted };
       } catch (reason) {
         jupiterResult = { status: "rejected", reason };
@@ -1007,6 +1077,10 @@ export class ShortWindowLiveTrader {
         requestId: jupiterBuildRequestId(build),
         usedPreflightBuild,
         quoteAgeAtSubmissionMs,
+        retryCount: jupiterExecutionRetryCount,
+        initialError: initialJupiterExecutionError === null
+          ? null
+          : errorDiagnostic(initialJupiterExecutionError),
         transactionSignature: jupiterResult.status === "fulfilled"
           ? jupiterResult.value.transactionSignature
           : null,
@@ -1167,7 +1241,7 @@ export class ShortWindowLiveTrader {
     let depositAmountMicroUsd = roundedScale(
       seedBuild.order.orderCostMicroUsd,
       targetContractsMicro,
-      seedBuild.order.newContractsMicro,
+      guaranteedJupiterOutputContracts(seedBuild),
     );
     let latest: JupiterPredictionOrderBuild | null = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -1196,10 +1270,10 @@ export class ShortWindowLiveTrader {
       let nextDeposit = roundedScale(
         depositAmountMicroUsd,
         targetContractsMicro,
-        latest.order.newContractsMicro,
+        guaranteedJupiterOutputContracts(latest),
       );
       if (nextDeposit === depositAmountMicroUsd) {
-        nextDeposit += latest.order.newContractsMicro < targetContractsMicro ? 1n : -1n;
+        nextDeposit += guaranteedJupiterOutputContracts(latest) < targetContractsMicro ? 1n : -1n;
       }
       depositAmountMicroUsd = maximum(1n, nextDeposit);
     }
@@ -1240,7 +1314,7 @@ export class ShortWindowLiveTrader {
         `$${formatUsd(jupiterAllIn)}, available $${formatUsd(maximumJupiterSpend)}`,
       );
     }
-    const quotedContractsMicro = build.order.newContractsMicro;
+    const quotedContractsMicro = guaranteedJupiterOutputContracts(build);
     const sizeDifference = absolute(quotedContractsMicro - targetContractsMicro);
     const mismatchBps = sizeDifference * 10_000n / targetContractsMicro;
 
@@ -2162,7 +2236,8 @@ function validateJupiterEntryBuild(input: {
       "configuration",
     );
   }
-  const polymarketExecutableContractsMicro = floorToPolymarketSharePrecision(build.order.newContractsMicro);
+  const guaranteedContractsMicro = guaranteedJupiterOutputContracts(build);
+  const polymarketExecutableContractsMicro = floorToPolymarketSharePrecision(guaranteedContractsMicro);
   if (polymarketExecutableContractsMicro < config.strategy.polymarketMinimumContractsMicro) {
     rejectEntryPreflight(
       "JUPITER_BELOW_POLYMARKET_MINIMUM",
@@ -2211,7 +2286,7 @@ function validateJupiterEntryBuild(input: {
   }
   const quantityMicro = polymarketExecutableContractsMicro;
   if (input.polymarketQuote.quantityMicro !== quantityMicro ||
-    build.order.newContractsMicro - quantityMicro >= CONTRACT_TOLERANCE_MICRO) {
+    guaranteedContractsMicro - quantityMicro >= CONTRACT_TOLERANCE_MICRO) {
     rejectEntryPreflight(
       "CROSS_VENUE_QUANTITY_MISMATCH",
       "Polymarket VWAP quote quantity differs from the Jupiter executable quote",
@@ -2276,7 +2351,7 @@ function canExecuteFreshScreeningBuild(input: {
   )) return false;
   const polymarketQuote = quoteBuyAcrossLevels(
     input.polymarketAsks,
-    floorToPolymarketSharePrecision(input.build.order.newContractsMicro),
+    floorToPolymarketSharePrecision(guaranteedJupiterOutputContracts(input.build)),
     "polymarket",
   );
   if (!polymarketQuote) return false;
@@ -2326,6 +2401,13 @@ function expectedJupiterIsYes(pair: LivePairIdentity): boolean {
   return pair.jupiterOutcomeMint !== undefined || pair.jupiterOutcome === "UP";
 }
 
+function isExplicitJupiterSlippageFailure(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const record = error as Record<string, unknown>;
+  const code = typeof record.code === "number" ? record.code : Number(record.code);
+  return record.name === "JupiterSwapExecutionError" && code === 6001;
+}
+
 function managedJupiterPositionPubkey(pair: LivePairIdentity, venuePositionPubkey: string): string {
   return pair.jupiterOutcomeMint
     ? forecastSwapPositionId(pair.jupiterMarketId, pair.jupiterOutcomeMint)
@@ -2343,6 +2425,66 @@ function tradeGross(priceMicroUsd: bigint, quantityMicro: bigint): bigint {
 
 function floorToPolymarketSharePrecision(quantityMicro: bigint): bigint {
   return quantityMicro / 100n * 100n;
+}
+
+function guaranteedJupiterOutputContracts(build: JupiterPredictionOrderBuild): bigint {
+  const threshold = build.execution.context.otherAmountThreshold;
+  let parsed: bigint | null = null;
+  if (typeof threshold === "bigint") parsed = threshold;
+  else if (typeof threshold === "number" && Number.isSafeInteger(threshold) && threshold > 0) {
+    parsed = BigInt(threshold);
+  } else if (typeof threshold === "string" && /^\d+$/.test(threshold)) {
+    parsed = BigInt(threshold);
+  }
+  return parsed !== null && parsed > 0n && parsed <= build.order.newContractsMicro
+    ? parsed
+    : build.order.newContractsMicro;
+}
+
+function haircutBookLevels(levels: readonly BookLevel[], haircutBps: number): BookLevel[] {
+  const retainedBps = BigInt(10_000 - Math.max(0, Math.min(10_000, Math.trunc(haircutBps))));
+  return levels.flatMap((level) => {
+    const contractsMicro = floorToPolymarketSharePrecision(
+      level.contractsMicro * retainedBps / 10_000n,
+    );
+    return contractsMicro > 0n ? [{ ...level, contractsMicro }] : [];
+  });
+}
+
+function maximumConservativelyProfitablePolymarketPrice(input: {
+  quantityMicro: bigint;
+  jupiterAllInMicroUsd: bigint;
+  displayedLimitPriceMicroUsd: bigint;
+  maximumSlippageBps: number;
+  minimumEdgeMicroUsdPerContract: bigint;
+  minimumEdgeTotalMicroUsd: bigint;
+  allowUnprofitable: boolean;
+}): bigint {
+  const configuredCeiling = applyBps(
+    input.displayedLimitPriceMicroUsd,
+    input.maximumSlippageBps,
+    "up",
+  );
+  if (input.allowUnprofitable || input.quantityMicro <= 0n) return configuredCeiling;
+  const perContractRequired = (
+    input.minimumEdgeMicroUsdPerContract * input.quantityMicro + ONE_CONTRACT_MICRO - 1n
+  ) / ONE_CONTRACT_MICRO;
+  const requiredEdge = maximum(input.minimumEdgeTotalMicroUsd, perContractRequired);
+  const maximumPolymarketAllIn = input.quantityMicro - input.jupiterAllInMicroUsd - requiredEdge;
+  let lowTicks = input.displayedLimitPriceMicroUsd / POLYMARKET_PRICE_TICK_MICRO_USD;
+  let highTicks = configuredCeiling / POLYMARKET_PRICE_TICK_MICRO_USD;
+  const isProfitable = (ticks: bigint): boolean => {
+    const price = ticks * POLYMARKET_PRICE_TICK_MICRO_USD;
+    return ceilTradeGrossToCent(price, input.quantityMicro) +
+      polymarketFee(price, input.quantityMicro) <= maximumPolymarketAllIn;
+  };
+  if (!isProfitable(lowTicks)) return input.displayedLimitPriceMicroUsd;
+  while (lowTicks < highTicks) {
+    const middle = (lowTicks + highTicks + 1n) / 2n;
+    if (isProfitable(middle)) lowTicks = middle;
+    else highTicks = middle - 1n;
+  }
+  return lowTicks * POLYMARKET_PRICE_TICK_MICRO_USD;
 }
 
 function ceilTradeGrossToCent(priceMicroUsd: bigint, quantityMicro: bigint): bigint {

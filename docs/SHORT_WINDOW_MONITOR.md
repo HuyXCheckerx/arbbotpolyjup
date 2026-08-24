@@ -42,7 +42,7 @@ The two closing values can land on opposite sides of their respective references
 
 ## Books and fees
 
-Polymarket top-of-book changes arrive over its market WebSocket. Jupiter entry prices arrive from the public price WebSocket used by the Degen UI; each duration subscribes to its selected Bison UP/DOWN market IDs in one connection. The socket is used only for ask discovery and does not consume authenticated Swap `/order` quota. Because it exposes top prices rather than executable depth, the scanner synthesizes Jupiter screening depth up to `--jupiter-quote-usd`, which follows the per-position venue allocation by default, and applies the documented prediction fee estimate. It selects the largest screened size that remains within both venue budgets and meets the conservative total and per-contract edge floors. Live execution reserves the 5% post-fill normalization allowance plus configured slippage beneath each hard venue cap; with the default 1% slippage, the usable entry capacity is `hard capacity / 1.06`. When a live candidate reaches preflight, the bot requests a fresh unsigned size-specific Jupiter build for the exact Forecast market, rechecks all-in profitability and slippage, and prepares a protected native Polymarket market FOK. Strategy sizing and exact-quote preflight both require rounded Polymarket market-BUY collateral of at least `$1`; invalid maker/taker precision is rejected before submission. The synthetic depth can overstate executable liquidity, so the exact build—not the WebSocket size—is authoritative and can reject or resize the candidate. Once a position is open, the bot polls Jupiter's REST orderbook for executable exit bids because it never treats websocket bid prices as depth.
+Polymarket top-of-book changes arrive over its market WebSocket. Jupiter entry prices arrive from the public price WebSocket used by the Degen UI; both streams are discovery signals, not final executable depth. The scanner selects the largest screened size within both budgets and profit floors. At live preflight it requests an exact Jupiter build, validates Swap V2's guaranteed minimum output, then fetches the selected Polymarket REST book immediately before signing. Polymarket depth receives a default 20% haircut, and the exact-share FOK maximum price is capped by the remaining profit budget. The default Jupiter strategy floor is `$5` and uses Prediction; sub-`$5` RTSE Swap V2 requires explicit opt-in. Once a position is open, balanced positions are held through resolution.
 
 Entry-preflight backoff is isolated per round. A market-change rejection waits 250ms, a transient venue/network failure waits 750ms, and a likely configuration/readiness error waits 2500ms. A failure on the 5m pair therefore cannot suppress the 15m pair. Cooldown decisions state the affected pair, remaining time, previous stage, and stable error code.
 
@@ -121,7 +121,7 @@ pnpm monitor:short-window -- --help
 | `--sample-interval-ms` | `50` | Minimum interval between WebSocket-triggered route evaluations; execution remains responsive at this cadence |
 | `--market-log-interval-ms` | `30000` | Minimum interval per duration between repetitive `book_sample` and changed `arb_opportunity` records |
 | `--jupiter-poll-ms` | `200` | REST retry/poll baseline; resolution-only live positions do not request exit books |
-| `--max-polymarket-age-ms` | `5000` | Maximum Polymarket snapshot age for an entry decision |
+| `--max-polymarket-age-ms` | `750` | Maximum Polymarket snapshot age for an entry decision |
 | `--max-jupiter-age-ms` | `2000` | Maximum Jupiter snapshot age for an entry decision |
 | `--jupiter-request-interval-ms` | `110` | Shared Developer-tier request spacing; live order builds are prioritized over discovery |
 | `--max-consecutive-jupiter-errors` | `5` | Persistent-error warning threshold; the pair remains active with exponential backoff |
@@ -132,11 +132,13 @@ pnpm monitor:short-window -- --help
 | `--confirm-live-trading` | none | Exact required real-money confirmation phrase |
 | `--live-state` | `logs/btc-poly-jup-short-window-live-state.json` | Durable live execution/exposure state |
 | `--setup-trading-approvals` | off | Submit Polymarket approvals and exit without market orders |
-| `--maximum-slippage-bps` | `100` | Live per-leg price protection |
+| `--maximum-slippage-bps` | `100` | Polymarket and recovery price protection; Jupiter Swap uses RTSE |
+| `--polymarket-depth-haircut-bps` | `2000` | Ignore the final 20% of displayed Polymarket depth when sizing |
 | `--jupiter-fill-timeout-ms` | `20000` | Jupiter execution reconciliation timeout |
 | `--minimum-venue-balance-usd` | `50` | Minimum real wallet balance required at each venue on startup |
 | `--max-venue-allocation-usd` | `50` | Maximum entry cost at each venue per position |
-| `--jupiter-minimum-order-usd` | `0.01` | Strategy floor for the direct Forecast token swap; this is not a Jupiter Prediction minimum |
+| `--jupiter-minimum-order-usd` | `5` | Default strategy floor matching Jupiter Prediction minimum |
+| `--allow-sub-five-jupiter-swap` | off | Explicitly permit direct RTSE Swap V2 Forecast orders below `$5` |
 | `--polymarket-minimum-order-usd` | `1` | Minimum collateral for a marketable Polymarket BUY; sizing scales cheap legs up to this floor |
 | `--jupiter-quote-usd` | follows `--max-venue-allocation-usd` (`50`) | Gross cap used to synthesize entry-screening depth from Degen top prices |
 | `--minimum-entry-edge-usd` | `0.01` | Minimum nominal entry edge per contract after entry fees |

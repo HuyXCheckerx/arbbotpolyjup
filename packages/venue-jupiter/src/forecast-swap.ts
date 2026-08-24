@@ -34,6 +34,13 @@ export interface JupiterSwapOrder {
   outputMint: string;
   inAmount: bigint;
   outAmount: bigint;
+  otherAmountThreshold: bigint | null;
+  slippageBps: number | null;
+  priceImpact: string | null;
+  feeBps: number | null;
+  signatureFeeLamports: bigint | null;
+  prioritizationFeeLamports: bigint | null;
+  rentFeeLamports: bigint | null;
   lastValidBlockHeight: number;
   router: string;
   mode: string;
@@ -101,16 +108,21 @@ export class JupiterSwapClient {
     inputMint: string;
     outputMint: string;
     amount: bigint;
-    taker: string;
-    slippageBps: number;
+    taker?: string;
+    slippageBps?: number;
   }): Promise<JupiterSwapOrder> {
     if (input.amount <= 0n) throw new Error("Jupiter Swap amount must be positive");
     const url = new URL(`${this.#baseUrl}/order`);
     url.searchParams.set("inputMint", input.inputMint);
     url.searchParams.set("outputMint", input.outputMint);
     url.searchParams.set("amount", input.amount.toString());
-    url.searchParams.set("taker", input.taker);
-    url.searchParams.set("slippageBps", String(input.slippageBps));
+    if (input.taker) url.searchParams.set("taker", input.taker);
+    // Omitting slippageBps opts into Jupiter's recommended Ultra/RTSE order
+    // construction. Supplying a fixed value forces manual-slippage mode and
+    // has produced avoidable 6001 failures on fast Forecast pools.
+    if (input.slippageBps !== undefined) {
+      url.searchParams.set("slippageBps", String(input.slippageBps));
+    }
     const payload = await this.#getJson(url);
     if (!isRecord(payload)) throw new Error("Jupiter Swap order response is not an object");
     const transaction = asString(payload.transaction);
@@ -137,6 +149,22 @@ export class JupiterSwapClient {
       outputMint: asString(payload.outputMint, input.outputMint),
       inAmount,
       outAmount,
+      otherAmountThreshold: parseOptionalUnsignedInteger(
+        payload.otherAmountThreshold,
+        "otherAmountThreshold",
+      ),
+      slippageBps: asNumber(payload.slippageBps),
+      priceImpact: optionalScalarString(payload.priceImpact),
+      feeBps: asNumber(payload.feeBps),
+      signatureFeeLamports: parseOptionalUnsignedInteger(
+        payload.signatureFeeLamports,
+        "signatureFeeLamports",
+      ),
+      prioritizationFeeLamports: parseOptionalUnsignedInteger(
+        payload.prioritizationFeeLamports,
+        "prioritizationFeeLamports",
+      ),
+      rentFeeLamports: parseOptionalUnsignedInteger(payload.rentFeeLamports, "rentFeeLamports"),
       lastValidBlockHeight: asNumber(payload.lastValidBlockHeight) ?? 0,
       router: asString(payload.router, "unknown"),
       mode: asString(payload.mode, "unknown"),
@@ -195,8 +223,8 @@ export class JupiterSwapClient {
 
 /**
  * Executes native Forecast outcome tokens through Swap V2. The Prediction API
- * enforces a $5 build minimum; Swap V2 trades the same Token-2022 mint without
- * that cap, which lets the arb size the Jupiter leg to the hedgeable quantity.
+ * enforces a $5 build minimum; explicitly enabled sub-minimum execution can
+ * trade the same Token-2022 mint through Swap V2 with Jupiter-managed RTSE.
  */
 export class JupiterForecastSwapExecutor {
   readonly #predictionClient: JupiterClient;
@@ -204,14 +232,14 @@ export class JupiterForecastSwapExecutor {
   readonly #connection: Connection;
   readonly #keypair: Keypair;
   readonly #commitment: Commitment;
-  readonly #slippageBps: number;
 
   constructor(input: {
     predictionClient: JupiterClient;
     swapClient: JupiterSwapClient;
     rpcUrl: string;
     privateKey: string;
-    slippageBps: number;
+    /** @deprecated Swap V2 now uses Jupiter RTSE; retained for config compatibility. */
+    slippageBps?: number;
     commitment?: Commitment;
   }) {
     this.#predictionClient = input.predictionClient;
@@ -219,7 +247,6 @@ export class JupiterForecastSwapExecutor {
     this.#commitment = input.commitment ?? "confirmed";
     this.#connection = new Connection(input.rpcUrl, this.#commitment);
     this.#keypair = parseSolanaKeypair(input.privateKey);
-    this.#slippageBps = input.slippageBps;
   }
 
   get ownerPubkey(): string {
@@ -261,7 +288,6 @@ export class JupiterForecastSwapExecutor {
       outputMint: outcomeMint,
       amount: input.depositAmountMicroUsd,
       taker: this.ownerPubkey,
-      slippageBps: this.#slippageBps,
     });
     return forecastSwapBuild({ order, marketId: input.marketId, outcomeMint, isBuy: true, ownerPubkey: this.ownerPubkey });
   }
@@ -281,7 +307,6 @@ export class JupiterForecastSwapExecutor {
       outputMint: USDC_MINT,
       amount: contractsMicro,
       taker: this.ownerPubkey,
-      slippageBps: this.#slippageBps,
     });
     return forecastSwapBuild({
       order,
@@ -312,7 +337,26 @@ export class JupiterForecastSwapExecutor {
     const submissionStartedAtMs = Date.now();
     const requestId = asString(prepared.build.execution.context.requestId);
     if (!requestId) throw new Error("Jupiter Forecast Swap build has no requestId");
-    const execution = await this.#swapClient.execute({ signedTransaction: prepared.signedTransaction, requestId });
+    const deadlineMs = submissionStartedAtMs + Math.max(0, _options.timeoutMs);
+    let execution: JupiterSwapExecution | null = null;
+    let lastTransportError: unknown = null;
+    // /execute is idempotent for the same requestId + signed transaction. One
+    // resubmission resolves an ambiguous dropped HTTP response without building
+    // or signing a different transaction that could double-fill.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        execution = await this.#swapClient.execute({
+          signedTransaction: prepared.signedTransaction,
+          requestId,
+        });
+        break;
+      } catch (error) {
+        lastTransportError = error;
+        if (attempt > 0 || Date.now() + 100 >= deadlineMs) throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    if (!execution) throw lastTransportError ?? new Error("Jupiter Swap execution returned no result");
     if (execution.status !== "Success" || !execution.signature || execution.code !== 0) {
       throw new JupiterSwapExecutionError(
         execution.code,
@@ -413,6 +457,13 @@ export function forecastSwapBuild(input: {
         requestId: input.order.requestId,
         router: input.order.router,
         mode: input.order.mode,
+        otherAmountThreshold: input.order.otherAmountThreshold,
+        rtseSlippageBps: input.order.slippageBps,
+        priceImpact: input.order.priceImpact,
+        feeBps: input.order.feeBps,
+        signatureFeeLamports: input.order.signatureFeeLamports,
+        prioritizationFeeLamports: input.order.prioritizationFeeLamports,
+        rentFeeLamports: input.order.rentFeeLamports,
         inputMint: input.order.inputMint,
         outputMint: input.order.outputMint,
       },
@@ -437,6 +488,15 @@ export function forecastSwapBuild(input: {
       estimatedTotalFeeMicroUsd: 0n,
     },
   };
+}
+
+function parseOptionalUnsignedInteger(value: unknown, field: string): bigint | null {
+  if (value === null || value === undefined || value === "") return null;
+  return parseUnsignedInteger(value, field);
+}
+
+function optionalScalarString(value: unknown): string | null {
+  return typeof value === "string" || typeof value === "number" ? String(value) : null;
 }
 
 function swapExecutionStatus(

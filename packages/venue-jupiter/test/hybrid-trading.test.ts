@@ -18,7 +18,11 @@ test("hybrid executor uses Prediction at $5+ and Swap V2 only for smaller Foreca
   const calls: string[] = [];
   const forecast = gateway("forecast", "/swap/v2/execute", "swap-v2:BISON-UP:mint", calls);
   const prediction = gateway("prediction", "/prediction/v1/execute", "prediction-position", calls);
-  const hybrid = new JupiterHybridLiveExecutor({ forecast, prediction });
+  const hybrid = new JupiterHybridLiveExecutor({
+    forecast,
+    prediction,
+    allowSubMinimumForecastSwap: true,
+  });
 
   const small = await hybrid.prepareBuy({
     marketId: "BISON-UP",
@@ -69,7 +73,11 @@ test("hybrid executor routes normalized Forecast positions to token settlement",
   const calls: string[] = [];
   const forecast = gateway("forecast", "/swap/v2/execute", "swap-v2:BISON-UP:mint", calls);
   const prediction = gateway("prediction", "/prediction/v1/execute", "prediction-position", calls);
-  const hybrid = new JupiterHybridLiveExecutor({ forecast, prediction });
+  const hybrid = new JupiterHybridLiveExecutor({
+    forecast,
+    prediction,
+    allowSubMinimumForecastSwap: true,
+  });
   const forecastPosition = forecastSwapPositionId("BISON-UP", "mint");
 
   await hybrid.getPosition(forecastPosition);
@@ -83,6 +91,24 @@ test("hybrid executor routes normalized Forecast positions to token settlement",
     "prediction:get-position",
     "prediction:claim",
   ]);
+});
+
+test("hybrid executor requires explicit opt-in for a sub-$5 Forecast swap", async () => {
+  const calls: string[] = [];
+  const hybrid = new JupiterHybridLiveExecutor({
+    forecast: gateway("forecast", "/swap/v2/execute", "swap-v2:BISON-UP:mint", calls),
+    prediction: gateway("prediction", "/prediction/v1/execute", "prediction-position", calls),
+  });
+  await assert.rejects(
+    hybrid.prepareBuy({
+      marketId: "BISON-UP",
+      outcomeMint: "mint",
+      isYes: true,
+      depositAmountMicroUsd: JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD - 1n,
+    }),
+    /sub-minimum direct Swap V2 execution is disabled/,
+  );
+  assert.deepEqual(calls, []);
 });
 
 interface MockGateway {

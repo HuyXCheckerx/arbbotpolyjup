@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { eligibleCrossVenueRoutes, evaluateCrossVenueRoutes } from "../../../packages/domain/src/short-window.ts";
-import type { BinaryOrderBook } from "../../../packages/domain/src/types.ts";
+import type { BinaryOrderBook, BookLevel } from "../../../packages/domain/src/types.ts";
 import type {
   JupiterPredictionOrderBuild,
   JupiterPredictionOrderStatus,
@@ -344,6 +344,43 @@ test("live trader accepts a favorable size quote above the old five-percent tole
   assert.equal(decision.type, "entry");
 });
 
+test("live trader sizes against the configured Polymarket depth haircut", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-depth-haircut-"));
+  const events: string[] = [];
+  const jupiter = new MockJupiter(events);
+  const polymarket = new MockPolymarket(events);
+  const trader = createTrader(
+    jupiter,
+    polymarket,
+    join(directory, "state.json"),
+    false,
+    5_000_000n,
+    "take_profit",
+    2_000,
+  );
+  await trader.initialize();
+  const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
+  const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarketBook,
+    jupiterBook,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  assert.ok(route);
+
+  const decision = await trader.consider({
+    pair: pair(route.route.polymarketOutcome, route.route.jupiterOutcome),
+    bestRoute: route,
+    polymarketBook,
+    jupiterBook,
+    atMs: 1_000,
+  });
+
+  assert.equal(decision.type, "entry");
+  assert.ok(polymarket.preparedBuy);
+  assert.ok(polymarket.preparedBuy.contractsMicro <= 40_000_000n);
+});
+
 test("live trader reprices the exact Jupiter quote against Polymarket multi-level depth", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-vwap-"));
   const events: string[] = [];
@@ -618,7 +655,9 @@ test("exact quote shrink cannot submit a Polymarket market BUY below one dollar"
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
   jupiter.contractMultiplierBps = 6_000n;
-  const trader = createTrader(jupiter, new MockPolymarket(events), join(directory, "state.json"));
+  const polymarket = new MockPolymarket(events);
+  polymarket.buyPriceMicroUsd = 100_000n;
+  const trader = createTrader(jupiter, polymarket, join(directory, "state.json"));
   await trader.initialize();
   const polymarketBook = book("polymarket", 900_000n, 100_000n, 890_000n, 90_000n);
   const jupiterBook = book("jupiter", 140_000n, 870_000n, 130_000n, 860_000n);
@@ -776,6 +815,44 @@ test("terminal zero-fill entry failures recover and can retry the still-open pai
   });
   assert.equal(retry.type, "entry");
   assert.equal(events.filter((event) => event === "jupiter:submit").length, 1);
+});
+
+test("one definitive Jupiter 6001 builds one fresh transaction and succeeds", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-jupiter-6001-retry-"));
+  const events: string[] = [];
+  const jupiter = new MockJupiter(events);
+  jupiter.submitError = new JupiterSwapExecutionError(
+    6001,
+    "metis",
+    "failed-signature",
+    "Jupiter Forecast Swap execution failed (6001): Slippage tolerance exceeded",
+  );
+  jupiter.submitFailuresRemaining = 1;
+  const polymarket = new MockPolymarket(events);
+  const trader = createTrader(jupiter, polymarket, join(directory, "state.json"));
+  await trader.initialize();
+  const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
+  const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarketBook,
+    jupiterBook,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  assert.ok(route);
+
+  const decision = await trader.consider({
+    pair: pair(route.route.polymarketOutcome, route.route.jupiterOutcome),
+    bestRoute: route,
+    polymarketBook,
+    jupiterBook,
+    atMs: 1_000,
+  });
+
+  assert.equal(decision.type, "entry");
+  assert.equal(decision.execution?.jupiter.retryCount, 1);
+  assert.equal(decision.execution?.jupiter.initialError?.code, 6001);
+  assert.equal(events.filter((event) => event === "jupiter:submit").length, 2);
+  assert.equal(events.includes("polymarket:submit-sell"), false);
 });
 
 test("terminal Jupiter slippage failure reconciles an ambiguous successful Polymarket unwind", async () => {
@@ -1729,6 +1806,7 @@ function createTrader(
   forceOneEntry = false,
   jupiterMinimumGrossOrderMicroUsd = 5_000_000n,
   exitMode: LiveExitMode = "take_profit",
+  polymarketDepthHaircutBps = 0,
 ): ShortWindowLiveTrader {
   return new ShortWindowLiveTrader({
     jupiter,
@@ -1749,6 +1827,7 @@ function createTrader(
       maximumOpenPositions: 2,
       exitMode,
       maximumSlippageBps: 100,
+      polymarketDepthHaircutBps,
       maximumReusableJupiterQuoteAgeMs: 3_000,
       maximumJupiterSubmissionQuoteAgeMs: 1_000,
       maximumEmergencyHedgeLossMicroUsd: 1_000_000n,
@@ -1771,6 +1850,7 @@ class MockJupiter implements LiveJupiterGateway {
   prepareBuyError: Error | null = null;
   prepareBuyFailuresAfterFirst = 0;
   submitError: Error | null = null;
+  submitFailuresRemaining: number | null = null;
   positionContractsMicro: bigint | null = null;
   lastBuyIsYes: boolean | null = null;
   #lastBuild: JupiterPredictionOrderBuild | null = null;
@@ -1845,7 +1925,10 @@ class MockJupiter implements LiveJupiterGateway {
 
   async submitPreparedAndWait(value: PreparedJupiterSubmission): Promise<SubmittedJupiterOrder> {
     this.#events.push("jupiter:submit");
-    if (this.submitError) throw this.submitError;
+    if (this.submitError && (this.submitFailuresRemaining === null || this.submitFailuresRemaining > 0)) {
+      if (this.submitFailuresRemaining !== null) this.submitFailuresRemaining -= 1;
+      throw this.submitError;
+    }
     const executionContracts = value.build.order.isBuy
       ? value.build.order.contractsMicro * this.executionContractMultiplierBps / 10_000n
       : value.build.order.contractsMicro;
@@ -1934,6 +2017,18 @@ class MockPolymarket implements LivePolymarketGateway {
   }
 
   async primeBuyToken(): Promise<void> {}
+
+  async fetchBuyAsks(): Promise<{
+    asks: BookLevel[];
+    receivedAtMs: number;
+    sourceTimestampMs: number | null;
+  }> {
+    return {
+      asks: [{ priceMicroUsd: this.buyPriceMicroUsd, contractsMicro: 1_000_000_000n }],
+      receivedAtMs: Date.now(),
+      sourceTimestampMs: Date.now(),
+    };
+  }
 
   async redeemMarket(): Promise<string> {
     this.#events.push("polymarket:redeem");

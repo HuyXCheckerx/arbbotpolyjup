@@ -39,19 +39,21 @@ type ForecastExecutionGateway = Pick<
 
 /**
  * Uses Jupiter's recommended Prediction API for Forecast orders that meet its
- * $5 build minimum, and falls back to direct Swap V2 for smaller native
- * outcome-token orders. Standard prediction markets have no outcome mint and
- * always use the Prediction API.
+ * $5 build minimum. Direct Swap V2 for smaller native outcome-token orders is
+ * available only through an explicit constructor opt-in. Standard prediction
+ * markets have no outcome mint and always use the Prediction API.
  */
 export class JupiterHybridLiveExecutor {
   readonly #forecast: ForecastExecutionGateway;
   readonly #prediction: JupiterExecutionGateway;
   readonly #predictionMinimumBuyMicroUsd: bigint;
+  readonly #allowSubMinimumForecastSwap: boolean;
 
   constructor(input: {
     forecast: ForecastExecutionGateway;
     prediction: JupiterExecutionGateway;
     predictionMinimumBuyMicroUsd?: bigint;
+    allowSubMinimumForecastSwap?: boolean;
   }) {
     if (input.forecast.ownerPubkey !== input.prediction.ownerPubkey) {
       throw new Error("Jupiter Forecast and Prediction executors use different owners");
@@ -60,6 +62,7 @@ export class JupiterHybridLiveExecutor {
     this.#prediction = input.prediction;
     this.#predictionMinimumBuyMicroUsd = input.predictionMinimumBuyMicroUsd ??
       JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD;
+    this.#allowSubMinimumForecastSwap = input.allowSubMinimumForecastSwap ?? false;
   }
 
   get ownerPubkey(): string {
@@ -73,6 +76,13 @@ export class JupiterHybridLiveExecutor {
     isYes?: boolean;
   }): Promise<JupiterPredictionOrderBuild> {
     if (input.outcomeMint && input.depositAmountMicroUsd < this.#predictionMinimumBuyMicroUsd) {
+      if (!this.#allowSubMinimumForecastSwap) {
+        throw new Error(
+          `Jupiter Forecast order $${Number(input.depositAmountMicroUsd) / 1_000_000} is below the ` +
+          `$${Number(this.#predictionMinimumBuyMicroUsd) / 1_000_000} Prediction API minimum; ` +
+          `sub-minimum direct Swap V2 execution is disabled`,
+        );
+      }
       return await this.#forecast.prepareBuy(input);
     }
     return await this.#prediction.prepareBuy(input);
