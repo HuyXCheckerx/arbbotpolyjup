@@ -26,6 +26,7 @@ import type {
   JupiterPredictionOrderStatus,
   JupiterPredictionPosition,
 } from "../../../packages/venue-jupiter/src/client.ts";
+import { forecastSwapPositionId } from "../../../packages/venue-jupiter/src/forecast-swap.ts";
 import { jupiterExecutionPath } from "../../../packages/venue-jupiter/src/hybrid-trading.ts";
 import type {
   PreparedJupiterSubmission,
@@ -125,6 +126,7 @@ export interface LivePosition {
   enteredAtMs: number;
   jupiterOrderPubkey: string | null;
   jupiterPositionPubkey: string;
+  jupiterEntryPositionPubkey?: string | null;
   jupiterContractsMicro: bigint;
   polymarketContractsMicro: bigint;
   jupiterEntryCostMicroUsd: bigint;
@@ -140,6 +142,7 @@ export interface LivePosition {
   exitSubmissionSkewMs: number | null;
   diagnosticTestEntry: boolean;
   lastError: string | null;
+  settlementError?: string | null;
 }
 
 export interface LiveSettlement {
@@ -316,6 +319,7 @@ export class ShortWindowLiveTrader {
 
   async initialize(): Promise<void> {
     this.#state = await loadLiveState(this.#config.statePath);
+    let stateMigrated = false;
     const persistedPolymarketCashMicroUsd = this.#state.polymarketCashMicroUsd;
     // Wallet collateral is the source of truth. Persisted cash fields are only
     // a crash-recovery snapshot and must never restore a simulated bankroll.
@@ -323,6 +327,18 @@ export class ShortWindowLiveTrader {
     this.#state.jupiterCashMicroUsd = this.#config.initialJupiterCashMicroUsd;
     this.#state.forcedEntrySubmissionAttempted ??= false;
     for (const position of this.#state.positions) {
+      position.settlementError ??= null;
+      if (position.pair.jupiterOutcomeMint) {
+        const managedPositionPubkey = managedJupiterPositionPubkey(
+          position.pair,
+          position.jupiterPositionPubkey,
+        );
+        if (managedPositionPubkey !== position.jupiterPositionPubkey) {
+          position.jupiterEntryPositionPubkey ??= position.jupiterPositionPubkey;
+          position.jupiterPositionPubkey = managedPositionPubkey;
+          stateMigrated = true;
+        }
+      }
       position.polymarketSettled ??= false;
       position.jupiterSettled ??= false;
       position.polymarketSettlementPayoutMicroUsd ??= 0n;
@@ -356,6 +372,8 @@ export class ShortWindowLiveTrader {
       this.#lastAction = this.#state.positions.length > 0
         ? "Known managed exposure remains open or awaiting settlement; new entries are re-enabled."
         : "No managed exposure remains; live trading is re-enabled.";
+      await this.#save();
+    } else if (stateMigrated) {
       await this.#save();
     }
   }
@@ -527,6 +545,19 @@ export class ShortWindowLiveTrader {
     this.#state.jupiterCashMicroUsd = maximum(0n, jupiterCashMicroUsd);
   }
 
+  async recordSettlementError(pairKey: string, error: unknown): Promise<boolean> {
+    const position = this.#state.positions.find(
+      (candidate) => candidate.pair.key === pairKey && candidate.phase === "awaiting_resolution",
+    );
+    if (!position) return false;
+    const message = errorMessage(error);
+    if (position.settlementError === message) return false;
+    position.settlementError = message;
+    this.#lastAction = `SETTLEMENT RETRY ${position.pair.duration} ${position.id}: ${message}`;
+    await this.#save();
+    return true;
+  }
+
   async settleAwaiting(pairKey: string, polymarketWon: boolean, jupiterWon: boolean): Promise<LiveSettlement | null> {
     const position = this.#state.positions.find(
       (candidate) => candidate.pair.key === pairKey && candidate.phase === "awaiting_resolution",
@@ -611,6 +642,7 @@ export class ShortWindowLiveTrader {
       realizedProfitUsd: string;
       enteredAt: string;
       lastError: string | null;
+      settlementError: string | null;
     }>;
   } {
     return {
@@ -656,6 +688,7 @@ export class ShortWindowLiveTrader {
           realizedProfitUsd: formatUsd(pos.realizedProfitMicroUsd),
           enteredAt: new Date(pos.enteredAtMs).toISOString(),
           lastError: pos.lastError,
+          settlementError: pos.settlementError ?? null,
         };
       }),
     };
@@ -833,7 +866,8 @@ export class ShortWindowLiveTrader {
       phase: "legs_submitting",
       enteredAtMs: Date.now(),
       jupiterOrderPubkey: build.order.orderPubkey,
-      jupiterPositionPubkey: build.order.positionPubkey,
+      jupiterPositionPubkey: managedJupiterPositionPubkey(pair, build.order.positionPubkey),
+      jupiterEntryPositionPubkey: build.order.positionPubkey,
       jupiterContractsMicro: 0n,
       polymarketContractsMicro: 0n,
       jupiterEntryCostMicroUsd: 0n,
@@ -849,6 +883,7 @@ export class ShortWindowLiveTrader {
       exitSubmissionSkewMs: null,
       diagnosticTestEntry: forcedTestEntry,
       lastError: null,
+      settlementError: null,
     };
     if (forcedTestEntry) this.#state.forcedEntrySubmissionAttempted = true;
     this.#state.positions.push(position);
@@ -910,7 +945,8 @@ export class ShortWindowLiveTrader {
           jupiterSigned = true;
         }
         position.jupiterOrderPubkey = build.order.orderPubkey;
-        position.jupiterPositionPubkey = build.order.positionPubkey;
+        position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, build.order.positionPubkey);
+        position.jupiterEntryPositionPubkey = build.order.positionPubkey;
         await this.#save();
         quoteAgeAtSubmissionMs = buildAtMs === null ? null : Math.max(0, Date.now() - buildAtMs);
         jupiterSubmissionAttempted = true;
@@ -2221,6 +2257,12 @@ function expectedJupiterIsYes(pair: LivePairIdentity): boolean {
   // Native Forecast represents UP and DOWN as separate YES-only markets. Other
   // Prediction providers expose both sides on one binary market.
   return pair.jupiterOutcomeMint !== undefined || pair.jupiterOutcome === "UP";
+}
+
+function managedJupiterPositionPubkey(pair: LivePairIdentity, venuePositionPubkey: string): string {
+  return pair.jupiterOutcomeMint
+    ? forecastSwapPositionId(pair.jupiterMarketId, pair.jupiterOutcomeMint)
+    : venuePositionPubkey;
 }
 
 function polymarketFee(priceMicroUsd: bigint, quantityMicro: bigint): bigint {

@@ -135,6 +135,9 @@ function renderPositions(positions = [], awaitingCount = 0) {
     const errorLine = pos.lastError
       ? `<div class="pos-error-line">ERROR: ${escapeHtml(pos.lastError)}</div>`
       : "";
+    const settlementErrorLine = pos.settlementError
+      ? `<div class="pos-error-line">SETTLEMENT RETRY: ${escapeHtml(pos.settlementError)}</div>`
+      : "";
 
     html += `
       <div class="position-card ${cardClass}">
@@ -197,6 +200,7 @@ function renderPositions(positions = [], awaitingCount = 0) {
         </div>
 
         ${errorLine}
+        ${settlementErrorLine}
       </div>
     `;
   }

@@ -102,6 +102,7 @@ export interface LivePositionSnapshot {
   realizedProfitUsd: string;
   enteredAt: string;
   lastError: string | null;
+  settlementError: string | null;
 }
 
 export interface StatusEvent {

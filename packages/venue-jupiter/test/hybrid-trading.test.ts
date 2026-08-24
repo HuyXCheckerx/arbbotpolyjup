@@ -6,6 +6,7 @@ import type {
   JupiterPredictionOrderStatus,
   JupiterPredictionPosition,
 } from "../src/client.ts";
+import { forecastSwapPositionId } from "../src/forecast-swap.ts";
 import {
   JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD,
   JupiterHybridLiveExecutor,
@@ -64,6 +65,26 @@ test("hybrid executor dispatches signing and submission from the build endpoint"
   ]);
 });
 
+test("hybrid executor routes normalized Forecast positions to token settlement", async () => {
+  const calls: string[] = [];
+  const forecast = gateway("forecast", "/swap/v2/execute", "swap-v2:BISON-UP:mint", calls);
+  const prediction = gateway("prediction", "/prediction/v1/execute", "prediction-position", calls);
+  const hybrid = new JupiterHybridLiveExecutor({ forecast, prediction });
+  const forecastPosition = forecastSwapPositionId("BISON-UP", "mint");
+
+  await hybrid.getPosition(forecastPosition);
+  await hybrid.claimPosition(forecastPosition, 7_000_000n);
+  await hybrid.getPosition("prediction-position");
+  await hybrid.claimPosition("prediction-position", 7_000_000n);
+
+  assert.deepEqual(calls, [
+    "forecast:get-position",
+    "forecast:claim",
+    "prediction:get-position",
+    "prediction:claim",
+  ]);
+});
+
 interface MockGateway {
   ownerPubkey: string;
   prepareBuy(input: {
@@ -117,23 +138,29 @@ function gateway(
       };
     },
     waitForOrder: async () => status(build(endpoint, positionPubkey)),
-    getPosition: async (value) => ({
-      positionPubkey: value,
-      marketId: "BISON-UP",
-      isYes: true,
-      contractsMicro: 1_000_000n,
-      totalCostMicroUsd: 500_000n,
-      feesPaidMicroUsd: 0n,
-      sellPriceMicroUsd: 500_000n,
-      claimable: false,
-      claimed: false,
-      claimedMicroUsd: 0n,
-      result: null,
-    }),
-    claimPosition: async (_value, expected = 0n) => ({
-      transactionSignature: `${label}-claim`,
-      payoutMicroUsd: expected,
-    }),
+    getPosition: async (value) => {
+      calls.push(`${label}:get-position`);
+      return {
+        positionPubkey: value,
+        marketId: "BISON-UP",
+        isYes: true,
+        contractsMicro: 1_000_000n,
+        totalCostMicroUsd: 500_000n,
+        feesPaidMicroUsd: 0n,
+        sellPriceMicroUsd: 500_000n,
+        claimable: false,
+        claimed: false,
+        claimedMicroUsd: 0n,
+        result: null,
+      };
+    },
+    claimPosition: async (_value, expected = 0n) => {
+      calls.push(`${label}:claim`);
+      return {
+        transactionSignature: `${label}-claim`,
+        payoutMicroUsd: expected,
+      };
+    },
   };
 }
 

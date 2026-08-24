@@ -400,7 +400,7 @@ export function forecastSwapBuild(input: {
   if (averagePriceMicroUsd <= 0n || averagePriceMicroUsd >= ONE_USD_MICRO) {
     throw new Error(`Jupiter Forecast Swap returned invalid average price ${averagePriceMicroUsd}`);
   }
-  const positionPubkey = swapPositionId(input.marketId, input.outcomeMint);
+  const positionPubkey = forecastSwapPositionId(input.marketId, input.outcomeMint);
   return {
     transaction: input.order.transaction,
     txMeta: { blockhash: "managed-by-swap-v2", lastValidBlockHeight: input.order.lastValidBlockHeight },
@@ -469,7 +469,7 @@ function swapExecutionStatus(
   };
 }
 
-function swapPositionId(marketId: string, outcomeMint: string): string {
+export function forecastSwapPositionId(marketId: string, outcomeMint: string): string {
   return `${SWAP_POSITION_PREFIX}:${marketId}:${outcomeMint}`;
 }
 

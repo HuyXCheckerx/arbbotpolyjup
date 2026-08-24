@@ -165,6 +165,11 @@ test("live trader signs a fresh exact Jupiter build before Polymarket and execut
   });
   assert.equal(entry.type, "entry");
   assert.equal(entry.position.entrySubmissionSkewMs, 1);
+  assert.equal(
+    entry.position.jupiterPositionPubkey,
+    `swap-v2:${identity.jupiterMarketId}:${identity.jupiterOutcomeMint}`,
+  );
+  assert.equal(entry.position.jupiterEntryPositionPubkey, "jup-position");
   assert.deepEqual(events.slice(0, 6), [
     "jupiter:prepare-buy",
     "polymarket:balance",
@@ -261,6 +266,54 @@ test("resolution-only mode does not prepare or submit an automatic profit-taking
   assert.equal(trader.snapshot().openPositions, 1);
   assert.equal(events.includes("jupiter:prepare-close"), false);
   assert.equal(events.includes("polymarket:submit-sell"), false);
+});
+
+test("startup migrates legacy Forecast position IDs and persists settlement retry errors", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-forecast-migration-"));
+  const statePath = join(directory, "state.json");
+  const jupiter = new MockJupiter([]);
+  const trader = createTrader(jupiter, new MockPolymarket([]), statePath);
+  await trader.initialize();
+  const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
+  const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarketBook,
+    jupiterBook,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  assert.ok(route);
+  const identity = pair(route.route.polymarketOutcome, route.route.jupiterOutcome);
+  assert.equal((await trader.consider({
+    pair: identity,
+    bestRoute: route,
+    polymarketBook,
+    jupiterBook,
+    atMs: 1_000,
+  })).type, "entry");
+
+  const legacy = await loadLiveState(statePath);
+  const legacyPosition = legacy.positions[0];
+  assert.ok(legacyPosition);
+  legacyPosition.jupiterPositionPubkey = "legacy-forecast-position";
+  delete legacyPosition.jupiterEntryPositionPubkey;
+  delete legacyPosition.settlementError;
+  await saveLiveState(statePath, legacy);
+
+  const restarted = createTrader(jupiter, new MockPolymarket([]), statePath);
+  await restarted.initialize();
+  const migrated = (await loadLiveState(statePath)).positions[0];
+  assert.ok(migrated);
+  assert.equal(
+    migrated.jupiterPositionPubkey,
+    `swap-v2:${identity.jupiterMarketId}:${identity.jupiterOutcomeMint}`,
+  );
+  assert.equal(migrated.jupiterEntryPositionPubkey, "legacy-forecast-position");
+  assert.equal(migrated.settlementError, null);
+
+  assert.equal(await restarted.recordSettlementError(identity.key, new Error("outcome token not settled")), true);
+  assert.equal(await restarted.recordSettlementError(identity.key, new Error("outcome token not settled")), false);
+  assert.equal(restarted.snapshot().positions[0]?.settlementError, "outcome token not settled");
+  assert.equal((await loadLiveState(statePath)).positions[0]?.settlementError, "outcome token not settled");
 });
 
 test("live trader accepts a favorable size quote above the old five-percent tolerance", async () => {

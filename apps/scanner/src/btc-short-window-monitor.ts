@@ -1964,8 +1964,32 @@ async function runLiveSettlementLoop(input: {
           `profit=$${formatUsd(settlement.realizedProfitMicroUsd)} ` +
           `Poly=${settlement.polymarketWon ? "WIN" : "LOSE"} Jup=${settlement.jupiterWon ? "WIN" : "LOSE"}`,
         );
-      } catch {
-        // Venue resolution and claim APIs can lag. Persisted per-leg flags make retries idempotent.
+      } catch (error) {
+        // Venue resolution and auto-settlement can lag. Persisted per-leg flags
+        // make retries idempotent, while the first distinct failure remains
+        // visible instead of looking like an indefinitely unresolved market.
+        const message = errorMessage(error);
+        const changed = await input.trader.recordSettlementError(position.pair.key, error);
+        updateLiveStrategyStatus(input.statusStore, input.trader);
+        if (changed) {
+          input.statusStore.recordEvent({
+            type: "live_settlement_error",
+            level: "warn",
+            duration: position.pair.duration,
+            code: "LIVE_SETTLEMENT_RETRY",
+            message: `${position.id}: ${message}`,
+          });
+          await input.writer.append({
+            schemaVersion: 2,
+            type: "live_settlement_error",
+            sessionId: input.sessionId,
+            at: iso(Date.now()),
+            positionId: position.id,
+            duration: position.pair.duration,
+            message,
+          });
+          console.warn(`[${position.pair.duration}] LIVE SETTLEMENT RETRY ${position.id}: ${message}`);
+        }
       }
     }
     updateLiveStrategyStatus(input.statusStore, input.trader);
