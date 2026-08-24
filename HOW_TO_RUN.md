@@ -212,7 +212,6 @@ Common controls:
 
 | Option | Default | Effect |
 | --- | ---: | --- |
-| `--max-reference-difference-usd=30` | `$30` | Requires the opening references to differ by strictly less than this amount |
 | `--max-venue-allocation-usd=50` | `$50` | Maximum cost at each venue for one position |
 | `--maximum-open-positions=5` | `5` | Portfolio-wide unsettled-position limit; wallet balances can impose a lower practical limit |
 | `--minimum-entry-edge-usd=0.001` | `$0.001` | Minimum modeled edge per contract after entry fees |
@@ -345,7 +344,6 @@ A new state file does not close or forget positions on-chain; it only tells the 
 - `ENTRY_CUTOFF_REACHED`: fewer than 30 seconds remain, so the bot correctly refuses a new position.
 - `ENTRY_PREFLIGHT_COOLDOWN`: a recent exact-quote or venue preflight failed; the affected pair is waiting for its short classified retry delay.
 - `POST_FILL_HEDGE_LOSS_LIMIT_EXCEEDED`: one venue already filled, but the available Jupiter hedge exceeded both `--maximum-emergency-hedge-loss-usd` and the already-at-risk Polymarket entry cost; the bot attempts the supported first-leg unwind and otherwise halts with the reconciled exposure.
-- `REFERENCE_DIFFERENCE_NOT_STRICTLY_BELOW_LIMIT`: the venues' opening references did not satisfy `--max-reference-difference-usd`.
 - No candidates: displayed raw asks may cease to qualify after taker fees, minimum collateral, exact Swap pricing, available depth, or the configured profit floors.
 - Port `3210` already occupied: another scanner/live bot may be running. Inspect it before choosing another port; never bypass the live lock to run two bots against the same state.
 - Degen price WebSocket repeatedly disconnects: the client reconnects automatically. Live execution still requires a fresh authenticated rolling build; the socket is only an indicative size selector. If Jupiter has moved its public frontend service, set `JUPITER_PREDICTION_PRICE_WEBSOCKET_URL` only after verifying the replacement endpoint and payload schema.

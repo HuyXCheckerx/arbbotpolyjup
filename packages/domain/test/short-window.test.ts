@@ -7,14 +7,8 @@ import {
   evaluateCrossVenueRoutes,
   jupiterPredictionTakerFeeTotalMicroUsd,
   polymarketCryptoTakerFeePerContractMicroUsd,
-  referencePricesWithin,
 } from "../src/short-window.ts";
 import type { BinaryOrderBook } from "../src/types.ts";
-
-test("requires a strict cross-venue reference-price difference below the configured threshold", () => {
-  assert.equal(referencePricesWithin(72_000_000_000n, 72_004_999_999n, 5_000_000n), true);
-  assert.equal(referencePricesWithin(72_000_000_000n, 72_005_000_000n, 5_000_000n), false);
-});
 
 test("selects the threshold-dominance route from cross-venue reference ordering", () => {
   assert.deepEqual(eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n), [{

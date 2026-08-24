@@ -280,8 +280,7 @@ function updateMarketBox(durKey, durData) {
   if (durData.references?.differenceUsd !== null && durData.references?.differenceUsd !== undefined) {
     const diff = Number(durData.references.differenceUsd);
     diffEl.textContent = `$${diff.toFixed(2)}`;
-    const limit = Number(durData.references?.limitUsd);
-    diffEl.style.color = Number.isFinite(limit) && diff < limit ? "var(--green)" : "var(--red)";
+    diffEl.style.color = "var(--text-bright)";
   } else {
     diffEl.textContent = "—";
     diffEl.style.color = "var(--text-bright)";

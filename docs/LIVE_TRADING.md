@@ -9,7 +9,7 @@ No live order is submitted by installation, tests, dashboard startup, or monitor
 For each current BTC 5-minute and 15-minute round, the process:
 
 1. Pairs only equal-duration markets with identical start and end times.
-2. Requires exact opening references to differ by strictly less than `$30`.
+2. Records the exact opening-reference difference for basis-risk diagnostics without rejecting the pair based on its size.
 3. Selects the complementary route implied by the two opening references.
 4. Uses the public Degen top-price WebSocket only to select an indicative complementary route and starting size. Live mode continuously requests authenticated unsigned executable builds through a shared 8-RPS scheduler and caches the newest response per outcome. Slower out-of-order responses are discarded, and a build older than `500ms` cannot arm entry. Exact sizing steps down when Jupiter price impact removes the edge and grows by at most 25% only after the current executable size remains profitable. The selected size must preserve at least `$0.001` per contract and `$0.10` total after exact Jupiter pricing, modeled Polymarket fees, depth haircut and protected limit price.
 5. Uses Jupiter Prediction `/orders` → `/execute` for native Forecast deposits of at least `$5`, matching the recommended website-style path. Smaller direct Swap V2 legs are disabled unless `--allow-sub-five-jupiter-swap` is supplied. Swap orders omit manual slippage so Jupiter can use RTSE; standard `POLY-*` prediction markets always use Prediction.
@@ -218,7 +218,7 @@ The JSONL contains public market/order/transaction identifiers but no wallet sec
 | Maximum signed Jupiter quote age at submission | `0.5 seconds` |
 | Base emergency hedge loss after first-leg fill | `$1`; may expand to the already-at-risk Polymarket entry cost |
 | Jupiter execution wait | `20 seconds` |
-| Opening-reference difference | strictly `< $30` |
+| Opening-reference difference | informational only; no maximum gate |
 
 Example with tighter risk limits:
 

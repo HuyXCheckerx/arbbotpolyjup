@@ -16,7 +16,6 @@ import {
   eligibleCrossVenueRoutes,
   evaluateCrossVenueRoutes,
   referenceDifferenceMicroUsd,
-  referencePricesWithin,
   type CrossVenueShortWindowRoute,
   type EvaluatedCrossVenueRoute,
   type ShortWindowOutcome,
@@ -107,7 +106,6 @@ const DURATION_MS: Readonly<Record<Duration, number>> = {
   "5m": 5 * 60 * 1_000,
   "15m": 15 * 60 * 1_000,
 };
-const DEFAULT_MAX_REFERENCE_DIFFERENCE_USD = "30";
 const DEFAULT_OUTPUT = "logs/btc-poly-jup-short-window-arb.jsonl";
 const DEFAULT_LIVE_STATE = "logs/btc-poly-jup-short-window-live-state.json";
 const LIVE_BALANCE_REFRESH_MS = 5_000;
@@ -171,7 +169,6 @@ type JupiterBookSource = Extract<PairEvent, { type: "jupiter_book" }>["source"];
 
 interface MonitorConfiguration {
   routeSelectionMode: "reference_directed" | "any_complementary";
-  maximumReferenceDifferenceMicroUsd: bigint;
   referenceRetryMs: number;
   referenceApiTimeoutMs: number;
   sampleIntervalMs: number;
@@ -214,9 +211,11 @@ async function main(): Promise<void> {
   }
 
   const outputPath = resolve(process.cwd(), args.string("output", DEFAULT_OUTPUT));
-  const maximumReferenceDifferenceMicroUsd = parseUsd(
-    args.string("max-reference-difference-usd", DEFAULT_MAX_REFERENCE_DIFFERENCE_USD),
-  );
+  if (args.has("max-reference-difference-usd")) {
+    console.warn(
+      "--max-reference-difference-usd is deprecated and ignored; opening-reference difference is informational only.",
+    );
+  }
   const referenceRetryMs = args.integer("reference-retry-ms", 2_000);
   const referenceApiTimeoutMs = args.integer("reference-api-timeout-ms", 2_000);
   const sampleIntervalMs = args.integer("sample-interval-ms", 50);
@@ -280,7 +279,6 @@ async function main(): Promise<void> {
   if (liveTestEntry && (checkPolymarketReadiness || checkLiveReadiness || args.has("setup-trading-approvals"))) {
     throw new Error("--live-test-entry cannot be combined with setup or readiness-only modes");
   }
-  if (maximumReferenceDifferenceMicroUsd <= 0n) throw new Error("--max-reference-difference-usd must be greater than zero");
   if (referenceRetryMs < 250) throw new Error("--reference-retry-ms must be at least 250");
   if (referenceApiTimeoutMs < 250) throw new Error("--reference-api-timeout-ms must be at least 250");
   if (sampleIntervalMs < 25 || sampleIntervalMs > 2_500) {
@@ -361,7 +359,6 @@ async function main(): Promise<void> {
     sessionId,
     startedAtMs,
     outputPath,
-    limitUsd: formatUsd(maximumReferenceDifferenceMicroUsd),
     paperStrategyEnabled: paperTrade,
     liveStrategyEnabled: liveTrade,
   });
@@ -405,7 +402,6 @@ async function main(): Promise<void> {
   };
   const configuration: MonitorConfiguration = {
     routeSelectionMode: anyComplementaryRoute ? "any_complementary" : "reference_directed",
-    maximumReferenceDifferenceMicroUsd,
     referenceRetryMs,
     referenceApiTimeoutMs,
     sampleIntervalMs,
@@ -597,8 +593,7 @@ async function main(): Promise<void> {
       pairing: "POLYMARKET_VS_JUPITER_PREDICTION",
       routeSelectionMode: configuration.routeSelectionMode,
       jupiterProviders: dailyThresholdEnabled ? ["bisonfi", "polymarket"] : ["bisonfi"],
-      maximumReferenceDifferenceMicroUsd,
-      maximumReferenceDifferenceUsd: formatUsd(maximumReferenceDifferenceMicroUsd),
+      referenceDifferenceFilter: "disabled",
       referenceRetryMs,
       referenceApiTimeoutMs,
       sampleIntervalMs,
@@ -682,7 +677,7 @@ async function main(): Promise<void> {
   if (dailyThresholdEnabled) {
     console.log("Also discovering exact Bitcoin-above-strike daily POLY-* pairs and selecting the best executable route.");
   }
-  console.log(`Reference difference must be strictly below $${formatUsd(maximumReferenceDifferenceMicroUsd)}.`);
+  console.log("Opening-reference difference is informational only; no maximum-difference gate is applied.");
   console.log("Candidates are not guaranteed: Polymarket settles on TWAP 60s; Jupiter Forecast settles on Chainlink spot.");
   console.log(
     liveTrade
@@ -897,7 +892,7 @@ async function runDurationLoop(input: {
         polymarket: emptyReferenceStatus(),
         jupiter: emptyReferenceStatus(),
         differenceUsd: null,
-        limitUsd: formatUsd(input.configuration.maximumReferenceDifferenceMicroUsd),
+        limitUsd: null,
       },
       books: { polymarket: null, jupiter: null },
       bestRoute: null,
@@ -998,34 +993,9 @@ async function runDurationLoop(input: {
         polymarket: referenceStatus(polymarketReference),
         jupiter: referenceStatus(jupiterReference),
         differenceUsd: formatUsd(differenceMicroUsd),
-        limitUsd: formatUsd(input.configuration.maximumReferenceDifferenceMicroUsd),
+        limitUsd: null,
       },
     });
-    if (!referencePricesWithin(
-      polymarketReference.priceMicroUsd,
-      jupiterReference.priceMicroUsd,
-      input.configuration.maximumReferenceDifferenceMicroUsd,
-    )) {
-      await input.writer.append({
-        schemaVersion: 2,
-        type: "pair_rejected",
-        sessionId: input.sessionId,
-        at: iso(Date.now()),
-        reason: "REFERENCE_DIFFERENCE_NOT_STRICTLY_BELOW_LIMIT",
-        pair: pairLog(pair),
-        references: referencesLog(polymarketReference, jupiterReference, differenceMicroUsd),
-      });
-      input.statusStore.updateDuration(input.duration, {
-        phase: "rejected",
-        message: `Pair rejected: opening references differ by $${formatUsd(differenceMicroUsd)}; the strict limit is below $${formatUsd(input.configuration.maximumReferenceDifferenceMicroUsd)}.`,
-      });
-      console.log(
-        `[${input.duration}] REJECTED references differ by $${formatUsd(differenceMicroUsd)} ` +
-        `(limit < $${formatUsd(input.configuration.maximumReferenceDifferenceMicroUsd)}).`,
-      );
-      await waitUntil(endMs + 50, input.signal);
-      continue;
-    }
 
     const routes = input.configuration.routeSelectionMode === "any_complementary"
       ? allComplementaryCrossVenueRoutes()
@@ -1050,8 +1020,8 @@ async function runDurationLoop(input: {
     input.statusStore.updateDuration(input.duration, {
       phase: "qualified",
       message: input.configuration.routeSelectionMode === "any_complementary"
-        ? "Opening references qualify. Evaluating both complementary routes and taking the best qualified net edge."
-        : `Opening references qualify. Starting both order-book feeds for ${routes.map(formatRoute).join(" or ")}.`,
+        ? "Opening references observed. Evaluating both complementary routes and taking the best qualified net edge."
+        : `Opening references observed. Starting both order-book feeds for ${routes.map(formatRoute).join(" or ")}.`,
     });
     console.log(
       `[${input.duration}] QUALIFIED Poly=$${formatUsd(polymarketReference.priceMicroUsd)} ` +
@@ -3314,7 +3284,7 @@ Behavior:
   - Separately pairs Polymarket 15m with native Jupiter Forecast 15m.
   - Discovers upcoming “Bitcoin above ___ on <date>?” POLY-* ladders, verifies exact rules/tokens,
     and evaluates the best complementary YES/NO route across all qualifying dates and strikes.
-  - Requires identical start/end times and a strict opening-reference difference below $30 by default.
+  - Requires identical start/end times; opening-reference difference is recorded but does not reject a pair.
   - --any-complementary-route evaluates both complementary directions and selects the best qualifying net edge.
   - Streams Polymarket books and Jupiter's public Degen top prices for indicative route/size selection.
   - Live mode continuously rolls authenticated exact executable Jupiter builds; only fresh builds can arm entry.
@@ -3326,7 +3296,6 @@ Behavior:
   - --live-test-entry deliberately permits one unprofitable real entry and requires a second confirmation phrase.
 
 Options:
-  --max-reference-difference-usd=30 Strict reference-price difference limit
   --any-complementary-route          Ignore reference direction and rank both complementary routes
   --reference-retry-ms=2000         Exact-reference retry interval
   --reference-api-timeout-ms=2000   Polymarket price-to-beat API timeout

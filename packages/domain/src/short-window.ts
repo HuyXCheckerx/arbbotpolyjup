@@ -38,14 +38,6 @@ export interface EvaluatedCrossVenueRoute {
   isFeeAdjustedCandidate: boolean;
 }
 
-export function referencePricesWithin(
-  polymarketReferenceMicroUsd: bigint,
-  jupiterReferenceMicroUsd: bigint,
-  maximumDifferenceMicroUsd: bigint,
-): boolean {
-  return absolute(polymarketReferenceMicroUsd - jupiterReferenceMicroUsd) < maximumDifferenceMicroUsd;
-}
-
 export function referenceDifferenceMicroUsd(
   polymarketReferenceMicroUsd: bigint,
   jupiterReferenceMicroUsd: bigint,

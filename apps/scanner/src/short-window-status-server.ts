@@ -66,7 +66,7 @@ export interface DurationStatus {
     polymarket: ReferenceStatus;
     jupiter: ReferenceStatus;
     differenceUsd: string | null;
-    limitUsd: string;
+    limitUsd: string | null;
   };
   books: {
     polymarket: BookStatus | null;
@@ -172,7 +172,6 @@ export class ShortWindowStatusStore {
   readonly #sessionId: string;
   readonly #startedAt: string;
   readonly #outputPath: string;
-  readonly #limitUsd: string;
   readonly #readOnly: boolean;
   #running = true;
   readonly #feeds: ShortWindowStatusSnapshot["feeds"];
@@ -185,14 +184,12 @@ export class ShortWindowStatusStore {
     sessionId: string;
     startedAtMs: number;
     outputPath: string;
-    limitUsd: string;
     paperStrategyEnabled?: boolean;
     liveStrategyEnabled?: boolean;
   }) {
     this.#sessionId = input.sessionId;
     this.#startedAt = new Date(input.startedAtMs).toISOString();
     this.#outputPath = input.outputPath;
-    this.#limitUsd = input.limitUsd;
     this.#readOnly = !input.liveStrategyEnabled;
     this.#feeds = {
       polymarketTwap: initialFeed(),
@@ -220,8 +217,8 @@ export class ShortWindowStatusStore {
       updatedAt: new Date().toISOString(),
     };
     this.#durations = {
-      "5m": initialDuration("5m", input.limitUsd),
-      "15m": initialDuration("15m", input.limitUsd),
+      "5m": initialDuration("5m"),
+      "15m": initialDuration("15m"),
     };
   }
 
@@ -360,7 +357,7 @@ function initialFeed(): FeedStatus {
   };
 }
 
-function initialDuration(duration: ShortWindowDuration, limitUsd: string): DurationStatus {
+function initialDuration(duration: ShortWindowDuration): DurationStatus {
   return {
     duration,
     phase: "discovering",
@@ -374,7 +371,7 @@ function initialDuration(duration: ShortWindowDuration, limitUsd: string): Durat
       polymarket: { ready: false, priceUsd: null, source: null },
       jupiter: { ready: false, priceUsd: null, source: null },
       differenceUsd: null,
-      limitUsd,
+      limitUsd: null,
     },
     books: { polymarket: null, jupiter: null },
     bestRoute: null,

@@ -115,7 +115,6 @@ pnpm monitor:short-window -- --help
 
 | Option | Default | Meaning |
 | --- | ---: | --- |
-| `--max-reference-difference-usd` | `30` | Strict opening-reference difference limit |
 | `--reference-retry-ms` | `2000` | Retry interval while references are unavailable |
 | `--reference-api-timeout-ms` | `2000` | Polymarket web reference timeout |
 | `--sample-interval-ms` | `50` | Minimum interval between WebSocket-triggered route evaluations; execution remains responsive at this cadence |
