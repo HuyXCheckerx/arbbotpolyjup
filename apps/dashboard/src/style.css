@@ -412,6 +412,15 @@ body {
   border: 1px solid var(--red-border);
 }
 
+.pos-risk-line {
+  font-size: 10px;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+  padding: 4px 8px;
+  border-radius: 2px;
+  border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent);
+}
+
 /* EMPTY STATE */
 .empty-state {
   text-align: center;

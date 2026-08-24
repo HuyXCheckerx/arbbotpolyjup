@@ -1777,14 +1777,19 @@ async function monitorQualifiedPair(input: {
         }
       }
       if (liveDecision?.type === "entry" || liveDecision?.type === "exit" || liveDecision?.type === "halt" ||
-        liveDecision?.type === "recovery") {
+        liveDecision?.type === "recovery" || liveDecision?.type === "recovery_plan") {
+        const eventType = liveDecision.type === "entry"
+          ? "live_entry"
+          : liveDecision.type === "exit"
+            ? "live_exit"
+            : liveDecision.type === "recovery"
+              ? "live_recovery"
+              : liveDecision.type === "recovery_plan" ? "live_recovery_plan" : "live_halt";
         input.statusStore.recordEvent({
-          type: liveDecision.type === "entry"
-            ? "live_entry"
-            : liveDecision.type === "exit"
-              ? "live_exit"
-              : liveDecision.type === "recovery" ? "live_recovery" : "live_halt",
-          level: liveDecision.type === "halt" ? "error" : "success",
+          type: eventType,
+          level: liveDecision.type === "halt"
+            ? "error"
+            : liveDecision.type === "recovery_plan" ? "warn" : "success",
           duration: input.pair.duration,
           message: liveDecision.type === "entry"
             ? `Filled ${liveDecision.position.id} ${input.pair.duration} position (${formatContracts(liveDecision.position.originalContractsMicro)} contracts)`
@@ -1792,15 +1797,13 @@ async function monitorQualifiedPair(input: {
               ? `Exited ${liveDecision.positionId} (${formatUsd(liveDecision.realizedProfitMicroUsd)} profit)`
               : liveDecision.type === "halt"
                 ? `Halted: ${liveDecision.reason}`
+                : liveDecision.type === "recovery_plan"
+                  ? `Position ${liveDecision.position.id} isolated for quote-based repair; other pairs remain enabled`
                 : `Recovery executed`,
         });
         await input.writer.append({
           schemaVersion: 2,
-          type: liveDecision.type === "entry"
-            ? "live_entry"
-            : liveDecision.type === "exit"
-              ? "live_exit"
-              : liveDecision.type === "recovery" ? "live_recovery" : "live_halt",
+          type: eventType,
           sessionId: input.sessionId,
           at: iso(atMs),
           duration: input.pair.duration,
@@ -1830,6 +1833,13 @@ async function monitorQualifiedPair(input: {
             (unwound
               ? `${liveDecision.positionId} automatically sold the Polymarket-only fill.`
               : `${liveDecision.positionId} confirmed zero exposure on both venues; no recovery order was submitted.`),
+          );
+        } else if (liveDecision.type === "recovery_plan") {
+          console.warn(
+            `[${input.pair.duration}] LIVE RECOVERY PLAN ${liveDecision.position.id}: ` +
+            `singleWinnerFloor=$${formatUsd(liveDecision.plan.intendedSingleWinnerFloorMicroUsd)} ` +
+            `bothLose=$${formatUsd(liveDecision.plan.scenarios.find((scenario) => scenario.code === "both_lose")?.pnlMicroUsd ?? 0n)} ` +
+            `action=${liveDecision.plan.action}; unrelated pairs remain enabled`,
           );
         } else {
           console.error(`[${input.pair.duration}] LIVE TRADER HALTED: ${liveDecision.reason}`);
@@ -2856,6 +2866,17 @@ function liveDecisionLog(decision: LiveDecision): object {
       recovery: decision.recovery ?? null,
     };
   }
+  if (decision.type === "recovery_plan") {
+    return {
+      type: decision.type,
+      reason: decision.reason,
+      positionId: decision.position.id,
+      phase: decision.position.phase,
+      plan: decision.plan,
+      preflight: decision.preflight ?? null,
+      execution: decision.execution ?? null,
+    };
+  }
   if (decision.type === "exit") {
     return {
       type: decision.type,
@@ -3109,6 +3130,9 @@ function liveCandidateStatusMessage(
   }
   if (decision.type === "recovery") {
     return `LIVE AUTO RECOVERY completed for ${label}: zero exposure confirmed; no recovery trade was submitted.`;
+  }
+  if (decision.type === "recovery_plan") {
+    return `LIVE position isolated for quote-based repair while other pairs remain enabled: ${decision.reason}.`;
   }
   if (decision.type === "halt") return `Candidate halted live trading: ${decision.reason}.`;
   return `Fresh candidate not executed: ${decision.reason}.`;

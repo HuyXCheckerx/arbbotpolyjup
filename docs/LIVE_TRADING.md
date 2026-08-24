@@ -18,10 +18,36 @@ For each current BTC 5-minute and 15-minute round, the process:
 8. Re-reads the selected Polymarket CLOB immediately before signing, ignores the final 20% of displayed depth by default, and signs an exact-share marketable FOK. Its maximum price is the smaller of the configured price buffer and the price that preserves both profit floors. The Jupiter validation uses Swap V2's guaranteed `otherAmountThreshold`, not only optimistic output. No venue submission happens during this preparation phase.
 9. Submits Polymarket first. A zero FOK fill explicitly skips Jupiter. After a fill, the bot executes the already-signed Jupiter build when fresh and conservatively size-matched; otherwise it requotes. An ambiguous `/execute` response resubmits the identical signed transaction and request ID once. A definitive 6001 no-fill builds and submits at most one fresh bounded transaction.
 10. Once Polymarket has filled, the second leg becomes exposure management: the Jupiter hedge-loss budget is the larger of `--maximum-emergency-hedge-loss-usd` (default `$1`) and the already-at-risk Polymarket entry cost. This may allow a hedge to be submitted, but it does not let that trade be reported as a successful arb.
-11. For Prediction atomic swaps, confirms the Solana transaction and derives the executed Forecast contracts and USDC cost from the wallet's token-balance deltas. The quote's `newContractsMicro` is retained only as diagnostics. It then recomputes both actual payoff cases. A fill whose real worst-case P&L or per-contract edge misses the configured minimum is quarantined and halts new entries.
+11. For Prediction atomic swaps, confirms the Solana transaction and derives the executed Forecast contracts and USDC cost from the wallet's token-balance deltas. The quote's `newContractsMicro` is retained only as diagnostics. It then projects all four joint outcomes: Polymarket-only win, Jupiter-only win, both win, and both lose. The latter two are possible because venue resolution observations are not identical. A fully known fill whose single-winner floor misses the configured minimum is isolated as `recovery_planning`; unrelated pairs remain enabled. Unknown fill quantities or identities still halt globally.
 12. Holds a safely reconciled position through market resolution. Forecast settlement P&L is booked from the confirmed on-chain USDC credit, not the expected/quoted token count. After settlement, the bot closes its empty Forecast Token-2022 account and returns its rent SOL to the wallet.
 
 The executed Forecast USDC debit is included in strategy P&L. SOL transaction fees are not converted into USD P&L, but empty Forecast token-account rent is automatically reclaimed after settlement.
+
+## Four-state payoff and repair model
+
+Let `P` be the confirmed Polymarket contracts, `J` the confirmed Jupiter contracts, and `C` the combined confirmed entry cost. A winning contract pays `$1`, so the position is modeled as:
+
+| Joint resolution | Payout | Terminal P&L | Why it can happen |
+|---|---:|---:|---|
+| Polymarket wins, Jupiter loses | `P` | `P - C` | The Polymarket observation selects the bought side and Jupiter's selects the opposite side |
+| Polymarket loses, Jupiter wins | `J` | `J - C` | Jupiter's observation selects the bought side and Polymarket's selects the opposite side |
+| Both win | `P + J` | `P + J - C` | Different observation methods/times can make both bought outcomes true |
+| Both lose | `0` | `-C` | Different observation methods/times can make both bought outcomes false |
+
+The configured entry edge tests the first two intended single-winner cases. It is not a guarantee across the final two oracle-divergence cases. Cancelled, voided, or exceptional venue resolutions must be reconciled under each market's published rules and are not silently treated as one of these four normal binary outcomes.
+
+For a fully known position that misses its single-winner floor, `quote_repair` means the next safe action is to obtain fresh executable quotes for trimming the larger leg, topping up the smaller leg, and unwinding either or both legs. A candidate repair must include its new cost/proceeds in the same four-state matrix, improve the intended single-winner floor, respect capital/slippage/time limits, and not increase maximum modeled loss beyond policy. Until those quotes exist, placing a guessed top-up can make every bad state worse, so the implementation isolates and reports the position without submitting a new order.
+
+Execution outcomes are handled separately from resolution outcomes:
+
+| Confirmed execution state | Action | Reason |
+|---|---|---|
+| Zero contracts on both venues | Clear the attempt and retry after cooldown when time permits | There is no exposure to repair |
+| Polymarket-only fill | Attempt the existing protected FOK unwind; halt if the unwind result or remaining balance is uncertain | A blind Jupiter catch-up can lock in a larger loss, and an ambiguous sell can hide residual exposure |
+| Jupiter-only fill with confirmed zero Polymarket balance | Isolate as `quote_repair` | Exact exposure is known, but an opposite-leg quote or Jupiter unwind is needed before acting |
+| Both fills, size/cost floors pass | Normal hold/exit management | Intended single-winner economics remain acceptable, with four-state basis risk still reported |
+| Both fills, size/cost floors fail | Isolate as `quote_repair` | Fresh trim/top-up/unwind quotes must be compared before another order |
+| Pending, identity-mismatched, or quantity-ambiguous result | Global halt | A new order could double an exposure that has not yet been measured |
 
 ## Hard safety behavior
 
@@ -34,9 +60,9 @@ The executed Forecast USDC debit is included in strategy P&L. SOL transaction fe
 - A stale or unavailable rolling Jupiter executable quote cannot trigger an entry. Public Degen prices and generic Jupiter orderbook asks never arm live entry, and balanced open positions do not consume REST requests for exit screening.
 - New entries stop in the final 30 seconds of both 5m and 15m rounds.
 - State is atomically persisted with file mode `0600` before and after execution phases.
-- An ambiguous submission, unmatched second leg, excessive observed size skew, negative actual payoff, or mismatched exit halts all new entries. Knowing both balances removes ambiguity; it does not make an unprofitable fill safe.
+- An ambiguous submission, unknown second leg, identity mismatch, or mismatched exit halts all new entries. A fully reconciled two-leg fill with excessive skew or a negative intended single-winner payoff is isolated for quote-based repair instead. Knowing both balances removes ambiguity; it does not make an unprofitable fill safe.
 - A terminal entry rejection automatically clears without a recovery trade only after both market-token balances are read back as zero. Structured terminal rejections can recover immediately; a persisted Jupiter terminal failure is retried read-only after the round closes and on later wallet refreshes. A zero-exposure attempt may retry the still-open pair after its short cooldown. Unknown, pending, nonzero, or identity-mismatched exposure remains halted.
-- Only bounded, still-profitable two-sided residuals remain open. Larger or negative-payoff residuals stay quarantined until close, then advance through verified settlement. Known terminal one-sided fills receive the same settlement treatment. Unknown or pending fills remain halted.
+- Only bounded, still-profitable two-sided residuals remain normally open. Larger or negative-payoff residuals enter `recovery_planning`, reserve a position slot, expose their four-state payoff matrix in status/log output, and advance through verified settlement if no proven repair is available before close. Known terminal one-sided fills receive the same settlement treatment. Unknown or pending fills remain halted.
 - Entry-preflight failures write a dedicated `live_entry_preflight_failed` record with the failing stage, stable code, retry class, cooldown duration, quote reuse/age, execution path, endpoint, request ID, router/mode, per-stage latency, and nested error metadata. Execution diagnostics now record quoted contracts/cost, confirmed executed contracts/cost, contract shortfall, reconciliation source, transaction signature, and nested venue errors.
 - On the first upgraded startup, any realized P&L produced by the old quote-derived accounting is moved to `legacyUnverifiedRealizedProfitMicroUsd`; verified realized P&L restarts at zero. A still-open legacy Jupiter position is halted as `LEGACY_UNVERIFIED_JUPITER_FILL` because its historical transaction must be reconciled before it can be trusted.
 - The setup command submits only Polymarket approval transactions and exits; it cannot continue into market trading.
@@ -218,7 +244,7 @@ If the dashboard or terminal says `LIVE TRADER HALTED`:
 2. Inspect both venues using the public order, position, token, and transaction IDs in the JSONL/state file.
 3. If the halt records a terminal Jupiter entry failure and zero recorded exposure, keep the same state file available. The bot will re-read both outcome-token balances after close and automatically clear the halt only when both are zero; a `live_recovery` record explains the proof used.
 4. If Polymarket filled but the Jupiter hedge exceeded the emergency loss budget or failed terminally, the bot first waits for Polygon settlement, refreshes the CLOB's conditional-token balance/allowance cache, and then attempts its protected Polymarket unwind. If the bought balance was temporarily reported as zero, the halted runtime and startup recovery passes retry the unwind while the market remains open. A successful unwind clears the position and writes `live_recovery`; an unsuccessful unwind remains halted with the exact observed balance.
-5. If the halt is a fully observed entry size/payoff mismatch or known terminal one-sided fill, the bot waits until market close and keeps the position quarantined for settlement. Forecast payout recognition waits for the real USDC credit; empty outcome-token account rent is then reclaimed automatically.
+5. A fully observed entry size/payoff mismatch is not a global halt: it becomes an isolated `quote_repair` plan and shows all four terminal P&Ls. A known terminal one-sided fill remains managed for settlement. Forecast payout recognition waits for the real USDC credit; empty outcome-token account rent is then reclaimed automatically.
 6. If either venue fill remains unknown or is one-sided for any other reason, determine the exact quantity and manually neutralize it if necessary; automatic recovery and redemption will not guess.
 7. Preserve the halted state file as the audit record.
 8. After all exposure is accounted for, start with a new explicit state path, for example `--live-state=logs/live-state-after-manual-recovery.json`.

@@ -112,17 +112,20 @@ function renderPositions(positions = [], awaitingCount = 0) {
     const hedgeStatus = pos.hedgeStatus || (pos.isHedged ? "perfect" : "exposure_error");
     const isPerfect = hedgeStatus === "perfect";
     const isBoundedResidual = hedgeStatus === "bounded_residual";
+    const isRecoveryPlanning = hedgeStatus === "recovery_planning";
     const residualPercent = pos.contractSkewBps === null || pos.contractSkewBps === undefined
       ? null
       : (Number(pos.contractSkewBps) / 100).toFixed(2);
-    const badgeClass = isPerfect ? "green" : isBoundedResidual ? "amber" : "red";
+    const badgeClass = isPerfect ? "green" : isBoundedResidual || isRecoveryPlanning ? "amber" : "red";
     const badgeLabel = isPerfect
       ? "✔ PERFECTLY HEDGED"
       : isBoundedResidual
         ? `◆ HEDGED · ${escapeHtml(residualPercent || "0.00")}% RESIDUAL`
-        : "✖ EXPOSURE ERROR";
-    const cardClass = isPerfect ? "hedged-perfect" : isBoundedResidual ? "hedged-residual" : "hedged-bad";
-    const skewColor = isPerfect ? "var(--green)" : isBoundedResidual ? "var(--amber)" : "var(--red)";
+        : isRecoveryPlanning
+          ? "◆ ISOLATED · QUOTE REPAIR"
+          : "✖ EXPOSURE ERROR";
+    const cardClass = isPerfect ? "hedged-perfect" : isBoundedResidual || isRecoveryPlanning ? "hedged-residual" : "hedged-bad";
+    const skewColor = isPerfect ? "var(--green)" : isBoundedResidual || isRecoveryPlanning ? "var(--amber)" : "var(--red)";
 
     const polySideClass = pos.polymarketOutcome.toUpperCase() === "UP" ? "up" : "down";
     const jupSideClass = pos.jupiterOutcome.toUpperCase() === "UP" ? "up" : "down";
@@ -154,6 +157,12 @@ function renderPositions(positions = [], awaitingCount = 0) {
     const realizedProfitUsd = escapeHtml(pos.realizedProfitUsd || "0.00");
     const enteredAt = escapeHtml(formatTime(pos.enteredAt));
     const phaseLabel = escapeHtml(pos.phase ? pos.phase.replace("_", " ").toUpperCase() : "OPEN");
+    const postFillActionValue = pos.postFillAction || "manual_reconciliation";
+    const postFillAction = escapeHtml(postFillActionValue.replaceAll("_", " ").toUpperCase());
+    const postFillReason = escapeHtml(pos.postFillReason || "No post-fill risk classification available.");
+    const postFillRiskClass = postFillActionValue === "hold_or_exit_normally"
+      ? "pos-risk-line"
+      : "pos-error-line";
     const errorLine = pos.lastError
       ? `<div class="pos-error-line">ERROR: ${escapeHtml(pos.lastError)}</div>`
       : "";
@@ -221,15 +230,20 @@ function renderPositions(positions = [], awaitingCount = 0) {
         <div class="pos-bottom-row">
           <div>Delta Skew: <b style="color:${skewColor}">${skewVal} contracts</b></div>
           <div>Total Capital: <b>${totalOutlay}</b></div>
-          <div>Min Aligned PnL: <b style="color:${minimumAlignedPnlColor}">${minimumAlignedPnlLabel}</b></div>
-          <div>Poly-win PnL: <b>$${escapeHtml(pos.polymarketWinPnlUsd || "0")}</b></div>
-          <div>Jup-win PnL: <b>$${escapeHtml(pos.jupiterWinPnlUsd || "0")}</b></div>
+          <div>Single-winner Floor: <b style="color:${minimumAlignedPnlColor}">${minimumAlignedPnlLabel}</b></div>
+          <div>Poly-only Win PnL: <b>$${escapeHtml(pos.polymarketWinPnlUsd || "0")}</b></div>
+          <div>Jup-only Win PnL: <b>$${escapeHtml(pos.jupiterWinPnlUsd || "0")}</b></div>
+          <div>Both Win PnL: <b>$${escapeHtml(pos.bothWinPnlUsd || "0")}</b></div>
+          <div>Both Lose PnL: <b style="color:var(--red)">$${escapeHtml(pos.bothLosePnlUsd || "0")}</b></div>
+          <div>Max Modeled Loss: <b style="color:var(--red)">$${escapeHtml(pos.maximumModeledLossUsd || "0")}</b></div>
+          <div>Post-fill Action: <b>${postFillAction}</b></div>
           <div>Jup Rent Reclaimed: <b>${pos.jupiterRentReclaimed ? `✔ ${escapeHtml(pos.jupiterRentReclaimedSol || "0")} SOL` : "⏳ PENDING"}</b></div>
           <div>Realized PnL: <b>$${realizedProfitUsd}</b></div>
           <div>Entered: <b>${enteredAt}</b></div>
         </div>
 
         ${errorLine}
+        <div class="${postFillRiskClass}">FOUR-STATE RISK: ${postFillReason}</div>
         ${settlementErrorLine}
       </div>
     `;

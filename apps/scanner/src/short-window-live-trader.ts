@@ -132,8 +132,39 @@ export type LivePositionPhase =
   | "open"
   | "exiting_jupiter"
   | "exiting_polymarket"
+  | "recovery_planning"
   | "awaiting_resolution"
   | "exposure_error";
+
+export type LiveResolutionScenarioCode =
+  | "polymarket_only_win"
+  | "jupiter_only_win"
+  | "both_win"
+  | "both_lose";
+
+export interface LiveResolutionScenario {
+  code: LiveResolutionScenarioCode;
+  polymarketWon: boolean;
+  jupiterWon: boolean;
+  payoutMicroUsd: bigint;
+  pnlMicroUsd: bigint;
+  rationale: string;
+}
+
+export type LivePostFillAction =
+  | "hold_or_exit_normally"
+  | "quote_repair"
+  | "manual_reconciliation";
+
+export interface LivePostFillRiskPlan {
+  action: LivePostFillAction;
+  reason: string;
+  scenarios: LiveResolutionScenario[];
+  intendedSingleWinnerFloorMicroUsd: bigint;
+  maximumModeledLossMicroUsd: bigint;
+  venueSizeMismatchMicro: bigint;
+  venueSizeMismatchBps: bigint | null;
+}
 
 export interface LivePosition {
   id: string;
@@ -164,6 +195,7 @@ export interface LivePosition {
   entrySubmissionSkewMs: number | null;
   exitSubmissionSkewMs: number | null;
   diagnosticTestEntry: boolean;
+  postFillRiskPlan?: LivePostFillRiskPlan | null;
   lastError: string | null;
   settlementError?: string | null;
 }
@@ -319,6 +351,7 @@ export type LiveDecision = (
   | { type: "entry"; position: LivePosition }
   | { type: "exit"; positionId: string; realizedProfitMicroUsd: bigint; submissionSkewMs: number | null }
   | { type: "recovery"; reason: string; positionId: string }
+  | { type: "recovery_plan"; reason: string; position: LivePosition; plan: LivePostFillRiskPlan }
   | { type: "hold"; reason: string; position?: LivePosition }
   | { type: "skip"; reason: string }
   | { type: "halt"; reason: string; position?: LivePosition }
@@ -401,13 +434,39 @@ export class ShortWindowLiveTrader {
       position.entrySubmissionSkewMs ??= null;
       position.exitSubmissionSkewMs ??= null;
       position.diagnosticTestEntry ??= false;
-      if (isRetainableFullyObservedSizeMismatch(position, this.#config.strategy)) {
+      position.postFillRiskPlan ??= null;
+      if (position.phase === "exposure_error" &&
+        isKnownTerminalOneSidedEntry(position) &&
+        position.polymarketContractsMicro <= CONTRACT_TOLERANCE_MICRO &&
+        position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO &&
+        Date.now() < position.pair.endMs) {
+        position.postFillRiskPlan = buildPostFillRiskPlan(
+          position,
+          this.#config.strategy,
+          true,
+        );
+        position.phase = "recovery_planning";
+        stateMigrated = true;
+      }
+      if ((position.phase === "recovery_planning" ||
+          (position.phase === "exposure_error" &&
+            position.lastError?.startsWith(OBSERVED_ENTRY_SIZE_MISMATCH) === true)) &&
+        hasFullyObservedTwoLegExposure(position)) {
+        const plan = buildPostFillRiskPlan(position, this.#config.strategy);
+        position.postFillRiskPlan = plan;
         position.originalContractsMicro = minimum(
           position.polymarketContractsMicro,
           position.jupiterContractsMicro,
         );
-        position.phase = Date.now() < position.pair.endMs ? "open" : "awaiting_resolution";
-        position.lastError = null;
+        if (Date.now() >= position.pair.endMs) {
+          position.phase = "awaiting_resolution";
+        } else if (plan.action === "quote_repair") {
+          position.phase = "recovery_planning";
+        } else {
+          position.phase = "open";
+          position.lastError = null;
+        }
+        stateMigrated = true;
       }
       if (canSafelyAwaitResolution(position, Date.now())) position.phase = "awaiting_resolution";
     }
@@ -415,9 +474,7 @@ export class ShortWindowLiveTrader {
     this.#pendingRecoveryDiagnostics.push(
       ...await this.#recoverPersistedPolymarketOnlyEntries("startup", persistedPolymarketCashMicroUsd),
     );
-    const ambiguous = this.#state.positions.find((position) =>
-      position.phase !== "open" && position.phase !== "awaiting_resolution"
-    );
+    const ambiguous = this.#state.positions.find((position) => !isManagedKnownPosition(position));
     if (ambiguous) {
       this.#state.halted = true;
       this.#state.haltReason = ambiguous.lastError ??
@@ -592,7 +649,7 @@ export class ShortWindowLiveTrader {
     position.phase = "awaiting_resolution";
     const released = this.#releaseHaltWithoutBlockingExposure();
     this.#lastAction = (position.lastError
-      ? `${position.pair.duration} fully observed halted exposure is awaiting venue resolution.`
+      ? `${position.pair.duration} fully observed isolated exposure is awaiting venue resolution.`
       : `${position.pair.duration} live position is awaiting venue resolution.`) +
       (released ? " New entries are re-enabled while settlement continues." : "");
     await this.#save();
@@ -743,9 +800,14 @@ export class ShortWindowLiveTrader {
       minimumAlignedPnlUsd: string;
       polymarketWinPnlUsd: string;
       jupiterWinPnlUsd: string;
+      bothWinPnlUsd: string;
+      bothLosePnlUsd: string;
+      maximumModeledLossUsd: string;
+      postFillAction: LivePostFillAction;
+      postFillReason: string;
       contractSkew: string;
       contractSkewBps: string | null;
-      hedgeStatus: "perfect" | "bounded_residual" | "exposure_error";
+      hedgeStatus: "perfect" | "bounded_residual" | "recovery_planning" | "exposure_error";
       isHedged: boolean;
       polymarketSettled: boolean;
       jupiterSettled: boolean;
@@ -779,6 +841,11 @@ export class ShortWindowLiveTrader {
         const matchedMicro = minimum(polyMicro, jupMicro);
         const totalCostMicroUsd = pos.polymarketEntryCostMicroUsd + pos.jupiterEntryCostMicroUsd;
         const payoff = actualEntryPayoffs(pos);
+        const postFillRiskPlan = buildPostFillRiskPlan(
+          pos,
+          this.#config.strategy,
+          isManagedKnownPosition(pos),
+        );
         const contractSkewBps = matchedMicro > 0n ? diffMicro * 10_000n / matchedMicro : null;
         const isHedged = diffMicro <= CONTRACT_TOLERANCE_MICRO &&
           (pos.phase === "open" || pos.phase === "awaiting_resolution") &&
@@ -813,9 +880,16 @@ export class ShortWindowLiveTrader {
           minimumAlignedPnlUsd: formatUsd(payoff.minimumPnlMicroUsd),
           polymarketWinPnlUsd: formatUsd(payoff.polymarketWinPnlMicroUsd),
           jupiterWinPnlUsd: formatUsd(payoff.jupiterWinPnlMicroUsd),
+          bothWinPnlUsd: formatUsd(payoff.bothWinPnlMicroUsd),
+          bothLosePnlUsd: formatUsd(payoff.bothLosePnlMicroUsd),
+          maximumModeledLossUsd: formatUsd(postFillRiskPlan.maximumModeledLossMicroUsd),
+          postFillAction: postFillRiskPlan.action,
+          postFillReason: postFillRiskPlan.reason,
           contractSkew: formatContracts(diffMicro),
           contractSkewBps: contractSkewBps === null ? null : contractSkewBps.toString(),
-          hedgeStatus: isHedged ? "perfect" : isBoundedResidual ? "bounded_residual" : "exposure_error",
+          hedgeStatus: pos.phase === "recovery_planning"
+            ? "recovery_planning"
+            : isHedged ? "perfect" : isBoundedResidual ? "bounded_residual" : "exposure_error",
           isHedged,
           polymarketSettled: pos.polymarketSettled,
           jupiterSettled: pos.jupiterSettled,
@@ -1257,6 +1331,14 @@ export class ShortWindowLiveTrader {
       preflight,
       execution,
     });
+    const recoveryPlanWithDiagnostics = async (
+      reason: string,
+      plan: LivePostFillRiskPlan,
+    ): Promise<LiveDecision> => ({
+      ...await this.#quarantineForRecovery(position, reason, plan),
+      preflight,
+      execution,
+    });
     if (!status) {
       const reason =
         `Sequential entry left Jupiter execution unresolved; Polymarket observed ` +
@@ -1371,8 +1453,10 @@ export class ShortWindowLiveTrader {
       );
     }
     if (position.jupiterContractsMicro <= 0n || position.polymarketContractsMicro <= 0n) {
-      return await haltWithDiagnostics(
-        "Entry did not fill both venues; no one-sided buy catch-up was attempted",
+      const reason = "Entry produced a fully reconciled one-sided fill; no unpriced buy catch-up was attempted";
+      return await recoveryPlanWithDiagnostics(
+        reason,
+        buildPostFillRiskPlan(position, this.#config.strategy, true),
       );
     }
     const retainedSizeMismatch = absolute(
@@ -1386,6 +1470,8 @@ export class ShortWindowLiveTrader {
       ? retainedSizeMismatch * 10_000n / matchedContractsMicro
       : 10_000n;
     const actualPayoffs = actualEntryPayoffs(position);
+    const postFillRiskPlan = buildPostFillRiskPlan(position, this.#config.strategy);
+    position.postFillRiskPlan = postFillRiskPlan;
     const actualEdgePerContract = matchedContractsMicro > 0n
       ? actualPayoffs.minimumPnlMicroUsd * ONE_CONTRACT_MICRO / matchedContractsMicro
       : -ONE_USD_MICRO;
@@ -1394,14 +1480,17 @@ export class ShortWindowLiveTrader {
       actualPayoffs.minimumPnlMicroUsd < this.#config.strategy.minimumEntryEdgeTotalMicroUsd ||
       actualEdgePerContract < this.#config.strategy.minimumEntryEdgeMicroUsdPerContract
     )) {
-      return await haltWithDiagnostics(
+      return await recoveryPlanWithDiagnostics(
         `${OBSERVED_ENTRY_SIZE_MISMATCH}: quoted Jupiter ` +
         `${formatContracts(position.jupiterQuotedContractsMicro ?? 0n)}, executed Jupiter ` +
         `${formatContracts(position.jupiterContractsMicro)}, executed Polymarket ` +
         `${formatContracts(position.polymarketContractsMicro)}, actual Poly-win P&L ` +
         `$${formatUsd(actualPayoffs.polymarketWinPnlMicroUsd)}, actual Jupiter-win P&L ` +
-        `$${formatUsd(actualPayoffs.jupiterWinPnlMicroUsd)}, skew ` +
+        `$${formatUsd(actualPayoffs.jupiterWinPnlMicroUsd)}, both-win P&L ` +
+        `$${formatUsd(actualPayoffs.bothWinPnlMicroUsd)}, both-lose P&L ` +
+        `$${formatUsd(actualPayoffs.bothLosePnlMicroUsd)}, skew ` +
         `${Number(retainedSizeMismatchBps) / 100}%`,
+        postFillRiskPlan,
       );
     }
     position.originalContractsMicro = minimum(position.jupiterContractsMicro, position.polymarketContractsMicro);
@@ -1411,7 +1500,8 @@ export class ShortWindowLiveTrader {
       `${position.entrySubmissionSkewMs ?? "unknown"}ms apart.` +
       (retainedSizeMismatch > CONTRACT_TOLERANCE_MICRO
         ? ` Retaining ${formatContracts(retainedSizeMismatch)} contract venue-size skew through resolution.`
-        : "");
+        : "") +
+      ` Four-state oracle-divergence floor: $${formatUsd(actualPayoffs.bothLosePnlMicroUsd)}.`;
     await this.#save();
     return { type: "entry", position, preflight, execution };
   }
@@ -1905,7 +1995,7 @@ export class ShortWindowLiveTrader {
         code: "POLYMARKET_ONLY_ENTRY_AUTOMATICALLY_UNWOUND",
       });
       const remainingAmbiguous = this.#state.positions.find((candidate) =>
-        candidate.phase !== "open" && candidate.phase !== "awaiting_resolution"
+        !isManagedKnownPosition(candidate)
       );
       if (!remainingAmbiguous) {
         this.#state.halted = false;
@@ -2061,7 +2151,7 @@ export class ShortWindowLiveTrader {
     }
     if (recoveries.length > 0) {
       const remainingAmbiguous = this.#state.positions.find((position) =>
-        position.phase !== "open" && position.phase !== "awaiting_resolution"
+        !isManagedKnownPosition(position)
       );
       if (!remainingAmbiguous) {
         this.#state.halted = false;
@@ -2117,7 +2207,7 @@ export class ShortWindowLiveTrader {
         });
       }
       const remainingAmbiguous = this.#state.positions.find((candidate) =>
-        candidate.phase !== "open" && candidate.phase !== "awaiting_resolution"
+        !isManagedKnownPosition(candidate)
       );
       if (!remainingAmbiguous) {
         this.#state.halted = false;
@@ -2147,10 +2237,26 @@ export class ShortWindowLiveTrader {
     return { type: "halt", reason, position };
   }
 
+  async #quarantineForRecovery(
+    position: LivePosition,
+    reason: string,
+    plan: LivePostFillRiskPlan,
+  ): Promise<LiveDecision> {
+    position.phase = "recovery_planning";
+    position.lastError = reason;
+    position.postFillRiskPlan = plan;
+    // The exact balances and identities are known, so this position can be
+    // isolated without disabling unrelated pairs. Any later repair must first
+    // be priced against the complete four-state portfolio.
+    this.#lastAction = `RECOVERY PLAN ${position.pair.duration}: ${plan.reason}`;
+    await this.#save();
+    return { type: "recovery_plan", reason, position, plan };
+  }
+
   #releaseHaltWithoutBlockingExposure(): boolean {
     if (!this.#state.halted) return false;
     const blockingExposure = this.#state.positions.some((position) =>
-      position.phase !== "open" && position.phase !== "awaiting_resolution"
+      !isManagedKnownPosition(position)
     );
     if (blockingExposure) return false;
     this.#state.halted = false;
@@ -2232,51 +2338,166 @@ function emptyState(): LiveTraderState {
   };
 }
 
+function isManagedKnownPosition(position: LivePosition): boolean {
+  return position.phase === "open" ||
+    position.phase === "recovery_planning" ||
+    position.phase === "awaiting_resolution";
+}
+
+function hasFullyObservedTwoLegExposure(position: LivePosition): boolean {
+  return position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO &&
+    position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
+}
+
 function canSafelyAwaitResolution(position: LivePosition, atMs: number): boolean {
   if (atMs < position.pair.endMs) return false;
-  if (position.phase === "open") return true;
+  if (position.phase === "open") return hasFullyObservedTwoLegExposure(position);
+  if (position.phase === "recovery_planning") {
+    return position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO ||
+      position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
+  }
   if (position.phase !== "exposure_error") return false;
   if (isKnownTerminalOneSidedEntry(position)) return true;
   if (!position.lastError?.startsWith(OBSERVED_ENTRY_SIZE_MISMATCH)) return false;
   // A size mismatch is still fully observable when both settled entry legs are
   // recorded. Resolution can safely redeem/settle those balances without
   // placing a one-sided recovery trade. Unknown or one-sided fills stay halted.
-  return position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO &&
-    position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
+  return hasFullyObservedTwoLegExposure(position);
 }
 
-function isRetainableFullyObservedSizeMismatch(
-  position: LivePosition,
-  strategy: ShortWindowStrategyConfig,
-): boolean {
-  const matched = minimum(position.polymarketContractsMicro, position.jupiterContractsMicro);
-  const mismatch = absolute(position.polymarketContractsMicro - position.jupiterContractsMicro);
-  const mismatchBps = matched > 0n ? mismatch * 10_000n / matched : 10_000n;
-  const payoff = actualEntryPayoffs(position);
-  const edgePerContract = matched > 0n
-    ? payoff.minimumPnlMicroUsd * ONE_CONTRACT_MICRO / matched
-    : -ONE_USD_MICRO;
-  return position.phase === "exposure_error" &&
-    position.lastError?.startsWith(OBSERVED_ENTRY_SIZE_MISMATCH) === true &&
-    position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO &&
-    position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO &&
-    mismatchBps <= MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS &&
-    payoff.minimumPnlMicroUsd >= strategy.minimumEntryEdgeTotalMicroUsd &&
-    edgePerContract >= strategy.minimumEntryEdgeMicroUsdPerContract;
+export function projectCrossVenueResolutionScenarios(input: {
+  polymarketContractsMicro: bigint;
+  jupiterContractsMicro: bigint;
+  totalEntryCostMicroUsd: bigint;
+}): LiveResolutionScenario[] {
+  const scenario = (
+    code: LiveResolutionScenarioCode,
+    polymarketWon: boolean,
+    jupiterWon: boolean,
+    rationale: string,
+  ): LiveResolutionScenario => {
+    const payoutMicroUsd =
+      (polymarketWon ? input.polymarketContractsMicro : 0n) +
+      (jupiterWon ? input.jupiterContractsMicro : 0n);
+    return {
+      code,
+      polymarketWon,
+      jupiterWon,
+      payoutMicroUsd,
+      pnlMicroUsd: payoutMicroUsd - input.totalEntryCostMicroUsd,
+      rationale,
+    };
+  };
+  return [
+    scenario(
+      "polymarket_only_win",
+      true,
+      false,
+      "Polymarket's resolution observation selects the bought outcome while Jupiter's selects the opposite outcome.",
+    ),
+    scenario(
+      "jupiter_only_win",
+      false,
+      true,
+      "Jupiter's resolution observation selects the bought outcome while Polymarket's selects the opposite outcome.",
+    ),
+    scenario(
+      "both_win",
+      true,
+      true,
+      "The venues use different resolution observations, so both bought outcomes can settle as winners.",
+    ),
+    scenario(
+      "both_lose",
+      false,
+      false,
+      "The venues use different resolution observations, so oracle or timing divergence can make both bought outcomes lose.",
+    ),
+  ];
 }
 
 function actualEntryPayoffs(position: LivePosition): {
   polymarketWinPnlMicroUsd: bigint;
   jupiterWinPnlMicroUsd: bigint;
+  bothWinPnlMicroUsd: bigint;
+  bothLosePnlMicroUsd: bigint;
   minimumPnlMicroUsd: bigint;
 } {
   const totalCostMicroUsd = position.polymarketEntryCostMicroUsd + position.jupiterEntryCostMicroUsd;
-  const polymarketWinPnlMicroUsd = position.polymarketContractsMicro - totalCostMicroUsd;
-  const jupiterWinPnlMicroUsd = position.jupiterContractsMicro - totalCostMicroUsd;
+  const scenarios = projectCrossVenueResolutionScenarios({
+    polymarketContractsMicro: position.polymarketContractsMicro,
+    jupiterContractsMicro: position.jupiterContractsMicro,
+    totalEntryCostMicroUsd: totalCostMicroUsd,
+  });
+  const polymarketWinPnlMicroUsd = scenarios[0]?.pnlMicroUsd ?? -totalCostMicroUsd;
+  const jupiterWinPnlMicroUsd = scenarios[1]?.pnlMicroUsd ?? -totalCostMicroUsd;
   return {
     polymarketWinPnlMicroUsd,
     jupiterWinPnlMicroUsd,
+    bothWinPnlMicroUsd: scenarios[2]?.pnlMicroUsd ?? -totalCostMicroUsd,
+    bothLosePnlMicroUsd: scenarios[3]?.pnlMicroUsd ?? -totalCostMicroUsd,
     minimumPnlMicroUsd: minimum(polymarketWinPnlMicroUsd, jupiterWinPnlMicroUsd),
+  };
+}
+
+function buildPostFillRiskPlan(
+  position: LivePosition,
+  strategy: ShortWindowStrategyConfig,
+  executionFullyReconciled = false,
+): LivePostFillRiskPlan {
+  const totalEntryCostMicroUsd = position.polymarketEntryCostMicroUsd + position.jupiterEntryCostMicroUsd;
+  const scenarios = projectCrossVenueResolutionScenarios({
+    polymarketContractsMicro: position.polymarketContractsMicro,
+    jupiterContractsMicro: position.jupiterContractsMicro,
+    totalEntryCostMicroUsd,
+  });
+  const matchedContractsMicro = minimum(
+    position.polymarketContractsMicro,
+    position.jupiterContractsMicro,
+  );
+  const venueSizeMismatchMicro = absolute(
+    position.polymarketContractsMicro - position.jupiterContractsMicro,
+  );
+  const venueSizeMismatchBps = matchedContractsMicro > 0n
+    ? venueSizeMismatchMicro * 10_000n / matchedContractsMicro
+    : null;
+  const intendedSingleWinnerFloorMicroUsd = minimum(
+    scenarios[0]?.pnlMicroUsd ?? -totalEntryCostMicroUsd,
+    scenarios[1]?.pnlMicroUsd ?? -totalEntryCostMicroUsd,
+  );
+  const intendedEdgePerContractMicroUsd = matchedContractsMicro > 0n
+    ? intendedSingleWinnerFloorMicroUsd * ONE_CONTRACT_MICRO / matchedContractsMicro
+    : -ONE_USD_MICRO;
+  const fullyObservedTwoLegPosition =
+    position.polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO &&
+    position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO;
+  if (!fullyObservedTwoLegPosition) {
+    return {
+      action: executionFullyReconciled ? "quote_repair" : "manual_reconciliation",
+      reason: executionFullyReconciled
+        ? "The one-sided fill and zero balance on the other venue are known. Fetch fresh opposite-leg and unwind quotes, then accept only an action that improves the complete modeled portfolio."
+        : "One or both venue fills are absent or not fully reconciled; do not submit a repair order until balances and order identities are known.",
+      scenarios,
+      intendedSingleWinnerFloorMicroUsd,
+      maximumModeledLossMicroUsd: totalEntryCostMicroUsd,
+      venueSizeMismatchMicro,
+      venueSizeMismatchBps,
+    };
+  }
+  const repairRequired = venueSizeMismatchBps === null ||
+    venueSizeMismatchBps > MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS ||
+    intendedSingleWinnerFloorMicroUsd < strategy.minimumEntryEdgeTotalMicroUsd ||
+    intendedEdgePerContractMicroUsd < strategy.minimumEntryEdgeMicroUsdPerContract;
+  return {
+    action: repairRequired ? "quote_repair" : "hold_or_exit_normally",
+    reason: repairRequired
+      ? "Both fills are known, but their executed sizes or costs miss the configured single-winner floor. Fetch fresh trim, top-up, and unwind quotes and accept only a repair that improves the modeled portfolio."
+      : "Both fills are known and meet the configured single-winner floor. Continue normal hold/exit management while retaining explicit both-win and both-lose oracle-divergence risk.",
+    scenarios,
+    intendedSingleWinnerFloorMicroUsd,
+    maximumModeledLossMicroUsd: totalEntryCostMicroUsd,
+    venueSizeMismatchMicro,
+    venueSizeMismatchBps,
   };
 }
 

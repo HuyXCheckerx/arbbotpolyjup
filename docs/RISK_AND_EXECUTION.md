@@ -57,7 +57,7 @@ Failure branches lead to `ABORTING`, `UNWINDING`, `MANUAL_REVIEW`, or `HALTED`.
 7. Persist the complete two-leg intent and prepared identities.
 8. Release both submission functions through the same in-process barrier and record their submission-start timestamps.
 9. Reconcile the Jupiter transaction's actual token deltas and Polymarket order/balance independently.
-10. Recompute the Poly-win and Jupiter-win payoff from final quantities and costs. Mark the position open only when the residual is bounded and both cases still meet the entry floors. Otherwise quarantine it and halt new trading without pretending the quote was earned.
+10. Recompute the four joint resolution payoffs from final quantities and costs: Polymarket-only win, Jupiter-only win, both win, and both lose. Mark the position open only when the residual is bounded and both intended single-winner cases still meet the entry floors. Otherwise isolate that known position for fresh quote-based repair without pretending the quote was earned or disabling unrelated pairs. Globally halt only when a fill quantity, identity, or pending status remains unknown.
 
 Concurrent release reduces systematic leg delay but does not make two chains atomic. Network scheduling, venue acceptance, and settlement can still leave one-sided or ambiguous exposure.
 

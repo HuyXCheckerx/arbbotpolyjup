@@ -196,6 +196,7 @@ jq -s '{
 | `live_entry` / `live_exit` | Confirmed real-money entry or legacy/manual-policy exit; production live mode holds balanced positions through resolution |
 | `live_entry_preflight_failed` | Structured preflight stage, stable code, retry class, cooldown, per-stage timings, quote inputs/results, router/mode, and nested error details |
 | `live_recovery` | Read-only balance reconciliation proved a terminal entry failure left zero exposure; no recovery trade was submitted |
+| `live_recovery_plan` | Fully reconciled exposure was isolated without a global halt; includes all four terminal P&Ls and the required quote-based next action |
 | `live_halt` | Execution became ambiguous; new entries stopped, with independent Jupiter/Polymarket result, fill, transaction/order, and nested-error fields |
 | `live_position_awaiting_resolution` / `live_settlement` | Resolution fallback and automatic Forecast/Polymarket redemption accounting, including retained fully observed size mismatches and legacy halted mismatches |
 

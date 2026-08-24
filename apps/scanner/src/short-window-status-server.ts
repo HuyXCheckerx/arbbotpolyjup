@@ -99,9 +99,14 @@ export interface LivePositionSnapshot {
   minimumAlignedPnlUsd: string;
   polymarketWinPnlUsd: string;
   jupiterWinPnlUsd: string;
+  bothWinPnlUsd: string;
+  bothLosePnlUsd: string;
+  maximumModeledLossUsd: string;
+  postFillAction: "hold_or_exit_normally" | "quote_repair" | "manual_reconciliation";
+  postFillReason: string;
   contractSkew: string;
   contractSkewBps: string | null;
-  hedgeStatus: "perfect" | "bounded_residual" | "exposure_error";
+  hedgeStatus: "perfect" | "bounded_residual" | "recovery_planning" | "exposure_error";
   isHedged: boolean;
   polymarketSettled: boolean;
   jupiterSettled: boolean;

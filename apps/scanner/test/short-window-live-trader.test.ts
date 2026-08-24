@@ -23,6 +23,7 @@ import {
 } from "../../../packages/venue-polymarket/src/trading.ts";
 import {
   loadLiveState,
+  projectCrossVenueResolutionScenarios,
   saveLiveState,
   ShortWindowLiveTrader,
   type LiveExitMode,
@@ -31,6 +32,24 @@ import {
   type LivePolymarketGateway,
   type LiveTraderState,
 } from "../src/short-window-live-trader.ts";
+
+test("cross-venue resolution projection includes all four joint outcomes", () => {
+  const scenarios = projectCrossVenueResolutionScenarios({
+    polymarketContractsMicro: 10_000_000n,
+    jupiterContractsMicro: 8_000_000n,
+    totalEntryCostMicroUsd: 7_000_000n,
+  });
+
+  assert.deepEqual(
+    scenarios.map((scenario) => [scenario.code, scenario.payoutMicroUsd, scenario.pnlMicroUsd]),
+    [
+      ["polymarket_only_win", 10_000_000n, 3_000_000n],
+      ["jupiter_only_win", 8_000_000n, 1_000_000n],
+      ["both_win", 18_000_000n, 11_000_000n],
+      ["both_lose", 0n, -7_000_000n],
+    ],
+  );
+});
 
 test("live state saves serialize concurrent atomic replacements", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-concurrent-save-"));
@@ -1066,13 +1085,16 @@ test("a filled Polymarket leg is hedged but quarantined when actual payoff misse
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "halt");
+  assert.equal(decision.type, "recovery_plan");
   assert.equal(decision.execution?.jupiter.submissionAttempted, true);
   assert.equal(decision.execution?.jupiter.result, "fulfilled");
   assert.equal(decision.execution?.jupiter.usedPreflightBuild, false);
   assert.equal(events.includes("jupiter:submit"), true);
-  assert.equal(trader.snapshot().halted, true);
-  assert.match(trader.snapshot().haltReason ?? "", /actual Poly-win P&L/);
+  assert.equal(decision.plan.action, "quote_repair");
+  assert.equal(decision.position.phase, "recovery_planning");
+  assert.equal(trader.snapshot().halted, false);
+  assert.equal(trader.snapshot().haltReason, null);
+  assert.ok(Number(trader.snapshot().positions[0]?.bothLosePnlUsd) < 0);
 });
 
 test("an emergency Jupiter hedge is submitted but never reported as a profitable arb", async () => {
@@ -1110,12 +1132,13 @@ test("an emergency Jupiter hedge is submitted but never reported as a profitable
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "halt");
+  assert.equal(decision.type, "recovery_plan");
   assert.equal(decision.execution?.jupiter.submissionAttempted, true);
   assert.equal(decision.execution?.jupiter.result, "fulfilled");
   assert.equal(events.includes("jupiter:submit"), true);
   assert.equal(events.includes("polymarket:submit-sell"), false);
-  assert.equal(trader.snapshot().halted, true);
+  assert.equal(decision.plan.action, "quote_repair");
+  assert.equal(trader.snapshot().halted, false);
 });
 
 test("terminal entry failure remains halted when balance reconciliation finds exposure", async () => {
@@ -1453,7 +1476,7 @@ test("a smaller-than-quoted Jupiter execution is quarantined from successful arb
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "halt");
+  assert.equal(decision.type, "recovery_plan");
   assert.ok(decision.position);
   assert.equal(events.filter((event) => event === "polymarket:submit-sell").length, 0);
   assert.equal(
@@ -1461,7 +1484,9 @@ test("a smaller-than-quoted Jupiter execution is quarantined from successful arb
     true,
   );
   assert.equal(decision.position?.jupiterQuotedContractsMicro !== undefined, true);
-  assert.equal(trader.snapshot().halted, true);
+  assert.equal(decision.position.phase, "recovery_planning");
+  assert.equal(decision.plan.action, "quote_repair");
+  assert.equal(trader.snapshot().halted, false);
   assert.ok(Number(trader.snapshot().positions[0]?.jupiterWinPnlUsd) < 0);
 });
 
@@ -1705,7 +1730,7 @@ test("a fully observed size mismatch releases the global halt while settlement r
   assert.equal(trader.snapshot().halted, false);
 });
 
-test("startup keeps a negative-payoff legacy size mismatch quarantined", async () => {
+test("startup converts a known negative-payoff size mismatch into an isolated recovery plan", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-size-mismatch-retain-"));
   const statePath = join(directory, "state.json");
   const identity = {
@@ -1756,9 +1781,10 @@ test("startup keeps a negative-payoff legacy size mismatch quarantined", async (
   await trader.initialize();
 
   const retained = (await loadLiveState(statePath)).positions[0];
-  assert.equal(retained?.phase, "exposure_error");
+  assert.equal(retained?.phase, "recovery_planning");
   assert.equal(retained?.lastError, reason);
-  assert.equal(trader.snapshot().halted, true);
+  assert.equal(retained?.postFillRiskPlan?.action, "quote_repair");
+  assert.equal(trader.snapshot().halted, false);
   const hold = await trader.consider({
     pair: identity,
     bestRoute: null,
@@ -1767,7 +1793,7 @@ test("startup keeps a negative-payoff legacy size mismatch quarantined", async (
     atMs: Date.now(),
   });
   assert.equal(hold.type, "hold");
-  assert.equal(hold.reason, reason);
+  assert.equal(hold.reason, "recovery_planning");
   assert.deepEqual(events, []);
 });
 

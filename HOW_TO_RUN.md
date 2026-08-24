@@ -177,7 +177,7 @@ For native Jupiter Forecast markets, live execution is hybrid:
 - Jupiter Prediction `/orders` → `/execute` is used when the Jupiter deposit is at least `$5`, matching Jupiter's recommended website-style path;
 - direct outcome-token Swap V2 is used below `$5`, because Prediction rejects smaller builds;
 - Prediction `/execute` amounts are never treated as fills: the bot confirms the transaction and measures the wallet's real outcome-token credit and USDC debit;
-- after both legs execute, the bot checks the Poly-win and Jupiter-win P&L separately. A quote that looked profitable but executed unprofitably is halted and shown as exposure, not realized profit;
+- after both legs execute, the bot predicts Polymarket-only win, Jupiter-only win, both-win, and both-lose P&L from confirmed fills. Because the venues use different resolution observations, the last two cases are real basis outcomes. A known but imperfect fill is isolated as `recovery_planning` while unrelated pairs remain enabled; an unknown fill still halts globally;
 - Forecast winners are credited from the confirmed settlement USDC delta, and empty Token-2022 outcome accounts are closed automatically to reclaim SOL rent;
 - live mode continuously rolls unsigned executable builds through a shared `125ms` scheduler (`8 RPS`), leaving headroom below the Developer plan's `10 RPS` limit; critical entry/recovery work jumps ahead of discovery;
 - out-of-order responses cannot replace a newer build, and the selected exact build is signed during Polymarket preparation only while it remains within the configured submission-age limit.
@@ -305,11 +305,11 @@ tail -f logs/btc-poly-jup-short-window-arb.jsonl | \
   jq --unbuffered -c 'select(.type == "arb_opportunity")'
 ```
 
-Watch live entries, exits, recovery, and halts:
+Watch live entries, exits, recovery plans, recovery, and halts:
 
 ```bash
 tail -f logs/btc-poly-jup-short-window-arb.jsonl | \
-  jq --unbuffered -c 'select(.type == "live_entry" or .type == "live_exit" or .type == "live_recovery" or .type == "live_halt")'
+  jq --unbuffered -c 'select(.type == "live_entry" or .type == "live_exit" or .type == "live_recovery_plan" or .type == "live_recovery" or .type == "live_halt")'
 ```
 
 Every live-entry execution record distinguishes `jupiter.result: "skipped"` from an actual rejection and includes `submissionAttempted`, `signed`, `executionPath`, `endpoint`, `requestId`, `usedPreflightBuild`, `quoteAgeAtSubmissionMs`, `quotedContractsMicro`, `filledContractsMicro`, `contractShortfallMicro`, `quotedCostMicroUsd`, `executedCostMicroUsd`, `reconciliationSource`, and the transaction signature.
@@ -328,7 +328,7 @@ Press `Ctrl-C` once and wait for the session-end message. The live bot persists 
 2. Check the actual Polymarket conditional-token balance and Jupiter outcome-token balance for the recorded markets.
 3. Preserve the JSONL and state file as the exposure audit trail.
 4. Restart with the same command and state file when you want the bot to attempt its supported automatic read-only reconciliation and post-resolution recovery.
-5. A bounded, profitable residual can continue to settlement. An excessive or negative-payoff residual stays quarantined; after close, settlement uses confirmed credits and reclaims the empty Forecast token-account rent. If either venue's fill is unknown or pending, determine the exact exposure and neutralize it manually if necessary; the bot deliberately will not guess.
+5. A bounded residual can continue to normal hold/exit management. An excessive or negative single-winner residual becomes a position-level `quote_repair` plan instead of halting every pair. The dashboard shows all four terminal P&Ls and the maximum modeled loss. The bot does not yet place a top-up or trim merely because one leg is smaller: it must first obtain fresh executable quotes and prove the proposed repair improves the complete portfolio. If either venue's fill is unknown or pending, global halt remains appropriate; determine the exact exposure and neutralize it manually if necessary.
 6. Use a new `--live-state` only after every old exposure is accounted for on both venues.
 
 Example after fully completed manual recovery:
