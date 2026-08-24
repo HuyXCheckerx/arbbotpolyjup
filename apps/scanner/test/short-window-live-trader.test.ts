@@ -580,7 +580,7 @@ test("one-shot live test submits one unprofitable pair and persists the attempt 
   assert.deepEqual(second, { type: "skip", reason: "ONE_SHOT_TEST_ENTRY_ALREADY_ATTEMPTED" });
 });
 
-test("live trader executes a fresh screening build without a redundant post-fill order request", async () => {
+test("live trader uses a screening build for discovery but creates a new per-attempt Jupiter build", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-reused-quote-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -612,8 +612,10 @@ test("live trader executes a fresh screening build without a redundant post-fill
   });
 
   assert.equal(decision.type, "entry");
-  assert.equal(events.filter((event) => event === "jupiter:prepare-buy").length, 1);
+  assert.equal(events.filter((event) => event === "jupiter:prepare-buy").length, 2);
+  assert.equal(decision.preflight?.reusedJupiterQuote, false);
   assert.equal(decision.execution?.jupiter.usedPreflightBuild, true);
+  assert.ok((decision.execution?.jupiter.quoteAgeAtSubmissionMs ?? Number.POSITIVE_INFINITY) <= 100);
   const position = trader.snapshot().positions[0];
   assert.equal(position?.hedgeStatus, "bounded_residual");
   assert.equal(position?.isHedged, false);
@@ -621,7 +623,7 @@ test("live trader executes a fresh screening build without a redundant post-fill
   assert.ok(Number(position?.minimumAlignedPnlUsd) > 0);
 });
 
-test("live trader reuses a screening quote through the configured poll-jitter window", async () => {
+test("live trader never executes a screening quote from the configured poll-jitter window", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-reused-jitter-quote-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -652,8 +654,8 @@ test("live trader reuses a screening quote through the configured poll-jitter wi
   });
 
   assert.equal(decision.type, "entry");
-  assert.equal(decision.preflight?.reusedJupiterQuote, true);
-  assert.ok((decision.preflight?.jupiterQuoteAgeMs ?? 0) >= 2_500);
+  assert.equal(decision.preflight?.reusedJupiterQuote, false);
+  assert.equal(decision.preflight?.jupiterQuoteAgeMs, null);
   assert.equal(events.filter((event) => event === "jupiter:prepare-buy").length, 2);
 });
 
@@ -695,10 +697,76 @@ test("live trader expands from a profitable screening build then requotes the ob
   });
 
   assert.equal(decision.type, "entry");
-  assert.equal(decision.preflight?.reusedJupiterQuote, true);
+  assert.equal(decision.preflight?.reusedJupiterQuote, false);
   assert.equal(decision.preflight?.jupiter.requestedGrossMicroUsd, 5_000_000n);
-  assert.equal(decision.preflight?.jupiter.quotedContractsMicro, quote.order.newContractsMicro);
+  assert.equal(decision.preflight?.jupiter.quotedContractsMicro, decision.position.jupiterQuotedContractsMicro);
   assert.equal(events.filter((event) => event === "jupiter:prepare-buy").length, 2);
+});
+
+test("live trader rebuilds when a per-attempt Jupiter build is older than 100ms after Polymarket fills", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-fresh-submit-build-"));
+  const events: string[] = [];
+  const jupiter = new MockJupiter(events);
+  const polymarket = new MockPolymarket(events);
+  polymarket.buySubmissionDelayMs = 125;
+  const trader = createTrader(jupiter, polymarket, join(directory, "state.json"));
+  await trader.initialize();
+  const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
+  const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarketBook,
+    jupiterBook,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  assert.ok(route);
+
+  const decision = await trader.consider({
+    pair: pair(route.route.polymarketOutcome, route.route.jupiterOutcome),
+    bestRoute: route,
+    polymarketBook,
+    jupiterBook,
+    atMs: 1_000,
+  });
+
+  assert.equal(decision.type, "entry");
+  assert.equal(events.filter((event) => event === "jupiter:prepare-buy").length, 2);
+  assert.equal(decision.execution?.jupiter.usedPreflightBuild, false);
+  assert.ok((decision.execution?.jupiter.quoteAgeAtSubmissionMs ?? Number.POSITIVE_INFINITY) <= 100);
+  assert.equal(decision.execution?.jupiter.submissionAttempted, true);
+});
+
+test("live trader never submits a Jupiter build that remains stale after one rebuild", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-expired-submit-build-"));
+  const events: string[] = [];
+  const jupiter = new MockJupiter(events);
+  jupiter.prepareSubmissionDelayMs = 125;
+  const polymarket = new MockPolymarket(events);
+  const trader = createTrader(jupiter, polymarket, join(directory, "state.json"));
+  await trader.initialize();
+  const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
+  const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarketBook,
+    jupiterBook,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  assert.ok(route);
+
+  const decision = await trader.consider({
+    pair: pair(route.route.polymarketOutcome, route.route.jupiterOutcome),
+    bestRoute: route,
+    polymarketBook,
+    jupiterBook,
+    atMs: 1_000,
+  });
+
+  assert.equal(decision.type, "recovery");
+  assert.equal(decision.execution?.jupiter.submissionAttempted, false);
+  assert.equal(decision.execution?.jupiter.freshBuildRetryCount, 1);
+  assert.equal(events.includes("jupiter:submit"), false);
+  assert.equal(events.includes("polymarket:submit-sell"), true);
+  assert.match(decision.execution?.jupiter.error?.message ?? "", /JUPITER_FRESH_BUILD_EXPIRED/);
+  assert.equal(trader.snapshot().halted, false);
 });
 
 test("market-change preflight rejections use a short cooldown and structured diagnostics", async () => {
@@ -2024,6 +2092,7 @@ function createTrader(
   exitMode: LiveExitMode = "take_profit",
   polymarketDepthHaircutBps = 0,
   maximumAllocationMicroUsd = 25_000_000n,
+  maximumJupiterSubmissionQuoteAgeMs = 100,
 ): ShortWindowLiveTrader {
   return new ShortWindowLiveTrader({
     jupiter,
@@ -2046,7 +2115,7 @@ function createTrader(
       maximumSlippageBps: 100,
       polymarketDepthHaircutBps,
       maximumReusableJupiterQuoteAgeMs: 3_000,
-      maximumJupiterSubmissionQuoteAgeMs: 1_000,
+      maximumJupiterSubmissionQuoteAgeMs,
       maximumEmergencyHedgeLossMicroUsd: 1_000_000n,
       jupiterFillTimeoutMs: 5_000,
       forceOneEntry,
@@ -2064,6 +2133,7 @@ class MockJupiter implements LiveJupiterGateway {
   postScreeningQuoteOffsetMicro = 0n;
   buyPriceMicroUsd = 550_000n;
   postScreeningBuyPriceMicroUsd: bigint | null = null;
+  prepareSubmissionDelayMs = 0;
   prepareBuyError: Error | null = null;
   prepareBuyFailuresAfterFirst = 0;
   submitError: Error | null = null;
@@ -2140,6 +2210,9 @@ class MockJupiter implements LiveJupiterGateway {
 
   async prepareSubmission(value: JupiterPredictionOrderBuild): Promise<PreparedJupiterSubmission> {
     this.#events.push("jupiter:prepare-submission");
+    if (this.prepareSubmissionDelayMs > 0) {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, this.prepareSubmissionDelayMs));
+    }
     return { build: value, signedTransaction: "signed-transaction" };
   }
 
@@ -2226,6 +2299,7 @@ class MockPolymarket implements LivePolymarketGateway {
   buyRejectionError: Error | null = null;
   buyPriceMicroUsd = 400_000n;
   fillContractMultiplierBps = 10_000n;
+  buySubmissionDelayMs = 0;
   postBuyBalanceVisibilityReads = 0;
 
   get preparedBuy(): { contractsMicro: bigint; maximumPriceMicroUsd: bigint } | null {
@@ -2288,6 +2362,9 @@ class MockPolymarket implements LivePolymarketGateway {
   async submitPreparedFok(prepared: PreparedPolymarketFokOrder): Promise<PolymarketLiveFill> {
     this.#events.push(`polymarket:submit-${prepared.kind}`);
     if (prepared.kind === "buy") {
+      if (this.buySubmissionDelayMs > 0) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, this.buySubmissionDelayMs));
+      }
       if (this.buyRejectionError) throw this.buyRejectionError;
       if (this.buyRejection) throw new Error(this.buyRejection);
       return this.#submitBuy();

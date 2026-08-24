@@ -179,8 +179,8 @@ For native Jupiter Forecast markets, live execution is hybrid:
 - Prediction `/execute` amounts are never treated as fills: the bot confirms the transaction and measures the wallet's real outcome-token credit and USDC debit;
 - after both legs execute, the bot predicts Polymarket-only win, Jupiter-only win, both-win, and both-lose P&L from confirmed fills. Because the venues use different resolution observations, the last two cases are real basis outcomes. A known but imperfect fill is isolated as `recovery_planning` while unrelated pairs remain enabled; an unknown fill still halts globally;
 - Forecast winners are credited from the confirmed settlement USDC delta, and empty Token-2022 outcome accounts are closed automatically to reclaim SOL rent;
-- live mode continuously rolls unsigned executable builds through a shared `125ms` scheduler (`8 RPS`), leaving headroom below the Developer plan's `10 RPS` limit; critical entry/recovery work jumps ahead of discovery;
-- out-of-order responses cannot replace a newer build, and the selected exact build is signed during Polymarket preparation only while it remains within the configured submission-age limit.
+- live mode continuously rolls unsigned executable builds through a shared `125ms` scheduler (`8 RPS`) for price discovery only, leaving headroom below the Developer plan's `10 RPS` limit; critical entry/recovery work jumps ahead of discovery;
+- every real entry requests a new Jupiter build. A signed build is submitted only while it is at most `100ms` old; otherwise it is discarded and rebuilt once. A second expiry prevents Jupiter submission and invokes Polymarket-only automatic recovery.
 
 ## Customize risk and entry requirements
 
@@ -192,7 +192,7 @@ pnpm bot:short-window:live -- \
   --max-venue-allocation-usd=20 \
   --maximum-open-positions=1 \
   --maximum-slippage-bps=50 \
-  --maximum-jupiter-submit-quote-age-ms=750 \
+  --maximum-jupiter-submit-quote-age-ms=100 \
   --maximum-emergency-hedge-loss-usd=0.50 \
   --minimum-entry-edge-usd=0.02 \
   --minimum-entry-profit-usd=0.25
@@ -218,7 +218,7 @@ Common controls:
 | `--minimum-entry-profit-usd=0.10` | `$0.10` | Minimum modeled total entry profit |
 | Exit policy | hold until resolution | Automatic profit-taking exits are disabled; recovery hedges and settlement remain enabled |
 | `--maximum-slippage-bps=100` | `100 bps` | Maximum live price protection per leg; allowed range is 1–500 bps |
-| `--maximum-jupiter-submit-quote-age-ms=500` | `0.5 seconds` | Requotes instead of submitting an older signed Jupiter build after Polymarket fills |
+| `--maximum-jupiter-submit-quote-age-ms=100` | `0.1 seconds` | Requires a new per-attempt Jupiter build and discards/rebuilds once rather than submitting an older transaction |
 | `--maximum-emergency-hedge-loss-usd=1` | `$1` | Base post-fill hedge-loss budget; after Polymarket fills, it may expand to that leg's already-at-risk entry cost. It does not relax pre-entry profit checks or hard allocation limits |
 | `--jupiter-quote-usd=MAX_ALLOCATION` | per-position allocation | Maximum rolling executable-quote gross; exact sizing adapts below this cap |
 | `--jupiter-fill-timeout-ms=20000` | `20 seconds` | Jupiter fill/reconciliation timeout |
@@ -311,7 +311,7 @@ tail -f logs/btc-poly-jup-short-window-arb.jsonl | \
   jq --unbuffered -c 'select(.type == "live_entry" or .type == "live_exit" or .type == "live_recovery_plan" or .type == "live_recovery" or .type == "live_halt")'
 ```
 
-Every live-entry execution record distinguishes `jupiter.result: "skipped"` from an actual rejection and includes `submissionAttempted`, `signed`, `executionPath`, `endpoint`, `requestId`, `usedPreflightBuild`, `quoteAgeAtSubmissionMs`, `quotedContractsMicro`, `filledContractsMicro`, `contractShortfallMicro`, `quotedCostMicroUsd`, `executedCostMicroUsd`, `reconciliationSource`, and the transaction signature.
+Every live-entry execution record distinguishes `jupiter.result: "skipped"` from an actual rejection and includes `submissionAttempted`, `signed`, `executionPath`, `endpoint`, `requestId`, `usedPreflightBuild`, `quoteAgeAtSubmissionMs`, `freshBuildRetryCount`, `quotedContractsMicro`, `filledContractsMicro`, `contractShortfallMicro`, `quotedCostMicroUsd`, `executedCostMicroUsd`, `reconciliationSource`, and the transaction signature. Rolling Jupiter builds are used only to discover and size candidates; a real entry always requests a new build. A build older than the configured submission ceiling is discarded and rebuilt once. If that replacement is also stale, it is never submitted and the existing Polymarket-only automatic recovery path runs.
 
 The first run after upgrading archives the old quote-derived realized P&L as `legacyUnverifiedRealizedProfitMicroUsd` and displays verified realized P&L from zero. Do not treat the archived figure as wallet profit. A legacy state containing an open Jupiter fill halts with `LEGACY_UNVERIFIED_JUPITER_FILL` for manual transaction reconciliation.
 

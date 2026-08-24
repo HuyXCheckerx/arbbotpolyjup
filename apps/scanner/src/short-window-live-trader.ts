@@ -311,6 +311,7 @@ export interface LiveEntryExecutionDiagnostics {
     requestId: string | null;
     usedPreflightBuild: boolean;
     quoteAgeAtSubmissionMs: number | null;
+    freshBuildRetryCount: number;
     retryCount: number;
     initialError: LiveErrorDiagnostic | null;
     transactionSignature: string | null;
@@ -624,8 +625,6 @@ export class ShortWindowLiveTrader {
         input.bestRoute?.polymarketAsks ?? [],
         entryJupiterGrossMicroUsd,
         entryContractsMicro,
-        input.jupiterEntryBuild ?? null,
-        input.jupiterEntryBuildAtMs ?? null,
         forcedTestEntry,
       );
       if (decision.type === "skip" && decision.preflight?.error) {
@@ -911,8 +910,6 @@ export class ShortWindowLiveTrader {
     polymarketAsks: readonly BookLevel[],
     jupiterDepositMicroUsd: bigint,
     proposedContractsMicro: bigint,
-    reusableJupiterBuild: JupiterPredictionOrderBuild | null,
-    reusableJupiterBuildAtMs: number | null,
     forcedTestEntry: boolean,
   ): Promise<LiveDecision> {
     let executablePolymarketAsks = haircutBookLevels(
@@ -997,26 +994,16 @@ export class ShortWindowLiveTrader {
       error: error === null ? null : errorDiagnostic(error),
     });
     try {
-      jupiterQuoteAgeMs = reusableJupiterBuildAtMs === null
-        ? null
-        : Math.max(0, Date.now() - reusableJupiterBuildAtMs);
-      reusedJupiterQuote = reusableJupiterBuild !== null && reusableJupiterBuildAtMs !== null &&
-        isReusableJupiterEntryBuild(
-          reusableJupiterBuild,
-          reusableJupiterBuildAtMs,
-          pair,
-          jupiterDepositMicroUsd,
-          this.#config.maximumReusableJupiterQuoteAgeMs,
-        );
-      build = reusedJupiterQuote && reusableJupiterBuild
-        ? reusableJupiterBuild
-        : await this.#jupiter.prepareBuy({
-          marketId: pair.jupiterMarketId,
-          depositAmountMicroUsd: jupiterDepositMicroUsd,
-          isYes: expectedJupiterIsYes(pair),
-          ...(pair.jupiterOutcomeMint ? { outcomeMint: pair.jupiterOutcomeMint } : {}),
-        });
-      buildAtMs = reusedJupiterQuote ? reusableJupiterBuildAtMs : Date.now();
+      // Rolling executable builds are price-discovery inputs only. Every real
+      // entry gets a new Jupiter order build so an older polling response can
+      // never become the transaction submitted after the Polymarket FOK.
+      build = await this.#jupiter.prepareBuy({
+        marketId: pair.jupiterMarketId,
+        depositAmountMicroUsd: jupiterDepositMicroUsd,
+        isYes: expectedJupiterIsYes(pair),
+        ...(pair.jupiterOutcomeMint ? { outcomeMint: pair.jupiterOutcomeMint } : {}),
+      });
+      buildAtMs = Date.now();
       quotedContractsMicro = build.order.newContractsMicro;
       // Refresh the selected token's executable CLOB immediately before
       // signing. The websocket book is useful for discovery but should not be
@@ -1187,6 +1174,7 @@ export class ShortWindowLiveTrader {
     let jupiterSigned = preparedJupiter !== null;
     let usedPreflightBuild = false;
     let quoteAgeAtSubmissionMs: number | null = null;
+    let freshBuildRetryCount = 0;
     let jupiterExecutionRetryCount = 0;
     let initialJupiterExecutionError: unknown | null = null;
     if (observedPolymarket <= CONTRACT_TOLERANCE_MICRO) {
@@ -1198,8 +1186,58 @@ export class ShortWindowLiveTrader {
       };
     } else {
       try {
+        const prepareFreshSubmission = async (
+          seedBuild: JupiterPredictionOrderBuild,
+          allowStaleRetry: boolean,
+        ): Promise<{
+          build: JupiterPredictionOrderBuild;
+          buildAtMs: number;
+          prepared: PreparedJupiterSubmission;
+          ageMs: number;
+        }> => {
+          let seed = seedBuild;
+          let lastAgeMs: number | null = null;
+          // The first fresh build may expire while it is signed and durably
+          // recorded. Discard it and rebuild once; never submit a transaction
+          // older than the configured ceiling.
+          const maximumAttempts = allowStaleRetry ? 2 : 1;
+          for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+            const freshBuild = await this.#prepareFreshJupiterHedge(
+              pair,
+              observedPolymarket,
+              seed,
+              position.polymarketEntryCostMicroUsd,
+              forcedTestEntry,
+            );
+            const freshBuildAtMs = Date.now();
+            const freshPrepared = await this.#jupiter.prepareSubmission(freshBuild);
+            jupiterSigned = true;
+            position.jupiterOrderPubkey = freshBuild.order.orderPubkey;
+            position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, freshBuild.order.positionPubkey);
+            position.jupiterEntryPositionPubkey = freshBuild.order.positionPubkey;
+            position.jupiterQuotedContractsMicro = freshBuild.order.newContractsMicro;
+            await this.#save();
+            lastAgeMs = Math.max(0, Date.now() - freshBuildAtMs);
+            if (lastAgeMs <= this.#config.maximumJupiterSubmissionQuoteAgeMs) {
+              return {
+                build: freshBuild,
+                buildAtMs: freshBuildAtMs,
+                prepared: freshPrepared,
+                ageMs: lastAgeMs,
+              };
+            }
+            if (attempt + 1 < maximumAttempts) freshBuildRetryCount += 1;
+            seed = freshBuild;
+          }
+          throw new JupiterFreshBuildExpiredError(
+            lastAgeMs,
+            this.#config.maximumJupiterSubmissionQuoteAgeMs,
+          );
+        };
         const preflightBuildAgeMs = buildAtMs === null ? Number.POSITIVE_INFINITY : Date.now() - buildAtMs;
-        if (preflightBuildAgeMs <= this.#config.maximumJupiterSubmissionQuoteAgeMs &&
+        const preflightBuildExpired =
+          preflightBuildAgeMs > this.#config.maximumJupiterSubmissionQuoteAgeMs;
+        if (!preflightBuildExpired &&
           this.#validatePostFillJupiterHedge(
             pair,
             observedPolymarket,
@@ -1208,17 +1246,14 @@ export class ShortWindowLiveTrader {
             forcedTestEntry,
           )) {
           usedPreflightBuild = true;
+          quoteAgeAtSubmissionMs = preflightBuildAgeMs;
         } else {
-          build = await this.#prepareFreshJupiterHedge(
-            pair,
-            observedPolymarket,
-            build,
-            position.polymarketEntryCostMicroUsd,
-            forcedTestEntry,
-          );
-          buildAtMs = Date.now();
-          preparedJupiter = await this.#jupiter.prepareSubmission(build);
-          jupiterSigned = true;
+          if (preflightBuildExpired) freshBuildRetryCount += 1;
+          const fresh = await prepareFreshSubmission(build, !preflightBuildExpired);
+          build = fresh.build;
+          buildAtMs = fresh.buildAtMs;
+          preparedJupiter = fresh.prepared;
+          quoteAgeAtSubmissionMs = fresh.ageMs;
         }
         position.jupiterOrderPubkey = build.order.orderPubkey;
         position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, build.order.positionPubkey);
@@ -1226,6 +1261,16 @@ export class ShortWindowLiveTrader {
         position.jupiterQuotedContractsMicro = build.order.newContractsMicro;
         await this.#save();
         quoteAgeAtSubmissionMs = buildAtMs === null ? null : Math.max(0, Date.now() - buildAtMs);
+        if (quoteAgeAtSubmissionMs !== null &&
+          quoteAgeAtSubmissionMs > this.#config.maximumJupiterSubmissionQuoteAgeMs) {
+          freshBuildRetryCount += 1;
+          const fresh = await prepareFreshSubmission(build, false);
+          build = fresh.build;
+          buildAtMs = fresh.buildAtMs;
+          preparedJupiter = fresh.prepared;
+          quoteAgeAtSubmissionMs = fresh.ageMs;
+          usedPreflightBuild = false;
+        }
         jupiterSubmissionAttempted = true;
         let submitted: SubmittedJupiterOrder;
         try {
@@ -1239,21 +1284,12 @@ export class ShortWindowLiveTrader {
           // resubmitting the same requestId inside the Swap executor instead.
           initialJupiterExecutionError = error;
           jupiterExecutionRetryCount = 1;
-          build = await this.#prepareFreshJupiterHedge(
-            pair,
-            observedPolymarket,
-            build,
-            position.polymarketEntryCostMicroUsd,
-            forcedTestEntry,
-          );
-          buildAtMs = Date.now();
-          preparedJupiter = await this.#jupiter.prepareSubmission(build);
-          position.jupiterOrderPubkey = build.order.orderPubkey;
-          position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, build.order.positionPubkey);
-          position.jupiterEntryPositionPubkey = build.order.positionPubkey;
-          position.jupiterQuotedContractsMicro = build.order.newContractsMicro;
-          await this.#save();
-          quoteAgeAtSubmissionMs = Math.max(0, Date.now() - buildAtMs);
+          const fresh = await prepareFreshSubmission(build, true);
+          build = fresh.build;
+          buildAtMs = fresh.buildAtMs;
+          preparedJupiter = fresh.prepared;
+          quoteAgeAtSubmissionMs = fresh.ageMs;
+          usedPreflightBuild = false;
           submitted = await this.#jupiter.submitPreparedAndWait(preparedJupiter, {
             timeoutMs: this.#config.jupiterFillTimeoutMs,
           });
@@ -1300,6 +1336,7 @@ export class ShortWindowLiveTrader {
         requestId: jupiterBuildRequestId(build),
         usedPreflightBuild,
         quoteAgeAtSubmissionMs,
+        freshBuildRetryCount,
         retryCount: jupiterExecutionRetryCount,
         initialError: initialJupiterExecutionError === null
           ? null
@@ -3242,6 +3279,18 @@ class JupiterSubmissionSkippedError extends Error {
   constructor(reason: unknown) {
     super(`Jupiter submission skipped because Polymarket did not fill first: ${errorMessage(reason)}`);
     this.name = "JupiterSubmissionSkippedError";
+  }
+}
+
+class JupiterFreshBuildExpiredError extends Error {
+  readonly code = "JUPITER_FRESH_BUILD_EXPIRED_BEFORE_SUBMISSION";
+
+  constructor(ageMs: number | null, maximumAgeMs: number) {
+    super(
+      `JUPITER_FRESH_BUILD_EXPIRED_BEFORE_SUBMISSION: final build age ` +
+      `${ageMs ?? "unknown"}ms exceeds ${maximumAgeMs}ms after one rebuild`,
+    );
+    this.name = "JupiterFreshBuildExpiredError";
   }
 }
 
