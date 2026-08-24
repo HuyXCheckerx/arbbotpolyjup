@@ -791,6 +791,7 @@ test("terminal Jupiter slippage failure reconciles an ambiguous successful Polym
   );
   const polymarket = new MockPolymarket(events);
   polymarket.ambiguousSell = true;
+  polymarket.postBuyBalanceVisibilityReads = 2;
   const trader = createTrader(jupiter, polymarket, statePath);
   await trader.initialize();
   const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
@@ -815,6 +816,7 @@ test("terminal Jupiter slippage failure reconciles an ambiguous successful Polym
   assert.equal(events.includes("polymarket:submit-buy"), true);
   assert.equal(events.includes("jupiter:submit"), true);
   assert.equal(events.includes("polymarket:submit-sell"), true);
+  assert.ok(events.filter((event) => event === "polymarket:refresh-balance").length >= 3);
   assert.equal(trader.snapshot().openPositions, 0);
   assert.equal(trader.snapshot().halted, false);
   assert.deepEqual((await loadLiveState(statePath)).positions, []);
@@ -1158,6 +1160,70 @@ test("a bounded non-exact Jupiter ExactIn quote is retained without an excess se
     decision.position.originalContractsMicro,
     minimumForTest(decision.position.polymarketContractsMicro, decision.position.jupiterContractsMicro),
   );
+  assert.equal(trader.snapshot().halted, false);
+});
+
+test("startup retries a failed Polymarket-only unwind after the bought balance becomes visible", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-retry-poly-unwind-"));
+  const statePath = join(directory, "state.json");
+  const events: string[] = [];
+  const identity = {
+    ...pair("UP", "DOWN"),
+    key: "15m:retry-poly-unwind",
+    duration: "15m" as const,
+    startMs: Date.now() - 60_000,
+    endMs: Date.now() + 600_000,
+  };
+  const reason = "Sequential entry left Jupiter execution unresolved; Polymarket observed 8.314283 " +
+    "contracts: Jupiter Forecast Swap execution failed (6001): Slippage tolerance exceeded; " +
+    "automatic Polymarket unwind failed: Polymarket FOK sell rejected (400): not enough balance / " +
+    "allowance: the balance is not enough → balance: 0, order amount: 8310000";
+  await writeFile(statePath, JSON.stringify({
+    schemaVersion: 1,
+    sequence: 19,
+    halted: true,
+    haltReason: reason,
+    realizedProfitMicroUsd: "0n",
+    polymarketCashMicroUsd: "94057782n",
+    jupiterCashMicroUsd: "70160000n",
+    forcedEntrySubmissionAttempted: false,
+    completedPairs: [],
+    positions: [{
+      id: "live-19",
+      pair: identity,
+      phase: "exposure_error",
+      enteredAtMs: Date.now() - 30_000,
+      jupiterOrderPubkey: null,
+      jupiterPositionPubkey: "swap-v2:jup-down:down-mint",
+      jupiterContractsMicro: "0n",
+      polymarketContractsMicro: "8314283n",
+      jupiterEntryCostMicroUsd: "0n",
+      polymarketEntryCostMicroUsd: "5942218n",
+      remainingEntryCostMicroUsd: "5942218n",
+      originalContractsMicro: "0n",
+      realizedProfitMicroUsd: "0n",
+      polymarketSettled: false,
+      jupiterSettled: false,
+      polymarketSettlementPayoutMicroUsd: "0n",
+      jupiterSettlementPayoutMicroUsd: "0n",
+      entrySubmissionSkewMs: null,
+      exitSubmissionSkewMs: null,
+      diagnosticTestEntry: false,
+      lastError: reason,
+    }],
+  }));
+  const polymarket = new MockPolymarket(events);
+  polymarket.seedTokenBalance(8_314_283n);
+  const trader = createTrader(new MockJupiter(events), polymarket, statePath);
+
+  await trader.initialize();
+
+  const recoveries = trader.drainRecoveryDiagnostics();
+  assert.equal(recoveries.length, 1);
+  assert.equal(recoveries[0]?.source, "startup");
+  assert.equal(recoveries[0]?.code, "POLYMARKET_ONLY_ENTRY_AUTOMATICALLY_UNWOUND");
+  assert.equal(events.includes("polymarket:submit-sell"), true);
+  assert.equal(trader.snapshot().openPositions, 0);
   assert.equal(trader.snapshot().halted, false);
 });
 
@@ -1844,6 +1910,7 @@ class MockPolymarket implements LivePolymarketGateway {
   buyRejectionError: Error | null = null;
   buyPriceMicroUsd = 400_000n;
   fillContractMultiplierBps = 10_000n;
+  postBuyBalanceVisibilityReads = 0;
 
   get preparedBuy(): { contractsMicro: bigint; maximumPriceMicroUsd: bigint } | null {
     return this.#preparedBuy;
@@ -1855,6 +1922,10 @@ class MockPolymarket implements LivePolymarketGateway {
 
   constructor(events: string[]) {
     this.#events = events;
+  }
+
+  seedTokenBalance(contractsMicro: bigint): void {
+    this.#balance = contractsMicro;
   }
 
   async assertTokenReady(): Promise<bigint> {
@@ -1928,6 +1999,15 @@ class MockPolymarket implements LivePolymarketGateway {
 
   async getTokenBalance(): Promise<bigint> {
     this.#events.push("polymarket:balance");
+    return this.#balance;
+  }
+
+  async refreshTokenBalance(): Promise<bigint> {
+    this.#events.push("polymarket:refresh-balance");
+    if (this.#balance > 0n && this.postBuyBalanceVisibilityReads > 0) {
+      this.postBuyBalanceVisibilityReads -= 1;
+      return 0n;
+    }
     return this.#balance;
   }
 }

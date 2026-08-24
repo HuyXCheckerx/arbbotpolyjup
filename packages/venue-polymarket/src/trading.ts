@@ -6,7 +6,7 @@ import {
   relayerApiKey,
   type SecureClient,
 } from "@polymarket/client";
-import { fetchBalanceAllowance, fetchTickSize } from "@polymarket/client/actions";
+import { fetchBalanceAllowance, fetchTickSize, updateBalanceAllowance } from "@polymarket/client/actions";
 import { privateKey } from "@polymarket/client/viem";
 
 import { formatContracts, formatUsd, parseContracts, parseUsd } from "../../domain/src/fixed.ts";
@@ -132,6 +132,17 @@ export class PolymarketLiveExecutor {
 
   async getTokenBalance(tokenId: string): Promise<bigint> {
     const balance = await fetchBalanceAllowance(this.#client, {
+      assetType: "CONDITIONAL" as never,
+      tokenId,
+    });
+    return BigInt(balance.balance as unknown as bigint);
+  }
+
+  async refreshTokenBalance(tokenId: string): Promise<bigint> {
+    // A matched BUY settles on Polygon asynchronously. Force the CLOB's
+    // balance/allowance cache to refresh before an emergency SELL; a plain
+    // balance read can otherwise continue reporting the pre-fill zero balance.
+    const balance = await updateBalanceAllowance(this.#client, {
       assetType: "CONDITIONAL" as never,
       tokenId,
     });

@@ -43,6 +43,7 @@ const TRANSIENT_PREFLIGHT_COOLDOWN_MS = 750;
 const CONFIGURATION_PREFLIGHT_COOLDOWN_MS = 2_500;
 const ENTRY_CUTOFF_MS = 30_000;
 const MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS = 500n;
+const POLYMARKET_RECOVERY_BALANCE_POLL_MS = 500;
 const POST_FILL_JUPITER_RATE_LIMIT_RETRY_DELAYS_MS = [500, 1_000] as const;
 const OBSERVED_ENTRY_SIZE_MISMATCH =
   "Venue fills are size-mismatched; no one-sided buy top-up was attempted";
@@ -106,6 +107,7 @@ export interface LivePolymarketGateway {
   }): Promise<PreparedPolymarketFokOrder>;
   submitPreparedFok(prepared: PreparedPolymarketFokOrder): Promise<PolymarketLiveFill>;
   getTokenBalance(tokenId: string): Promise<bigint>;
+  refreshTokenBalance(tokenId: string): Promise<bigint>;
 }
 
 export type LivePositionPhase =
@@ -358,7 +360,7 @@ export class ShortWindowLiveTrader {
     }
     this.#pendingRecoveryDiagnostics.push(...await this.#recoverPersistedZeroExposureEntries("startup"));
     this.#pendingRecoveryDiagnostics.push(
-      ...await this.#recoverPersistedPolymarketOnlyEntries(persistedPolymarketCashMicroUsd),
+      ...await this.#recoverPersistedPolymarketOnlyEntries("startup", persistedPolymarketCashMicroUsd),
     );
     const ambiguous = this.#state.positions.find((position) =>
       position.phase !== "open" && position.phase !== "awaiting_resolution"
@@ -390,7 +392,9 @@ export class ShortWindowLiveTrader {
     if (!this.#state.halted || this.#busy) return [];
     this.#busy = true;
     try {
-      return await this.#recoverPersistedZeroExposureEntries("runtime");
+      const recoveries = await this.#recoverPersistedZeroExposureEntries("runtime");
+      recoveries.push(...await this.#recoverPersistedPolymarketOnlyEntries("runtime", null));
+      return recoveries;
     } finally {
       this.#busy = false;
     }
@@ -1568,6 +1572,7 @@ export class ShortWindowLiveTrader {
     entryResult: PromiseSettledResult<PolymarketLiveFill>,
     maximumEntryPriceMicroUsd: bigint,
     reason: string,
+    source: LiveRecoverySource = "entry_execution",
   ): Promise<LiveRecoveryDiagnostics | null> {
     if (position.jupiterContractsMicro > CONTRACT_TOLERANCE_MICRO ||
       position.polymarketContractsMicro <= CONTRACT_TOLERANCE_MICRO) {
@@ -1585,7 +1590,10 @@ export class ShortWindowLiveTrader {
         POLYMARKET_PRICE_TICK_MICRO_USD,
         applyBps(entryAveragePriceMicroUsd, this.#config.maximumSlippageBps, "down"),
       );
-      const balanceBefore = await this.#polymarket.getTokenBalance(position.pair.polymarketTokenId);
+      const balanceBefore = await this.#waitForPolymarketUnwindBalance(
+        position.pair.polymarketTokenId,
+        originalPolymarketContractsMicro,
+      );
       const prepared = await this.#polymarket.prepareSellFok({
         tokenId: position.pair.polymarketTokenId,
         contractsMicro: originalPolymarketContractsMicro,
@@ -1625,7 +1633,7 @@ export class ShortWindowLiveTrader {
       }
       const recovery: LiveRecoveryDiagnostics = {
         code: "POLYMARKET_ONLY_ENTRY_AUTOMATICALLY_UNWOUND",
-        source: "entry_execution",
+        source,
         recoveredAtMs: Date.now(),
         positionId: position.id,
         pairKey: position.pair.key,
@@ -1642,9 +1650,38 @@ export class ShortWindowLiveTrader {
       // If the exact-share unwind cannot fill within the configured slippage,
       // retain the reconciled exposure and halt. Automatic recovery must never
       // turn a known one-sided position into an unknown one.
-      position.lastError = `${reason}; automatic Polymarket unwind failed: ${errorMessage(error)}`;
+      position.lastError = `${primaryEntryFailureReason(reason)}; automatic Polymarket unwind failed: ` +
+        errorMessage(error);
       await this.#save();
       return null;
+    }
+  }
+
+  async #waitForPolymarketUnwindBalance(tokenId: string, contractsMicro: bigint): Promise<bigint> {
+    // Market SELL maker amounts are cent-precision shares. Waiting for that
+    // executable amount avoids blocking on harmless sub-cent share dust.
+    const requiredBalanceMicro = contractsMicro / 10_000n * 10_000n;
+    const deadlineMs = Date.now() + this.#config.jupiterFillTimeoutMs;
+    let latestBalanceMicro = 0n;
+    let lastError: unknown = null;
+    while (true) {
+      try {
+        latestBalanceMicro = await this.#polymarket.refreshTokenBalance(tokenId);
+        lastError = null;
+        if (latestBalanceMicro >= requiredBalanceMicro) return latestBalanceMicro;
+      } catch (error) {
+        lastError = error;
+      }
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(
+          `POLYMARKET_UNWIND_BALANCE_NOT_VISIBLE: need ${formatContracts(requiredBalanceMicro)} ` +
+          `contracts, refreshed balance ${formatContracts(latestBalanceMicro)}` +
+          (lastError ? `; last refresh failed: ${errorMessage(lastError)}` : ""),
+          lastError === null ? undefined : { cause: lastError },
+        );
+      }
+      await waitMilliseconds(Math.min(POLYMARKET_RECOVERY_BALANCE_POLL_MS, remainingMs));
     }
   }
 
@@ -1665,6 +1702,7 @@ export class ShortWindowLiveTrader {
   }
 
   async #recoverPersistedPolymarketOnlyEntries(
+    source: Extract<LiveRecoverySource, "startup" | "runtime">,
     persistedPolymarketCashMicroUsd: bigint | null,
   ): Promise<LiveRecoveryDiagnostics[]> {
     const candidates = this.#state.positions.filter((position) =>
@@ -1673,7 +1711,7 @@ export class ShortWindowLiveTrader {
     const recoveries: LiveRecoveryDiagnostics[] = [];
     for (const position of candidates) {
       const [observedBalance, observedJupiter] = await Promise.all([
-        this.#polymarket.getTokenBalance(position.pair.polymarketTokenId),
+        this.#polymarket.refreshTokenBalance(position.pair.polymarketTokenId),
         this.#jupiter.getPosition(position.jupiterPositionPubkey),
       ]);
       if (observedJupiter.positionPubkey !== position.jupiterPositionPubkey ||
@@ -1681,9 +1719,27 @@ export class ShortWindowLiveTrader {
         observedJupiter.isYes !== expectedJupiterIsYes(position.pair)) {
         continue;
       }
-      if (observedBalance > CONTRACT_TOLERANCE_MICRO ||
-        observedJupiter.contractsMicro > CONTRACT_TOLERANCE_MICRO) continue;
+      if (observedJupiter.contractsMicro > CONTRACT_TOLERANCE_MICRO) continue;
       const recordedContractsMicro = position.polymarketContractsMicro;
+      if (position.phase === "exposure_error" && Date.now() < position.pair.endMs &&
+        (observedBalance > CONTRACT_TOLERANCE_MICRO ||
+          isPolymarketUnwindBalanceVisibilityFailure(position.lastError))) {
+        const conservativeEntryPriceMicroUsd = minimum(
+          ONE_USD_MICRO,
+          position.polymarketEntryCostMicroUsd * ONE_CONTRACT_MICRO / recordedContractsMicro,
+        );
+        const recovery = await this.#recoverPolymarketOnlyEntry(
+          position,
+          { status: "rejected", reason: new Error("retrying persisted Polymarket-only entry") },
+          conservativeEntryPriceMicroUsd,
+          position.lastError ?? "persisted Polymarket-only entry",
+          source,
+        );
+        if (recovery) recoveries.push(recovery);
+        continue;
+      }
+      if (observedBalance > CONTRACT_TOLERANCE_MICRO ||
+        isPolymarketUnwindBalanceVisibilityFailure(position.lastError)) continue;
       const conservativeExitPriceMicroUsd = applyBps(
         position.polymarketEntryCostMicroUsd * ONE_CONTRACT_MICRO / recordedContractsMicro,
         this.#config.maximumSlippageBps,
@@ -1709,7 +1765,7 @@ export class ShortWindowLiveTrader {
       this.#state.positions = this.#state.positions.filter((candidate) => candidate.id !== position.id);
       const recovery: LiveRecoveryDiagnostics = {
         code: "POLYMARKET_ONLY_ENTRY_AUTOMATICALLY_UNWOUND",
-        source: "startup",
+        source,
         recoveredAtMs: Date.now(),
         positionId: position.id,
         pairKey: position.pair.key,
@@ -2344,6 +2400,18 @@ async function waitMilliseconds(milliseconds: number): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function primaryEntryFailureReason(reason: string): string {
+  return reason.split("; automatic Polymarket unwind failed:", 1)[0] ?? reason;
+}
+
+function isPolymarketUnwindBalanceVisibilityFailure(reason: string | null): boolean {
+  const error = reason?.toLowerCase() ?? "";
+  return error.includes("automatic polymarket unwind failed") && (
+    error.includes("polymarket_unwind_balance_not_visible") ||
+    (error.includes("not enough balance / allowance") && error.includes("balance: 0"))
+  );
 }
 
 function errorDiagnostic(error: unknown, depth = 0): LiveErrorDiagnostic {
