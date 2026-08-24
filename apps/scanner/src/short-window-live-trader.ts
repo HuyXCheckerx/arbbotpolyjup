@@ -32,9 +32,10 @@ import type {
   PreparedJupiterSubmission,
   SubmittedJupiterOrder,
 } from "../../../packages/venue-jupiter/src/trading.ts";
-import type {
-  PolymarketLiveFill,
-  PreparedPolymarketFokOrder,
+import {
+  floorPolymarketFokBuyContractsToAmountPrecision,
+  type PolymarketLiveFill,
+  type PreparedPolymarketFokOrder,
 } from "../../../packages/venue-polymarket/src/trading.ts";
 
 const CONTRACT_TOLERANCE_MICRO = 10_000n;
@@ -775,6 +776,7 @@ export class ShortWindowLiveTrader {
     let maximumPolymarketPrice: bigint | null = null;
     let polymarketQuote: VenueTradeCost | null = null;
     let quotedContractsMicro: bigint | null = null;
+    let polymarketContractsMicro = 0n;
     const finishStage = (): void => {
       stageTimingsMs[stage] = (stageTimingsMs[stage] ?? 0) + Math.max(0, Date.now() - stageStartedAtMs);
     };
@@ -814,7 +816,9 @@ export class ShortWindowLiveTrader {
       },
       polymarket: {
         tokenId: pair.polymarketTokenId,
-        proposedContractsMicro,
+        proposedContractsMicro: polymarketContractsMicro > 0n
+          ? polymarketContractsMicro
+          : proposedContractsMicro,
         quotedGrossMicroUsd: polymarketQuote?.grossMicroUsd ?? null,
         maximumPriceMicroUsd: maximumPolymarketPrice,
       },
@@ -850,34 +854,63 @@ export class ShortWindowLiveTrader {
         freshPolymarketBook.asks,
         this.#config.polymarketDepthHaircutBps,
       );
-      // The official Polymarket limit-order SDK signs share size to two
-      // decimals. Hedge only that executable precision; the sub-0.01 Jupiter
-      // remainder remains below the explicit one-cent cross-venue tolerance.
-      const polymarketContractsMicro = floorToPolymarketSharePrecision(
+      // The official SDK signs two-decimal shares, while the CLOB classifies a
+      // posted FOK as a marketable BUY and additionally requires a whole-cent
+      // collateral maker amount. Select the largest profitable price/size pair
+      // that satisfies both constraints before either venue is submitted.
+      polymarketContractsMicro = floorToPolymarketSharePrecision(
         guaranteedJupiterOutputContracts(build),
       );
       moveToStage("cross_venue_validation");
-      polymarketQuote = quoteBuyAcrossLevels(
-        executablePolymarketAsks,
-        polymarketContractsMicro,
-        "polymarket",
-      );
-      if (!polymarketQuote) {
+      let precisionSelectionStable = false;
+      for (let pass = 0; pass < 8; pass += 1) {
+        polymarketQuote = quoteBuyAcrossLevels(
+          executablePolymarketAsks,
+          polymarketContractsMicro,
+          "polymarket",
+        );
+        if (!polymarketQuote) {
+          rejectEntryPreflight(
+            "POLYMARKET_DEPTH_CHANGED",
+            "quoted Jupiter size exceeds visible Polymarket ladder depth",
+            "market_changed",
+          );
+        }
+        const profitablePriceCeiling = maximumConservativelyProfitablePolymarketPrice({
+          quantityMicro: polymarketContractsMicro,
+          jupiterAllInMicroUsd: build.order.orderCostMicroUsd + build.order.estimatedTotalFeeMicroUsd,
+          displayedLimitPriceMicroUsd: polymarketQuote.limitPriceMicroUsd,
+          maximumSlippageBps: this.#config.maximumSlippageBps,
+          minimumEdgeMicroUsdPerContract: this.#config.strategy.minimumEntryEdgeMicroUsdPerContract,
+          minimumEdgeTotalMicroUsd: this.#config.strategy.minimumEntryEdgeTotalMicroUsd,
+          allowUnprofitable: forcedTestEntry,
+        });
+        const preciseOrder = largestPolymarketFokBuyAtValidPrecision({
+          requestedContractsMicro: polymarketContractsMicro,
+          minimumPriceMicroUsd: polymarketQuote.limitPriceMicroUsd,
+          maximumPriceMicroUsd: profitablePriceCeiling,
+        });
+        if (preciseOrder.contractsMicro <= 0n) {
+          rejectEntryPreflight(
+            "POLYMARKET_FOK_AMOUNT_PRECISION_UNREACHABLE",
+            "no marketable Polymarket FOK size satisfies the CLOB amount precision",
+            "market_changed",
+          );
+        }
+        maximumPolymarketPrice = preciseOrder.limitPriceMicroUsd;
+        if (preciseOrder.contractsMicro === polymarketContractsMicro) {
+          precisionSelectionStable = true;
+          break;
+        }
+        polymarketContractsMicro = preciseOrder.contractsMicro;
+      }
+      if (!precisionSelectionStable || !polymarketQuote || maximumPolymarketPrice === null) {
         rejectEntryPreflight(
-          "POLYMARKET_DEPTH_CHANGED",
-          "quoted Jupiter size exceeds visible Polymarket ladder depth",
-          "market_changed",
+          "POLYMARKET_FOK_AMOUNT_PRECISION_UNSTABLE",
+          "Polymarket FOK precision normalization did not converge",
+          "transient",
         );
       }
-      maximumPolymarketPrice = maximumConservativelyProfitablePolymarketPrice({
-        quantityMicro: polymarketContractsMicro,
-        jupiterAllInMicroUsd: build.order.orderCostMicroUsd + build.order.estimatedTotalFeeMicroUsd,
-        displayedLimitPriceMicroUsd: polymarketQuote.limitPriceMicroUsd,
-        maximumSlippageBps: this.#config.maximumSlippageBps,
-        minimumEdgeMicroUsdPerContract: this.#config.strategy.minimumEntryEdgeMicroUsdPerContract,
-        minimumEdgeTotalMicroUsd: this.#config.strategy.minimumEntryEdgeTotalMicroUsd,
-        allowUnprofitable: forcedTestEntry,
-      });
       validateJupiterEntryBuild({
         build,
         pair,
@@ -2305,13 +2338,28 @@ function validateJupiterEntryBuild(input: {
       "market_changed",
     );
   }
-  const quantityMicro = polymarketExecutableContractsMicro;
-  if (input.polymarketQuote.quantityMicro !== quantityMicro ||
-    guaranteedContractsMicro - quantityMicro >= CONTRACT_TOLERANCE_MICRO) {
+  const quantityMicro = input.polymarketQuote.quantityMicro;
+  if (quantityMicro < config.strategy.polymarketMinimumContractsMicro) {
+    rejectEntryPreflight(
+      "POLYMARKET_BELOW_CONTRACT_MINIMUM",
+      "precision-normalized Polymarket FOK is below the configured contract minimum",
+      "market_changed",
+    );
+  }
+  if (quantityMicro <= 0n || quantityMicro > guaranteedContractsMicro) {
     rejectEntryPreflight(
       "CROSS_VENUE_QUANTITY_MISMATCH",
-      "Polymarket VWAP quote quantity differs from the Jupiter executable quote",
+      "Polymarket FOK quantity exceeds the Jupiter executable quote",
       "transient",
+    );
+  }
+  const unmatchedJupiterContractsMicro = guaranteedContractsMicro - quantityMicro;
+  const unmatchedJupiterBps = unmatchedJupiterContractsMicro * 10_000n / quantityMicro;
+  if (unmatchedJupiterBps > MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS) {
+    rejectEntryPreflight(
+      "CROSS_VENUE_QUANTITY_MISMATCH",
+      "Polymarket FOK precision would leave too much unmatched Jupiter output",
+      "market_changed",
     );
   }
   if (input.polymarketQuote.grossMicroUsd < config.strategy.polymarketMinimumGrossOrderMicroUsd) {
@@ -2446,6 +2494,36 @@ function tradeGross(priceMicroUsd: bigint, quantityMicro: bigint): bigint {
 
 function floorToPolymarketSharePrecision(quantityMicro: bigint): bigint {
   return quantityMicro / 10_000n * 10_000n;
+}
+
+function largestPolymarketFokBuyAtValidPrecision(input: {
+  requestedContractsMicro: bigint;
+  minimumPriceMicroUsd: bigint;
+  maximumPriceMicroUsd: bigint;
+}): { contractsMicro: bigint; limitPriceMicroUsd: bigint } {
+  const minimumTicks = (
+    input.minimumPriceMicroUsd + POLYMARKET_PRICE_TICK_MICRO_USD - 1n
+  ) / POLYMARKET_PRICE_TICK_MICRO_USD;
+  const maximumTicks = input.maximumPriceMicroUsd / POLYMARKET_PRICE_TICK_MICRO_USD;
+  if (minimumTicks > maximumTicks) {
+    return { contractsMicro: 0n, limitPriceMicroUsd: 0n };
+  }
+  let bestContractsMicro = 0n;
+  let bestPriceMicroUsd = 0n;
+  for (let ticks = minimumTicks; ticks <= maximumTicks; ticks += 1n) {
+    const priceMicroUsd = ticks * POLYMARKET_PRICE_TICK_MICRO_USD;
+    const contractsMicro = floorPolymarketFokBuyContractsToAmountPrecision(
+      input.requestedContractsMicro,
+      priceMicroUsd,
+    );
+    if (contractsMicro > bestContractsMicro ||
+      (contractsMicro === bestContractsMicro &&
+        (bestPriceMicroUsd === 0n || priceMicroUsd < bestPriceMicroUsd))) {
+      bestContractsMicro = contractsMicro;
+      bestPriceMicroUsd = priceMicroUsd;
+    }
+  }
+  return { contractsMicro: bestContractsMicro, limitPriceMicroUsd: bestPriceMicroUsd };
 }
 
 function guaranteedJupiterOutputContracts(build: JupiterPredictionOrderBuild): bigint {

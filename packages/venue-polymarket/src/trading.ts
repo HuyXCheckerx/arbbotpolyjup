@@ -30,6 +30,17 @@ function floorToCent(value: bigint): bigint {
   return value / 10_000n * 10_000n;
 }
 
+function greatestCommonDivisor(left: bigint, right: bigint): bigint {
+  let a = left < 0n ? -left : left;
+  let b = right < 0n ? -right : right;
+  while (b !== 0n) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+  return a;
+}
+
 export const POLYMARKET_MARKETABLE_BUY_MINIMUM_MICRO_USD = 1_000_000n;
 
 export interface PolymarketLiveFill {
@@ -362,6 +373,27 @@ export function assertPolymarketBuyLimitOrder(
       `Polymarket SDK produced a BUY limit maker amount above the configured maximum price`,
     );
   }
+  // FOK is treated as a marketable BUY by the CLOB even though the signed
+  // payload was built with the limit-order helper. Its collateral maker amount
+  // must therefore be cent-precision and its share taker amount may use at most
+  // four decimals.
+  assertPolymarketMarketOrderPrecision(order);
+}
+
+export function floorPolymarketFokBuyContractsToAmountPrecision(
+  requestedContractsMicro: bigint,
+  limitPriceMicroUsd: bigint,
+): bigint {
+  if (requestedContractsMicro <= 0n || limitPriceMicroUsd <= 0n || limitPriceMicroUsd >= 1_000_000n) {
+    return 0n;
+  }
+  // The signed limit order uses two-decimal shares. For an FOK BUY the CLOB
+  // additionally requires (price * shares) to produce a whole-cent collateral
+  // maker amount. If price is P micro-USD and size is S share-cents, that means
+  // P*S must be divisible by 1_000_000.
+  const shareCentStep = 1_000_000n / greatestCommonDivisor(limitPriceMicroUsd, 1_000_000n);
+  const requestedShareCents = requestedContractsMicro / 10_000n;
+  return requestedShareCents / shareCentStep * shareCentStep * 10_000n;
 }
 
 export function assertPolymarketMarketableBuyMinimum(grossAmountMicroUsd: bigint): void {

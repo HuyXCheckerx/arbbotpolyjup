@@ -238,7 +238,7 @@ async function main(): Promise<void> {
   const maximumSlippageBps = args.integer("maximum-slippage-bps", 100);
   const polymarketDepthHaircutBps = args.integer("polymarket-depth-haircut-bps", 2_000);
   const allowSubFiveJupiterSwap = args.has("allow-sub-five-jupiter-swap");
-  const maximumJupiterSubmissionQuoteAgeMs = args.integer("maximum-jupiter-submit-quote-age-ms", 500);
+  const maximumJupiterSubmissionQuoteAgeMs = args.integer("maximum-jupiter-submit-quote-age-ms", 2_500);
   const maximumEmergencyHedgeLossMicroUsd = parseUsd(args.string("maximum-emergency-hedge-loss-usd", "1"));
   const jupiterFillTimeoutMs = args.integer("jupiter-fill-timeout-ms", 20_000);
   const minimumVenueBalanceMicroUsd = parseUsd(args.string("minimum-venue-balance-usd", "50"));
@@ -3290,7 +3290,7 @@ Options:
   --check-live-readiness             Read both venue balances/readiness, then exit without transactions
   --maximum-slippage-bps=100         Polymarket and recovery price protection; Jupiter uses RTSE
   --polymarket-depth-haircut-bps=2000 Ignore the final 20% of displayed CLOB depth when sizing
-  --maximum-jupiter-submit-quote-age-ms=500 Maximum signed quote age before a post-fill requote
+  --maximum-jupiter-submit-quote-age-ms=2500 Maximum signed quote age before a post-fill requote
   --maximum-emergency-hedge-loss-usd=1 Base accepted loss after first-leg fill; may expand to the naked first-leg stake
   --jupiter-fill-timeout-ms=20000    Reconcile Jupiter after signed execution submission
   --minimum-venue-balance-usd=50     Minimum real wallet balance required at each venue on startup
