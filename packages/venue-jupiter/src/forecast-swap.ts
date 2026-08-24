@@ -21,7 +21,7 @@ import {
   type PreparedJupiterSubmission,
   type SubmittedJupiterOrder,
 } from "./trading.ts";
-import type { JupiterRequestScheduler } from "./request-scheduler.ts";
+import type { JupiterRequestPriority, JupiterRequestScheduler } from "./request-scheduler.ts";
 
 const DEFAULT_SWAP_URL = "https://api.jup.ag/swap/v2";
 const AUTO_SETTLEMENT_TOLERANCE_MICRO = 10_000n;
@@ -87,6 +87,7 @@ export class JupiterSwapClient {
   readonly #http: HttpClient;
   readonly #minimumRequestIntervalMs: number;
   readonly #requestScheduler: JupiterRequestScheduler | undefined;
+  readonly #requestPriority: JupiterRequestPriority;
   #lastRequestAtMs = 0;
   #requestQueue: Promise<void> = Promise.resolve();
 
@@ -96,12 +97,14 @@ export class JupiterSwapClient {
     http?: HttpClient;
     minimumRequestIntervalMs?: number;
     requestScheduler?: JupiterRequestScheduler;
+    requestPriority?: JupiterRequestPriority;
   } = {}) {
     this.#baseUrl = trimSlash(options.baseUrl ?? process.env.JUPITER_SWAP_URL ?? DEFAULT_SWAP_URL);
     this.#apiKey = options.apiKey ?? process.env.JUPITER_API_KEY;
     this.#http = options.http ?? new HttpClient();
     this.#minimumRequestIntervalMs = options.minimumRequestIntervalMs ?? (this.#apiKey ? 1_000 : 2_100);
     this.#requestScheduler = options.requestScheduler;
+    this.#requestPriority = options.requestPriority ?? "critical";
   }
 
   async createOrder(input: {
@@ -199,7 +202,7 @@ export class JupiterSwapClient {
   async #requestJson(method: "GET" | "POST", url: URL | string, body?: unknown): Promise<unknown> {
     const requestUrl = typeof url === "string" ? new URL(url) : url;
     if (this.#requestScheduler && !requestUrl.pathname.endsWith("/execute")) {
-      await this.#requestScheduler.wait("critical");
+      await this.#requestScheduler.wait(this.#requestPriority);
       if (method === "POST") return await this.#http.postJson(requestUrl, body, this.#headers());
       return await this.#http.getJson(requestUrl, this.#headers());
     }

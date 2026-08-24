@@ -506,7 +506,8 @@ export class ShortWindowLiveTrader {
           jupiterAvailableMicroUsd: entryJupiterCapacity,
           config: this.#config,
         })) {
-        // The screening quote is already an executable Swap V2 transaction.
+        // The rolling screening quote is already an executable Jupiter
+        // Prediction or Swap V2 transaction.
         // Matching the hedge to its full output avoids a second quote request,
         // API-rate-limit contention, and hundreds of milliseconds of drift.
         entryJupiterGrossMicroUsd = input.jupiterEntryBuild.order.orderCostMicroUsd;
@@ -565,6 +566,13 @@ export class ShortWindowLiveTrader {
 
   hasOpenPosition(pairKey: string): boolean {
     return this.#state.positions.some((position) => position.pair.key === pairKey && position.phase === "open");
+  }
+
+  acceptsEntryQuotes(pairKey: string): boolean {
+    if (this.#state.halted || this.#state.completedPairs.includes(pairKey)) return false;
+    if (this.#state.positions.some((position) => position.pair.key === pairKey)) return false;
+    if (this.#state.positions.length >= this.#config.maximumOpenPositions) return false;
+    return !this.#config.forceOneEntry || !this.#state.forcedEntrySubmissionAttempted;
   }
 
   needsExitBook(pairKey: string): boolean {

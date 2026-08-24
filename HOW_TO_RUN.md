@@ -176,8 +176,8 @@ For native Jupiter Forecast markets, live execution is hybrid:
 
 - Jupiter Prediction `/orders` → `/execute` is used when the Jupiter deposit is at least `$5`, matching Jupiter's recommended website-style path;
 - direct outcome-token Swap V2 is used below `$5`, because Prediction rejects smaller builds;
-- both paths share a one-request-per-second exact-build scheduler, while the signed `/execute` handoff is not delayed;
-- the exact Jupiter build is signed during Polymarket preparation and reused only while it remains within the configured submission-age limit.
+- live mode continuously rolls unsigned executable builds through a shared `125ms` scheduler (`8 RPS`), leaving headroom below the Developer plan's `10 RPS` limit; critical entry/recovery work jumps ahead of discovery;
+- out-of-order responses cannot replace a newer build, and the selected exact build is signed during Polymarket preparation only while it remains within the configured submission-age limit.
 
 ## Customize risk and entry requirements
 
@@ -218,12 +218,12 @@ Common controls:
 | `--maximum-slippage-bps=100` | `100 bps` | Maximum live price protection per leg; allowed range is 1–500 bps |
 | `--maximum-jupiter-submit-quote-age-ms=500` | `0.5 seconds` | Requotes instead of submitting an older signed Jupiter build after Polymarket fills |
 | `--maximum-emergency-hedge-loss-usd=1` | `$1` | Base post-fill hedge-loss budget; after Polymarket fills, it may expand to that leg's already-at-risk entry cost. It does not relax pre-entry profit checks or hard allocation limits |
-| `--jupiter-quote-usd=5` | `$5` | Gross cap used for websocket entry screening |
+| `--jupiter-quote-usd=MAX_ALLOCATION` | per-position allocation | Maximum rolling executable-quote gross; exact sizing adapts below this cap |
 | `--jupiter-fill-timeout-ms=20000` | `20 seconds` | Jupiter fill/reconciliation timeout |
 | `--market-log-interval-ms=30000` | `30 seconds` | Suppresses repetitive snapshots without slowing execution evaluation |
-| `--max-polymarket-age-ms=5000` | `5 seconds` | Rejects entry decisions based on an older Polymarket snapshot |
+| `--max-polymarket-age-ms=750` | `0.75 seconds` | Rejects entry decisions based on an older Polymarket snapshot |
 | `--max-jupiter-age-ms=2000` | `2 seconds` | Rejects entry decisions based on an older Jupiter snapshot |
-| `--jupiter-request-interval-ms=110` | `110 ms` | Shares the Developer-tier 10 RPS bucket across Prediction and Swap; live builds jump ahead of discovery |
+| `--jupiter-request-interval-ms=125` | `125 ms` | Caps the shared main bucket at 8 RPS; critical builds jump ahead of rolling discovery |
 | `--no-daily-threshold` | off | Disables daily Bitcoin-above-strike markets |
 | `--web-port=3210` | `3210` | Local status API and live single-instance lock |
 | `--output=PATH` | standard JSONL path | Selects the append-only event log |
@@ -343,6 +343,6 @@ A new state file does not close or forget positions on-chain; it only tells the 
 - `REFERENCE_DIFFERENCE_NOT_STRICTLY_BELOW_LIMIT`: the venues' opening references did not satisfy `--max-reference-difference-usd`.
 - No candidates: displayed raw asks may cease to qualify after taker fees, minimum collateral, exact Swap pricing, available depth, or the configured profit floors.
 - Port `3210` already occupied: another scanner/live bot may be running. Inspect it before choosing another port; never bypass the live lock to run two bots against the same state.
-- Degen price WebSocket repeatedly disconnects: the client reconnects automatically. If Jupiter has moved its public frontend service, set `JUPITER_PREDICTION_PRICE_WEBSOCKET_URL` only after verifying the replacement endpoint and payload schema.
+- Degen price WebSocket repeatedly disconnects: the client reconnects automatically. Live execution still requires a fresh authenticated rolling build; the socket is only an indicative size selector. If Jupiter has moved its public frontend service, set `JUPITER_PREDICTION_PRICE_WEBSOCKET_URL` only after verifying the replacement endpoint and payload schema.
 
 For the detailed execution and recovery model, read [docs/LIVE_TRADING.md](docs/LIVE_TRADING.md). For market qualification, fee handling, and record formats, read [docs/SHORT_WINDOW_MONITOR.md](docs/SHORT_WINDOW_MONITOR.md).

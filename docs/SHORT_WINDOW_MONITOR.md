@@ -42,7 +42,7 @@ The two closing values can land on opposite sides of their respective references
 
 ## Books and fees
 
-Polymarket top-of-book changes arrive over its market WebSocket. Jupiter entry prices arrive from the public price WebSocket used by the Degen UI; both streams are discovery signals, not final executable depth. The scanner selects the largest screened size within both budgets and profit floors. At live preflight it requests an exact Jupiter build, validates Swap V2's guaranteed minimum output, then fetches the selected Polymarket REST book immediately before signing. Polymarket depth receives a default 20% haircut, and the exact-share FOK maximum price is capped by the remaining profit budget. The default Jupiter strategy floor is `$5` and uses Prediction; sub-`$5` RTSE Swap V2 requires explicit opt-in. Once a position is open, balanced positions are held through resolution.
+Polymarket top-of-book changes arrive over its market WebSocket. The public price WebSocket used by Jupiter's Degen UI is only an indicative route/size selector. In live mode, overlapping authenticated Prediction builds produce the execution book and newest unsigned transaction for each selected outcome. The shared scheduler starts at most one main-bucket request every `125ms` (`8 RPS`), while critical entry and recovery requests jump ahead of rolling discovery. A slower response cannot overwrite a newer request sequence, and a build older than `500ms` cannot arm entry. Exact sizing steps down when price impact removes the edge and grows in bounded increments toward the largest conservatively profitable size. Polymarket depth receives a default 20% haircut, and the exact-share FOK maximum price is capped by the remaining profit budget. The default Jupiter strategy floor is `$5` and uses Prediction; sub-`$5` RTSE Swap V2 requires explicit opt-in. Once a position is open, balanced positions are held through resolution.
 
 Entry-preflight backoff is isolated per round. A market-change rejection waits 250ms, a transient venue/network failure waits 750ms, and a likely configuration/readiness error waits 2500ms. A failure on the 5m pair therefore cannot suppress the 15m pair. Cooldown decisions state the affected pair, remaining time, previous stage, and stable error code.
 
@@ -54,7 +54,7 @@ The scanner evaluates the smaller size available at the two selected top asks an
 - Jupiter generic-orderbook taker-fee estimate: `contracts × 0.07 × price × (1-price)`, rounded up to the nearest cent per order.
 - Jupiter live Swap V2 quote: the effective ask is `input USDC / output outcome-token units`. The returned amounts already include Swap V2's platform fee and price impact, so the scanner does not add a second prediction-market fee.
 
-An `arb_opportunity` record is written only when the nominal complementary payout exceeds the fee-adjusted asks and the Jupiter websocket snapshot is fresh. In live mode, that indicative candidate cannot be submitted until a fresh atomic Swap `/order` preflight confirms the exact executable size and price. The record remains a non-guaranteed candidate because of oracle basis and non-atomic cross-chain execution.
+An `arb_opportunity` record is written only when the nominal complementary payout exceeds the fee-adjusted asks and the Jupiter snapshot is fresh. In live mode that snapshot comes from a rolling authenticated executable build, and the associated unsigned transaction must still be fresh when the bot prepares both venues. The record remains a non-guaranteed candidate because of oracle basis and non-atomic cross-chain execution.
 
 ## Run
 
@@ -123,7 +123,7 @@ pnpm monitor:short-window -- --help
 | `--jupiter-poll-ms` | `200` | REST retry/poll baseline; resolution-only live positions do not request exit books |
 | `--max-polymarket-age-ms` | `750` | Maximum Polymarket snapshot age for an entry decision |
 | `--max-jupiter-age-ms` | `2000` | Maximum Jupiter snapshot age for an entry decision |
-| `--jupiter-request-interval-ms` | `110` | Shared Developer-tier request spacing; live order builds are prioritized over discovery |
+| `--jupiter-request-interval-ms` | `125` | Shared 8-RPS Developer-tier spacing; critical entry/recovery builds are prioritized over rolling discovery |
 | `--max-consecutive-jupiter-errors` | `5` | Persistent-error warning threshold; the pair remains active with exponential backoff |
 | `--max-samples` | `0` | Stop after N synchronized samples; zero is unlimited |
 | `--max-opportunities` | `0` | Stop after N distinct candidate records; zero is unlimited |
@@ -140,7 +140,7 @@ pnpm monitor:short-window -- --help
 | `--jupiter-minimum-order-usd` | `5` | Default strategy floor matching Jupiter Prediction minimum |
 | `--allow-sub-five-jupiter-swap` | off | Explicitly permit direct RTSE Swap V2 Forecast orders below `$5` |
 | `--polymarket-minimum-order-usd` | `1` | Minimum collateral for a marketable Polymarket BUY; sizing scales cheap legs up to this floor |
-| `--jupiter-quote-usd` | follows `--max-venue-allocation-usd` (`50`) | Gross cap used to synthesize entry-screening depth from Degen top prices |
+| `--jupiter-quote-usd` | follows `--max-venue-allocation-usd` (`50`) | Maximum rolling executable-quote gross; adaptive sizing may request less |
 | `--minimum-entry-edge-usd` | `0.001` | Minimum nominal entry edge per contract after entry fees |
 | `--minimum-entry-profit-usd` | `0.10` | Minimum nominal total entry edge |
 | `--minimum-exit-profit-usd` | `0.10` | Legacy threshold retained for compatibility; live automatic exits are disabled |
@@ -149,7 +149,7 @@ pnpm monitor:short-window -- --help
 | `--no-web` | off | Disable the local dashboard status API |
 | `--output` | `logs/btc-poly-jup-short-window-arb.jsonl` | Append-only JSONL path |
 
-Short-window entry discovery uses the same public top-price WebSocket as Jupiter's Degen UI. It subscribes to the selected Bison UP/DOWN market IDs in one connection and does not call authenticated Swap `/order` while merely watching prices. A candidate must still pass a fresh atomic Swap V2 build before the bot prepares or submits the Polymarket leg. Once a balanced position is open, automatic profit-taking is skipped and no Jupiter REST exit book is polled; the settlement loop takes over after resolution.
+Short-window live discovery subscribes to the same public top-price WebSocket as Jupiter's Degen UI, but that feed only retargets the rolling quote size and cannot trigger an order. The execution signal is built from authenticated unsigned Prediction transactions (or explicitly enabled sub-`$5` Swap V2 transactions). Several requests may overlap, but the shared scheduler caps their starts at 8 RPS and the per-outcome sequence cache retains only the newest response. Once a balanced position is open, automatic profit-taking is skipped and rolling entry builds pause; the settlement loop takes over after resolution.
 
 The Degen price service is a public frontend dependency but is not part of Jupiter's documented Prediction API contract. The stream reconnects with exponential backoff after errors or 30 seconds without messages. If Jupiter moves the service before this beta stabilizes, override it with `JUPITER_PREDICTION_PRICE_WEBSOCKET_URL` while updating the integration.
 

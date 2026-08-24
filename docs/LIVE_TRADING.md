@@ -11,7 +11,7 @@ For each current BTC 5-minute and 15-minute round, the process:
 1. Pairs only equal-duration markets with identical start and end times.
 2. Requires exact opening references to differ by strictly less than `$30`.
 3. Selects the complementary route implied by the two opening references.
-4. Discovers entries from Jupiter's public Degen top-price WebSocket with synthetic screening depth capped by the per-position Jupiter allocation, then requests one exact executable build only after a candidate reaches preflight. The strategy selects the largest screened size that fits both venue budgets and preserves at least `$0.001` per contract and `$0.10` total after modeled fees. Live entry reserves the configured 5% post-fill normalization allowance plus the configured slippage allowance beneath the hard venue cap, so a price-improved Polymarket fill can still be fully hedged. The exact build must preserve the same profit limits after price impact and slippage protection.
+4. Uses the public Degen top-price WebSocket only to select an indicative complementary route and starting size. Live mode continuously requests authenticated unsigned executable builds through a shared 8-RPS scheduler and caches the newest response per outcome. Slower out-of-order responses are discarded, and a build older than `500ms` cannot arm entry. Exact sizing steps down when Jupiter price impact removes the edge and grows by at most 25% only after the current executable size remains profitable. The selected size must preserve at least `$0.001` per contract and `$0.10` total after exact Jupiter pricing, modeled Polymarket fees, depth haircut and protected limit price.
 5. Uses Jupiter Prediction `/orders` → `/execute` for native Forecast deposits of at least `$5`, matching the recommended website-style path. Smaller direct Swap V2 legs are disabled unless `--allow-sub-five-jupiter-swap` is supplied. Swap orders omit manual slippage so Jupiter can use RTSE; standard `POLY-*` prediction markets always use Prediction.
 6. Limits each leg of each position to `$50`, including modeled/quoted entry fees, and permits at most five concurrent unsettled positions. Real wallet balances can impose a lower practical limit.
 7. Verifies Polymarket balances and approvals before exposing the Jupiter leg. The same read supplies the pre-entry token-balance snapshot, avoiding a redundant API round trip.
@@ -31,7 +31,7 @@ Gas and ordinary network fees are not included in strategy P&L, as requested. Th
 - Polymarket entry orders are exact-share FOKs with a protected maximum price. Price improvement lowers spend instead of increasing the share count. A rejected FOK does not rest on the book.
 - Entry is Polymarket-first; Jupiter is pre-signed and submitted only after a positive observed Polymarket fill. Submission timing is written to the JSONL/state record.
 - No one-sided buy top-up or excess sell is placed after a fully observed two-sided size mismatch. Both recorded venue balances are retained through resolution; the unmatched remainder remains directional exposure.
-- A stale or unavailable Jupiter atomic executable quote cannot trigger an entry. Generic Jupiter orderbook asks never arm live entry, and balanced open positions do not consume REST requests for exit screening.
+- A stale or unavailable rolling Jupiter executable quote cannot trigger an entry. Public Degen prices and generic Jupiter orderbook asks never arm live entry, and balanced open positions do not consume REST requests for exit screening.
 - New entries stop in the final 30 seconds of both 5m and 15m rounds.
 - State is atomically persisted with file mode `0600` before and after execution phases.
 - An ambiguous submission, unmatched second leg, or mismatched exit halts all new entries. A fully observed two-sided entry-size mismatch does not halt: it remains open and is held through resolution because both balances are known exactly.
@@ -179,14 +179,15 @@ The JSONL contains public market/order/transaction identifiers but no wallet sec
 | Minimum real wallet balance per venue at startup | `$50` |
 | Maximum allocation per venue per position | `$50` |
 | Maximum concurrent unsettled positions | `5` |
-| Jupiter strategy floor | `$0.01` |
-| Jupiter websocket entry-screening gross cap | Follows the `$50` maximum venue allocation unless overridden |
-| Minimum entry edge per contract | `$0.01` |
+| Jupiter strategy floor | `$5` |
+| Jupiter rolling executable-quote gross cap | Follows the `$50` maximum venue allocation unless overridden |
+| Developer-tier shared request spacing | `125ms` (`8 RPS`, leaving headroom under the 10-RPS plan limit) |
+| Minimum entry edge per contract | `$0.001` |
 | Minimum total entry edge | `$0.10` |
 | Exit policy | Hold through resolution; no automatic profit-taking |
 | Entry cutoff before market close | `30 seconds` |
 | Maximum live slippage per leg | `100 bps` |
-| Maximum signed Jupiter quote age at submission | `1 second` |
+| Maximum signed Jupiter quote age at submission | `0.5 seconds` |
 | Base emergency hedge loss after first-leg fill | `$1`; may expand to the already-at-risk Polymarket entry cost |
 | Jupiter execution wait | `20 seconds` |
 | Opening-reference difference | strictly `< $30` |

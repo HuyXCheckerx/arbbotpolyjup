@@ -7,6 +7,7 @@ import {
   buildJupiterForecastOrderBook,
   buildJupiterMarketPricingBook,
   JupiterPredictionPriceBookState,
+  JupiterRollingAtomicQuoteBookState,
   type JupiterBuyQuoteGateway,
 } from "../src/jupiter-quote-fallback.ts";
 
@@ -80,6 +81,49 @@ test("creates an entry-only Jupiter book from unsigned size-specific atomic quot
   }]);
   assert.equal(result.builds.get("UP")?.order.marketId, "event-UP");
   assert.equal(result.builds.get("DOWN")?.order.marketId, "event-DOWN");
+});
+
+test("rolling executable quote state rejects out-of-order responses and expires each outcome independently", () => {
+  const state = new JupiterRollingAtomicQuoteBookState({
+    upMarketId: "event-UP",
+    downMarketId: "event-DOWN",
+    outcomes: ["UP", "DOWN"],
+  });
+  const newestUp = build("event-UP", 5_000_000n, 10_000_000n);
+  const staleUp = build("event-UP", 5_000_000n, 9_000_000n);
+  const down = build("event-DOWN", 5_000_000n, 20_000_000n);
+
+  const upSnapshot = state.apply({
+    outcome: "UP",
+    sequence: 2,
+    build: newestUp,
+    builtAtMs: 1_000,
+    maximumAgeMs: 500,
+  });
+  assert.equal(upSnapshot?.builds.get("UP"), newestUp);
+  assert.equal(state.apply({
+    outcome: "UP",
+    sequence: 1,
+    build: staleUp,
+    builtAtMs: 1_100,
+    maximumAgeMs: 500,
+  }), null);
+
+  const both = state.apply({
+    outcome: "DOWN",
+    sequence: 1,
+    build: down,
+    builtAtMs: 1_200,
+    maximumAgeMs: 500,
+  });
+  assert.equal(both?.book.receivedAtMs, 1_000);
+  assert.equal(both?.builds.get("UP"), newestUp);
+  assert.equal(both?.builds.get("DOWN"), down);
+
+  const downOnly = state.snapshot(1_501, 500);
+  assert.equal(downOnly?.builds.has("UP"), false);
+  assert.equal(downOnly?.builds.get("DOWN"), down);
+  assert.equal(state.snapshot(1_701, 500), null);
 });
 
 test("uses Jupiter's indicative market price before spending an atomic quote request", async () => {

@@ -27,6 +27,107 @@ export interface JupiterAtomicQuoteBook {
   builds: ReadonlyMap<ShortWindowOutcome, JupiterPredictionOrderBuild>;
 }
 
+export interface JupiterRollingAtomicQuoteSnapshot extends JupiterAtomicQuoteBook {
+  buildAtMs: ReadonlyMap<ShortWindowOutcome, number>;
+}
+
+interface RollingAtomicQuote {
+  sequence: number;
+  build: JupiterPredictionOrderBuild;
+  builtAtMs: number;
+}
+
+/**
+ * Retains only the newest completed executable quote for each Forecast outcome.
+ * Several quote requests are intentionally allowed in flight at once; the
+ * monotonically increasing request sequence prevents a slower old response
+ * from replacing a newer transaction.
+ */
+export class JupiterRollingAtomicQuoteBookState {
+  readonly #upMarketId: string;
+  readonly #downMarketId: string;
+  readonly #outcomes: readonly ShortWindowOutcome[];
+  readonly #quotes = new Map<ShortWindowOutcome, RollingAtomicQuote>();
+
+  constructor(input: {
+    upMarketId: string;
+    downMarketId: string;
+    outcomes: readonly ShortWindowOutcome[];
+  }) {
+    this.#upMarketId = input.upMarketId;
+    this.#downMarketId = input.downMarketId;
+    this.#outcomes = [...new Set(input.outcomes)];
+    if (this.#outcomes.length === 0) throw new Error("Jupiter rolling quote state has no selected outcome");
+  }
+
+  apply(input: {
+    outcome: ShortWindowOutcome;
+    sequence: number;
+    build: JupiterPredictionOrderBuild;
+    builtAtMs: number;
+    maximumAgeMs: number;
+  }): JupiterRollingAtomicQuoteSnapshot | null {
+    if (!this.#outcomes.includes(input.outcome)) return null;
+    if (!Number.isSafeInteger(input.sequence) || input.sequence < 1) {
+      throw new Error("Jupiter rolling quote sequence must be a positive safe integer");
+    }
+    if (!Number.isFinite(input.builtAtMs) || input.builtAtMs < 0) {
+      throw new Error("Jupiter rolling quote timestamp must be non-negative");
+    }
+    if (!Number.isInteger(input.maximumAgeMs) || input.maximumAgeMs < 0) {
+      throw new Error("Jupiter rolling quote maximum age must be a non-negative integer");
+    }
+    const marketId = this.#marketId(input.outcome);
+    validateBuild(input.build, marketId, input.build.order.orderCostMicroUsd);
+    const current = this.#quotes.get(input.outcome);
+    if (current && current.sequence >= input.sequence) return null;
+    this.#quotes.set(input.outcome, {
+      sequence: input.sequence,
+      build: input.build,
+      builtAtMs: input.builtAtMs,
+    });
+    return this.snapshot(input.builtAtMs, input.maximumAgeMs);
+  }
+
+  snapshot(atMs: number, maximumAgeMs: number): JupiterRollingAtomicQuoteSnapshot | null {
+    const active = this.#outcomes.flatMap((outcome) => {
+      const quote = this.#quotes.get(outcome);
+      if (!quote) return [];
+      const ageMs = atMs - quote.builtAtMs;
+      return ageMs >= 0 && ageMs <= maximumAgeMs ? [{ outcome, quote }] : [];
+    });
+    if (active.length === 0) return null;
+    const builds = new Map<ShortWindowOutcome, JupiterPredictionOrderBuild>();
+    const buildAtMs = new Map<ShortWindowOutcome, number>();
+    const yesAsks: BookLevel[] = [];
+    const noAsks: BookLevel[] = [];
+    for (const { outcome, quote } of active) {
+      builds.set(outcome, quote.build);
+      buildAtMs.set(outcome, quote.builtAtMs);
+      (outcome === "UP" ? yesAsks : noAsks).push(quoteLevel(quote.build));
+    }
+    return {
+      book: {
+        venue: "jupiter",
+        provider: "bisonfi_atomic_quote",
+        marketId: active.map(({ outcome }) => this.#marketId(outcome)).join("|"),
+        // The oldest included side controls composite freshness. This prevents
+        // a new UP response from making an older DOWN build appear new.
+        receivedAtMs: Math.min(...active.map(({ quote }) => quote.builtAtMs)),
+        sourceTimestampMs: null,
+        yes: { bids: [], asks: yesAsks },
+        no: { bids: [], asks: noAsks },
+      },
+      builds,
+      buildAtMs,
+    };
+  }
+
+  #marketId(outcome: ShortWindowOutcome): string {
+    return outcome === "UP" ? this.#upMarketId : this.#downMarketId;
+  }
+}
+
 /**
  * Converts Jupiter's public Degen price websocket into the logical UP/DOWN
  * book used by the short-window strategy. The socket exposes top prices but

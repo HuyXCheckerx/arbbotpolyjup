@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
-import { formatContracts, formatUsd, parseFixed, parseUsd } from "../../../packages/domain/src/fixed.ts";
+import {
+  ONE_CONTRACT_MICRO,
+  formatContracts,
+  formatUsd,
+  parseFixed,
+  parseUsd,
+} from "../../../packages/domain/src/fixed.ts";
 import { HttpClient } from "../../../packages/domain/src/http.ts";
 import { asNumber, asString, isRecord, stringifyJson } from "../../../packages/domain/src/json.ts";
 import {
@@ -15,9 +21,15 @@ import {
   type EvaluatedCrossVenueRoute,
   type ShortWindowOutcome,
 } from "../../../packages/domain/src/short-window.ts";
-import type { ShortWindowStrategyConfig } from "../../../packages/domain/src/short-window-strategy.ts";
+import {
+  evaluateShortWindowEntry,
+  type ShortWindowStrategyConfig,
+} from "../../../packages/domain/src/short-window-strategy.ts";
 import type { BinaryOrderBook, VenueMarket } from "../../../packages/domain/src/types.ts";
-import { JupiterClient } from "../../../packages/venue-jupiter/src/client.ts";
+import {
+  JupiterClient,
+  type JupiterPredictionOrderBuild,
+} from "../../../packages/venue-jupiter/src/client.ts";
 import {
   streamJupiterPredictionPrices,
   type JupiterPredictionPriceStreamStatus,
@@ -55,8 +67,11 @@ import {
   type DailyThresholdPair,
 } from "./btc-daily-threshold.ts";
 import {
+  buildJupiterAtomicQuoteBook,
   buildJupiterForecastOrderBook,
+  JupiterRollingAtomicQuoteBookState,
   JupiterPredictionPriceBookState,
+  type JupiterBuyQuoteGateway,
 } from "./jupiter-quote-fallback.ts";
 import {
   ShortWindowLiveTrader,
@@ -97,7 +112,7 @@ const LIVE_BALANCE_REFRESH_MS = 5_000;
 const LIVE_BALANCE_LOG_HEARTBEAT_MS = 60_000;
 const LIVE_CONTRACT_TOLERANCE_MICRO = 10_000n;
 const DEFAULT_MARKET_LOG_INTERVAL_MS = 30_000;
-const DEFAULT_JUPITER_DEVELOPER_REQUEST_INTERVAL_MS = 110;
+const DEFAULT_JUPITER_DEVELOPER_REQUEST_INTERVAL_MS = 125;
 const LIVE_CONFIRMATION = "I_ACCEPT_REAL_MONEY_RISK";
 const LIVE_TEST_ENTRY_CONFIRMATION = "I_ACCEPT_ONE_UNPROFITABLE_TEST_TRADE";
 const CORE_BASIS_WARNINGS = [
@@ -142,8 +157,10 @@ type PairEvent =
   | {
       type: "jupiter_book";
       book: BinaryOrderBook;
-      source: "orderbook" | "price_websocket";
+      source: "atomic_quote" | "orderbook" | "price_websocket";
       notice: string | null;
+      entryBuilds?: ReadonlyMap<ShortWindowOutcome, JupiterPredictionOrderBuild>;
+      entryBuildAtMs?: ReadonlyMap<ShortWindowOutcome, number>;
     }
   | { type: "jupiter_error"; message: string; consecutiveErrors: number; retryInMs: number }
   | { type: "end"; reason: string };
@@ -167,6 +184,7 @@ interface MonitorConfiguration {
   dailyThresholdDiscoveryRefreshMs: number;
   minimumEntryEdgeMicroUsdPerContract: bigint;
   minimumEntryEdgeTotalMicroUsd: bigint;
+  strategy: ShortWindowStrategyConfig;
 }
 
 async function retryStartup<T>(name: string, fn: () => Promise<T>, maxRetries = 4, delayMs = 1500): Promise<T> {
@@ -276,8 +294,10 @@ async function main(): Promise<void> {
     throw new Error("--max-polymarket-age-ms must be between 250 and 30000");
   }
   if (maximumJupiterAgeMs < jupiterPollMs) throw new Error("--max-jupiter-age-ms must be at least --jupiter-poll-ms");
-  if (jupiterRequestIntervalMs < 100 || jupiterRequestIntervalMs > 5_000) {
-    throw new Error("--jupiter-request-interval-ms must be between 100 and 5000 for the Developer-tier 10 RPS bucket");
+  if (jupiterRequestIntervalMs < 125 || jupiterRequestIntervalMs > 5_000) {
+    throw new Error(
+      "--jupiter-request-interval-ms must be between 125 and 5000; 125ms caps the shared main bucket at 8 RPS",
+    );
   }
   if (maximumConsecutiveJupiterErrors < 1) throw new Error("--max-consecutive-jupiter-errors must be at least 1");
   if (dailyThresholdPollMs < 2_500) throw new Error("--daily-threshold-poll-ms must be at least 2500");
@@ -328,7 +348,7 @@ async function main(): Promise<void> {
   }
   const maximumReusableJupiterQuoteAgeMs = Math.min(
     maximumJupiterAgeMs,
-    Math.min(5_000, jupiterPollMs + 500),
+    maximumJupiterSubmissionQuoteAgeMs,
   );
 
   await mkdir(dirname(outputPath), { recursive: true });
@@ -371,6 +391,16 @@ async function main(): Promise<void> {
       referer: "https://polymarket.com/",
     },
   });
+  const strategyConfiguration: ShortWindowStrategyConfig = {
+    polymarketMaximumAllocationMicroUsd: maximumVenueAllocationMicroUsd,
+    jupiterMaximumAllocationMicroUsd: maximumVenueAllocationMicroUsd,
+    jupiterMinimumGrossOrderMicroUsd: jupiterMinimumOrderMicroUsd,
+    polymarketMinimumGrossOrderMicroUsd: polymarketMinimumOrderMicroUsd,
+    polymarketMinimumContractsMicro: 5_000_000n,
+    minimumEntryEdgeMicroUsdPerContract: minimumEntryEdgePerContractMicroUsd,
+    minimumEntryEdgeTotalMicroUsd,
+    minimumExitProfitMicroUsd,
+  };
   const configuration: MonitorConfiguration = {
     routeSelectionMode: anyComplementaryRoute ? "any_complementary" : "reference_directed",
     maximumReferenceDifferenceMicroUsd,
@@ -388,16 +418,7 @@ async function main(): Promise<void> {
     dailyThresholdDiscoveryRefreshMs,
     minimumEntryEdgeMicroUsdPerContract: minimumEntryEdgePerContractMicroUsd,
     minimumEntryEdgeTotalMicroUsd,
-  };
-  const strategyConfiguration: ShortWindowStrategyConfig = {
-    polymarketMaximumAllocationMicroUsd: maximumVenueAllocationMicroUsd,
-    jupiterMaximumAllocationMicroUsd: maximumVenueAllocationMicroUsd,
-    jupiterMinimumGrossOrderMicroUsd: jupiterMinimumOrderMicroUsd,
-    polymarketMinimumGrossOrderMicroUsd: polymarketMinimumOrderMicroUsd,
-    polymarketMinimumContractsMicro: 5_000_000n,
-    minimumEntryEdgeMicroUsdPerContract: minimumEntryEdgePerContractMicroUsd,
-    minimumEntryEdgeTotalMicroUsd,
-    minimumExitProfitMicroUsd,
+    strategy: strategyConfiguration,
   };
   const paperTrader = paperTrade ? new ShortWindowPaperTrader({
     polymarketStartingCashMicroUsd: minimumVenueBalanceMicroUsd,
@@ -409,6 +430,7 @@ async function main(): Promise<void> {
   let polymarketLiveExecutor: PolymarketLiveExecutor | null = null;
   let jupiterLiveExecutor: JupiterForecastSwapExecutor | null = null;
   let jupiterPredictionLiveExecutor: JupiterLiveExecutor | null = null;
+  let jupiterRollingQuoteGateway: JupiterBuyQuoteGateway | null = null;
   if (liveTrade) {
     const relayerRequired = !checkPolymarketReadiness;
     polymarketLiveExecutor = await retryStartup("Polymarket secure client initialization", () =>
@@ -466,6 +488,28 @@ async function main(): Promise<void> {
       client: jupiterExecutionClient,
       rpcUrl: solanaRpcUrl,
       privateKey: jupiterPrivateKey,
+    });
+    // Rolling discovery builds use normal priority and share the same 8-RPS
+    // scheduler. Entry/recovery builds use the critical clients above and jump
+    // ahead of any queued discovery reservation.
+    jupiterRollingQuoteGateway = new JupiterHybridLiveExecutor({
+      forecast: new JupiterForecastSwapExecutor({
+        predictionClient: jupiterClient,
+        swapClient: new JupiterSwapClient({
+          apiKey: jupiterApiKey,
+          minimumRequestIntervalMs: 0,
+          requestScheduler: jupiterRequestScheduler,
+          requestPriority: "normal",
+        }),
+        rpcUrl: solanaRpcUrl,
+        privateKey: jupiterPrivateKey,
+      }),
+      prediction: new JupiterLiveExecutor({
+        client: jupiterClient,
+        rpcUrl: solanaRpcUrl,
+        privateKey: jupiterPrivateKey,
+      }),
+      allowSubMinimumForecastSwap: allowSubFiveJupiterSwap,
     });
     const [polymarketReadiness, jupiterReadiness] = await Promise.all([
       retryStartup("Polymarket readiness check", () => polymarketLiveExecutor!.assertReady(minimumVenueBalanceMicroUsd)),
@@ -600,12 +644,14 @@ async function main(): Promise<void> {
     feeModel: {
       polymarket: "0.07 * price * (1-price), per-contract fee rounded to 0.00001 USDC",
       jupiter: liveTrade
-        ? "Public Degen websocket discovery is indicative; live preflight uses Prediction at $5+ and RTSE Swap V2 only with explicit sub-$5 opt-in"
+        ? "Rolling authenticated executable quotes use Prediction at $5+ and RTSE Swap V2 only with explicit sub-$5 opt-in; public Degen prices only retarget quote size"
         : "0.07 * price * (1-price) * contracts, order fee rounded up to 0.01 USDC",
     },
     warnings: [
       ...BASIS_WARNINGS,
-      "JUPITER_PUBLIC_DEGEN_PRICE_WEBSOCKET_REQUIRES_ATOMIC_ORDER_PREFLIGHT",
+      ...(liveTrade
+        ? ["JUPITER_ROLLING_EXECUTABLE_QUOTES_EXPIRE_QUICKLY"]
+        : ["JUPITER_PUBLIC_DEGEN_PRICE_WEBSOCKET_IS_INDICATIVE_ONLY"]),
       ...(anyComplementaryRoute ? [ANY_ROUTE_WARNING] : []),
     ],
     readOnly: !liveTrade,
@@ -631,9 +677,12 @@ async function main(): Promise<void> {
   console.log(`Reference difference must be strictly below $${formatUsd(maximumReferenceDifferenceMicroUsd)}.`);
   console.log("Candidates are not guaranteed: Polymarket settles on TWAP 60s; Jupiter Forecast settles on Chainlink spot.");
   console.log(
-    `Jupiter entries use its public Degen price WebSocket; an authenticated exact order build is called only after a ` +
-    `qualified candidate, using Prediction API at $5+ and opt-in RTSE Swap V2 below $5. Repetitive logs are capped at ` +
-    `${marketLogIntervalMs}ms to ${outputPath}.`,
+    liveTrade
+      ? `Jupiter live entries use rolling authenticated executable builds at an 8-RPS shared cap; the public Degen ` +
+        `WebSocket only selects route/size. Prediction is used at $5+ and opt-in RTSE Swap V2 below $5. Repetitive logs are capped at ` +
+        `${marketLogIntervalMs}ms to ${outputPath}.`
+      : `Jupiter monitor entries use its indicative public Degen price WebSocket. Repetitive logs are capped at ` +
+        `${marketLogIntervalMs}ms to ${outputPath}.`,
   );
   if (paperTrader) {
     statusStore.updateStrategy(paperTrader.snapshot());
@@ -657,7 +706,7 @@ async function main(): Promise<void> {
     if (liveTestEntry) {
       console.warn(
         `ONE-SHOT TEST ENTRY ENABLED: profitability checks are bypassed for one submission attempt only. ` +
-        `Jupiter gross uses the current $${formatUsd(jupiterQuoteGrossMicroUsd)} screening build; all identity, freshness, depth, ` +
+        `Jupiter gross uses the current rolling build up to $${formatUsd(jupiterQuoteGrossMicroUsd)}; all identity, freshness, depth, ` +
         `balance, allocation, slippage, exact-build freshness, and reconciliation protections remain active.`,
       );
     }
@@ -757,6 +806,7 @@ async function main(): Promise<void> {
         statusStore,
         paperTrader,
         liveTrader,
+        jupiterQuoteGateway: jupiterRollingQuoteGateway,
         signal: controller.signal,
         recordSample,
         recordOpportunity,
@@ -816,6 +866,7 @@ async function runDurationLoop(input: {
   statusStore: ShortWindowStatusStore;
   paperTrader: ShortWindowPaperTrader | null;
   liveTrader: ShortWindowLiveTrader | null;
+  jupiterQuoteGateway: JupiterBuyQuoteGateway | null;
   signal: AbortSignal;
   recordSample: () => number;
   recordOpportunity: () => number;
@@ -1020,6 +1071,7 @@ async function runDurationLoop(input: {
       statusStore: input.statusStore,
       paperTrader: input.paperTrader,
       liveTrader: input.liveTrader,
+      jupiterQuoteGateway: input.jupiterQuoteGateway,
       signal: input.signal,
       recordSample: input.recordSample,
       recordOpportunity: input.recordOpportunity,
@@ -1342,6 +1394,7 @@ async function monitorQualifiedPair(input: {
   statusStore: ShortWindowStatusStore;
   paperTrader: ShortWindowPaperTrader | null;
   liveTrader: ShortWindowLiveTrader | null;
+  jupiterQuoteGateway: JupiterBuyQuoteGateway | null;
   signal: AbortSignal;
   recordSample: () => number;
   recordOpportunity: () => number;
@@ -1353,6 +1406,17 @@ async function monitorQualifiedPair(input: {
   });
   let latestPolymarket: BinaryOrderBook | null = null;
   let latestJupiter: BinaryOrderBook | null = null;
+  let latestIndicativeJupiter: BinaryOrderBook | null = null;
+  let latestJupiterBuilds: ReadonlyMap<ShortWindowOutcome, JupiterPredictionOrderBuild> = new Map();
+  let latestJupiterBuildAtMs: ReadonlyMap<ShortWindowOutcome, number> = new Map();
+  const rollingQuoteGross = new Map<ShortWindowOutcome, bigint>();
+  const indicativeQuoteGross = new Map<ShortWindowOutcome, bigint>();
+  const outcomes = [...new Set(input.routes.map((route) => route.jupiterOutcome))];
+  const exactQuotedOutcomes = new Set<ShortWindowOutcome>();
+  for (const outcome of outcomes) {
+    rollingQuoteGross.set(outcome, input.configuration.jupiterFallbackGrossMicroUsd);
+    indicativeQuoteGross.set(outcome, input.configuration.jupiterFallbackGrossMicroUsd);
+  }
   let samples = 0;
   let opportunities = 0;
   let lastEvaluationAtMs = 0;
@@ -1381,7 +1445,12 @@ async function monitorQualifiedPair(input: {
     pair: input.pair,
     outcomes: input.routes.map((route) => route.jupiterOutcome),
     needsExitBook: () => input.liveTrader?.needsExitBook(pairKey(input.pair)) ?? false,
+    acceptsEntryQuotes: () => input.liveTrader?.acceptsEntryQuotes(pairKey(input.pair)) ?? false,
+    quoteGateway: input.jupiterQuoteGateway,
+    quoteGrossMicroUsd: (outcome) =>
+      rollingQuoteGross.get(outcome) ?? input.configuration.jupiterFallbackGrossMicroUsd,
     fallbackGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
+    maximumQuoteAgeMs: input.configuration.maximumReusableJupiterQuoteAgeMs,
     intervalMs: input.configuration.jupiterPollMs,
     signal: controller.signal,
     queue,
@@ -1456,14 +1525,51 @@ async function monitorQualifiedPair(input: {
         console.warn(`[${input.pair.duration}] ${event.notice}`);
       }
 
+      // In live mode the public socket is only a cheap route/size selector.
+      // It must never replace the rolling executable transaction used by the
+      // entry decision.
+      if (event.type === "jupiter_book" && event.source === "price_websocket" && input.jupiterQuoteGateway) {
+        latestIndicativeJupiter = event.book;
+        if (latestPolymarket) {
+          retargetRollingJupiterQuotes({
+            polymarketBook: latestPolymarket,
+            jupiterBook: latestIndicativeJupiter,
+            routes: input.routes,
+            strategy: input.configuration.strategy,
+            maximumGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
+            rollingQuoteGross,
+            indicativeQuoteGross,
+            exactQuotedOutcomes,
+            exact: false,
+          });
+        }
+        continue;
+      }
+
       const trigger = event.type === "polymarket_book"
         ? `polymarket_websocket_${event.update.eventType}`
         : event.source === "orderbook" ? "jupiter_rest_poll" : `jupiter_${event.source}`;
       if (event.type === "polymarket_book") {
         latestPolymarket = event.update.book;
         input.statusStore.updateBook(input.pair.duration, "polymarket", bookStatus(latestPolymarket, Date.now(), false));
+        if (latestIndicativeJupiter && input.jupiterQuoteGateway) {
+          retargetRollingJupiterQuotes({
+            polymarketBook: latestPolymarket,
+            jupiterBook: latestIndicativeJupiter,
+            routes: input.routes,
+            strategy: input.configuration.strategy,
+            maximumGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
+            rollingQuoteGross,
+            indicativeQuoteGross,
+            exactQuotedOutcomes,
+            exact: false,
+          });
+        }
       } else {
         latestJupiter = event.book;
+        latestJupiterBuilds = event.entryBuilds ?? new Map();
+        latestJupiterBuildAtMs = event.entryBuildAtMs ?? new Map();
+        for (const outcome of latestJupiterBuilds.keys()) exactQuotedOutcomes.add(outcome);
         const ageMs = Math.max(0, Date.now() - latestJupiter.receivedAtMs);
         input.statusStore.updateBook(
           input.pair.duration,
@@ -1472,6 +1578,20 @@ async function monitorQualifiedPair(input: {
         );
       }
       if (!latestPolymarket || !latestJupiter) continue;
+
+      if (event.type === "jupiter_book" && event.source === "atomic_quote") {
+        retargetRollingJupiterQuotes({
+          polymarketBook: latestPolymarket,
+          jupiterBook: latestJupiter,
+          routes: input.routes,
+          strategy: input.configuration.strategy,
+          maximumGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
+          rollingQuoteGross,
+          indicativeQuoteGross,
+          exactQuotedOutcomes,
+          exact: true,
+        });
+      }
 
       const atMs = Date.now();
       if (event.type === "polymarket_book" &&
@@ -1488,6 +1608,13 @@ async function monitorQualifiedPair(input: {
       const evaluated = evaluateCrossVenueRoutes(latestPolymarket, latestJupiter, input.routes);
       const best = evaluated[0] ?? null;
       const routeForIdentity = best?.route ?? input.routes[0];
+      const jupiterEntryBuild = best ? latestJupiterBuilds.get(best.route.jupiterOutcome) ?? null : null;
+      const jupiterEntryBuildAtMs = best ? latestJupiterBuildAtMs.get(best.route.jupiterOutcome) ?? null : null;
+      const freshRollingBuild = jupiterEntryBuild !== null && jupiterEntryBuildAtMs !== null &&
+        atMs - jupiterEntryBuildAtMs >= 0 &&
+        atMs - jupiterEntryBuildAtMs <= input.configuration.maximumReusableJupiterQuoteAgeMs;
+      const staleExecutableBuild = input.jupiterQuoteGateway !== null && best?.isFeeAdjustedCandidate === true &&
+        !freshRollingBuild;
       const paperDecision = input.paperTrader && !marketDataStale
         ? input.paperTrader.consider({
           pair: paperPairIdentity(input.pair, best?.route.jupiterOutcome ?? "UP"),
@@ -1497,14 +1624,15 @@ async function monitorQualifiedPair(input: {
           atMs,
         })
         : null;
-      const liveDecision = input.liveTrader && !marketDataStale && routeForIdentity
+      const liveDecision = input.liveTrader && !marketDataStale && routeForIdentity &&
+        (!input.jupiterQuoteGateway || input.liveTrader.hasOpenPosition(pairKey(input.pair)) || freshRollingBuild)
         ? await input.liveTrader.consider({
           pair: livePairIdentity(input.pair, routeForIdentity),
           bestRoute: best,
           polymarketBook: latestPolymarket,
           jupiterBook: latestJupiter,
-          jupiterEntryBuild: null,
-          jupiterEntryBuildAtMs: null,
+          jupiterEntryBuild,
+          jupiterEntryBuildAtMs,
           atMs,
         })
         : null;
@@ -1516,6 +1644,8 @@ async function monitorQualifiedPair(input: {
           ? `Books received, but the Polymarket snapshot is stale (${polymarketSnapshotAgeMs}ms). No candidate will be recorded.`
           : jupiterSnapshotStale
             ? `Books received, but the Jupiter snapshot is stale (${jupiterSnapshotAgeMs}ms). No candidate will be recorded.`
+          : input.liveTrader && input.jupiterQuoteGateway && best?.isFeeAdjustedCandidate && !freshRollingBuild
+            ? "Exact Jupiter candidate exists, but its executable transaction is stale. Waiting for the next rolling build."
           : input.liveTrader && best?.isFeeAdjustedCandidate
             ? liveCandidateStatusMessage(best, liveDecision)
           : input.liveTrader
@@ -1525,7 +1655,7 @@ async function monitorQualifiedPair(input: {
           polymarket: bookStatus(latestPolymarket, atMs, polymarketSnapshotStale),
           jupiter: bookStatus(latestJupiter, atMs, jupiterSnapshotStale),
         },
-        bestRoute: best ? routeStatus(best, marketDataStale) : null,
+        bestRoute: best ? routeStatus(best, marketDataStale || staleExecutableBuild) : null,
         samples,
         opportunities,
       });
@@ -1553,7 +1683,9 @@ async function monitorQualifiedPair(input: {
           books: {
             polymarket: bookLog(latestPolymarket),
             jupiter: bookLog(latestJupiter),
-            jupiterPriceSource: jupiterPriceWebsocket ? "degen_price_websocket" : "orderbook",
+            jupiterPriceSource: latestJupiter.provider === "bisonfi_atomic_quote"
+              ? "rolling_atomic_executable_quote"
+              : jupiterPriceWebsocket ? "degen_price_websocket" : "orderbook",
             polymarketSnapshotAgeMs,
             polymarketSnapshotStale,
             jupiterSnapshotAgeMs,
@@ -1571,6 +1703,7 @@ async function monitorQualifiedPair(input: {
               ? ["JUPITER_PUBLIC_DEGEN_PRICE_WEBSOCKET_REQUIRES_ATOMIC_ORDER_PREFLIGHT"]
               : []),
             ...(jupiterSnapshotStale ? ["STALE_JUPITER_SNAPSHOT"] : []),
+            ...(staleExecutableBuild ? ["STALE_JUPITER_EXECUTABLE_BUILD"] : []),
             ...(polymarketSnapshotStale ? ["STALE_POLYMARKET_SNAPSHOT"] : []),
           ],
         });
@@ -1695,7 +1828,7 @@ async function monitorQualifiedPair(input: {
           console.error(`[${input.pair.duration}] LIVE TRADER HALTED: ${liveDecision.reason}`);
         }
       }
-      if (best?.isFeeAdjustedCandidate && !jupiterSnapshotStale) {
+      if (best?.isFeeAdjustedCandidate && !polymarketSnapshotStale && !jupiterSnapshotStale && !staleExecutableBuild) {
         const signature = opportunitySignature(best);
         if (signature !== lastOpportunitySignature &&
           atMs - lastOpportunityLogAtMs >= input.configuration.marketLogIntervalMs) {
@@ -1775,18 +1908,25 @@ async function pollJupiterOrderBook(input: {
   pair: CrossVenuePair;
   outcomes: readonly ("UP" | "DOWN")[];
   needsExitBook: () => boolean;
+  acceptsEntryQuotes: () => boolean;
+  quoteGateway: JupiterBuyQuoteGateway | null;
+  quoteGrossMicroUsd: (outcome: ShortWindowOutcome) => bigint;
   fallbackGrossMicroUsd: bigint;
+  maximumQuoteAgeMs: number;
   intervalMs: number;
   signal: AbortSignal;
   queue: CoalescingAsyncQueue<PairEvent>;
 }): Promise<void> {
+  const outcomes = [...new Set(input.outcomes)];
   const priceState = new JupiterPredictionPriceBookState({
     upMarketId: input.pair.jupiterUp.marketId,
     downMarketId: input.pair.jupiterDown.marketId,
-    outcomes: input.outcomes,
+    outcomes,
     grossAmountMicroUsd: input.fallbackGrossMicroUsd,
   });
   const sourceState: { value: JupiterBookSource | null } = { value: null };
+  let announcedWebsocketSelector = false;
+  let announcedAtomicQuotes = false;
   let consecutiveStreamErrors = 0;
   let consecutiveExitErrors = 0;
   const streamTask = streamJupiterPredictionPrices(priceState.marketIds(), {
@@ -1800,15 +1940,22 @@ async function pollJupiterOrderBook(input: {
         type: "jupiter_book",
         book,
         source: "price_websocket",
-        notice: sourceState.value === "price_websocket"
-          ? null
-          : `Jupiter entry discovery is using its public Degen price WebSocket. ` +
-            `Authenticated exact order builds are reserved for qualified entry preflight and execution.`,
+        notice: input.quoteGateway
+          ? announcedWebsocketSelector
+            ? null
+            : "Jupiter's public Degen WebSocket is connected as an indicative route/size selector only; it cannot arm live execution."
+          : sourceState.value === "price_websocket"
+            ? null
+            : "Jupiter entry discovery is using its public Degen price WebSocket; live execution is unavailable without a quote gateway.",
       });
-      sourceState.value = "price_websocket";
+      announcedWebsocketSelector = true;
+      if (!input.quoteGateway) sourceState.value = "price_websocket";
     },
     onStatus: (status) => reportJupiterPriceStreamStatus(status),
   });
+  const exactQuoteTask = input.quoteGateway
+    ? pollRollingAtomicQuotes(input.quoteGateway)
+    : Promise.resolve();
   const exitPollTask = (async (): Promise<void> => {
     while (!input.signal.aborted) {
       if (!input.needsExitBook()) {
@@ -1821,16 +1968,16 @@ async function pollJupiterOrderBook(input: {
           gateway: input.client,
           upMarketId: input.pair.jupiterUp.marketId,
           downMarketId: input.pair.jupiterDown.marketId,
-          outcomes: input.outcomes,
+          outcomes,
         });
         consecutiveExitErrors = 0;
         input.queue.push({
           type: "jupiter_book",
           book: orderBook,
           source: "orderbook",
-          notice: sourceState.value === "price_websocket"
-            ? "Open position detected; Jupiter REST bids are now used for exit screening. Any exit still requires a fresh atomic close build."
-            : null,
+          notice: sourceState.value === "orderbook"
+            ? null
+            : "Open position detected; Jupiter REST bids are now used for exit screening. Any exit still requires a fresh atomic close build.",
         });
         sourceState.value = "orderbook";
       } catch (error) {
@@ -1847,7 +1994,88 @@ async function pollJupiterOrderBook(input: {
     }
   })();
 
-  await Promise.all([streamTask, exitPollTask]);
+  await Promise.all([streamTask, exactQuoteTask, exitPollTask]);
+
+  async function pollRollingAtomicQuotes(gateway: JupiterBuyQuoteGateway): Promise<void> {
+    const quoteState = new JupiterRollingAtomicQuoteBookState({
+      upMarketId: input.pair.jupiterUp.marketId,
+      downMarketId: input.pair.jupiterDown.marketId,
+      outcomes,
+    });
+    const nextSequence = new Map<ShortWindowOutcome, number>();
+    const consecutiveErrors = new Map<ShortWindowOutcome, number>();
+    // One selected route gets three overlapping lanes. Any-route mode gets two
+    // per outcome. Across 5m and 15m this is enough concurrency to fill the
+    // shared 8-RPS scheduler even when an individual build takes ~700ms.
+    const lanesPerOutcome = outcomes.length === 1 ? 3 : 2;
+    await Promise.all(outcomes.flatMap((outcome) =>
+      Array.from({ length: lanesPerOutcome }, () => quoteLane(outcome))
+    ));
+
+    async function quoteLane(outcome: ShortWindowOutcome): Promise<void> {
+      while (!input.signal.aborted) {
+        if (input.needsExitBook() || !input.acceptsEntryQuotes()) {
+          await waitForAbort(Math.min(250, input.intervalMs), input.signal);
+          continue;
+        }
+        const sequence = (nextSequence.get(outcome) ?? 0) + 1;
+        nextSequence.set(outcome, sequence);
+        let nextDelayMs = 0;
+        try {
+          const grossAmountMicroUsd = input.quoteGrossMicroUsd(outcome);
+          const quoted = await buildJupiterAtomicQuoteBook({
+            gateway,
+            upMarketId: input.pair.jupiterUp.marketId,
+            downMarketId: input.pair.jupiterDown.marketId,
+            ...(input.pair.jupiterUp.outcomeMint
+              ? { upOutcomeMint: input.pair.jupiterUp.outcomeMint }
+              : {}),
+            ...(input.pair.jupiterDown.outcomeMint
+              ? { downOutcomeMint: input.pair.jupiterDown.outcomeMint }
+              : {}),
+            outcomes: [outcome],
+            grossAmountMicroUsd,
+          });
+          const build = quoted.builds.get(outcome);
+          if (!build) throw new Error(`Jupiter rolling ${outcome} quote returned no executable build`);
+          const builtAtMs = Date.now();
+          const snapshot = quoteState.apply({
+            outcome,
+            sequence,
+            build,
+            builtAtMs,
+            maximumAgeMs: input.maximumQuoteAgeMs,
+          });
+          consecutiveErrors.set(outcome, 0);
+          if (!snapshot || input.signal.aborted) continue;
+          input.queue.push({
+            type: "jupiter_book",
+            book: snapshot.book,
+            source: "atomic_quote",
+            notice: announcedAtomicQuotes
+              ? null
+              : "Live entry discovery is using rolling authenticated executable Jupiter quotes; only a fresh cached transaction can arm execution.",
+            entryBuilds: snapshot.builds,
+            entryBuildAtMs: snapshot.buildAtMs,
+          });
+          announcedAtomicQuotes = true;
+          sourceState.value = "atomic_quote";
+        } catch (error) {
+          if (input.signal.aborted) break;
+          const errors = (consecutiveErrors.get(outcome) ?? 0) + 1;
+          consecutiveErrors.set(outcome, errors);
+          nextDelayMs = jupiterRetryDelayMs(input.intervalMs, errors);
+          input.queue.push({
+            type: "jupiter_error",
+            message: `Jupiter rolling ${outcome} atomic quote failed: ${errorMessage(error)}`,
+            consecutiveErrors: errors,
+            retryInMs: nextDelayMs,
+          });
+        }
+        if (nextDelayMs > 0) await waitForAbort(nextDelayMs, input.signal);
+      }
+    }
+  }
 
   function reportJupiterPriceStreamStatus(status: JupiterPredictionPriceStreamStatus): void {
     if (status.status === "connected") {
@@ -1868,6 +2096,83 @@ async function pollJupiterOrderBook(input: {
 function jupiterRetryDelayMs(baseIntervalMs: number, consecutiveErrors: number): number {
   const exponent = Math.min(Math.max(1, consecutiveErrors), 4);
   return Math.min(30_000, baseIntervalMs * (2 ** exponent));
+}
+
+function retargetRollingJupiterQuotes(input: {
+  polymarketBook: BinaryOrderBook;
+  jupiterBook: BinaryOrderBook;
+  routes: readonly CrossVenueShortWindowRoute[];
+  strategy: ShortWindowStrategyConfig;
+  maximumGrossMicroUsd: bigint;
+  rollingQuoteGross: Map<ShortWindowOutcome, bigint>;
+  indicativeQuoteGross: Map<ShortWindowOutcome, bigint>;
+  exactQuotedOutcomes: ReadonlySet<ShortWindowOutcome>;
+  exact: boolean;
+}): void {
+  const evaluated = evaluateCrossVenueRoutes(input.polymarketBook, input.jupiterBook, input.routes);
+  for (const route of evaluated) {
+    const outcome = route.route.jupiterOutcome;
+    const evaluation = evaluateShortWindowEntry({
+      route,
+      polymarketAvailableMicroUsd: input.strategy.polymarketMaximumAllocationMicroUsd,
+      jupiterAvailableMicroUsd: input.strategy.jupiterMaximumAllocationMicroUsd,
+      config: input.strategy,
+    });
+    if (!input.exact) {
+      if (!evaluation.eligible) continue;
+      const suggested = clampRollingQuoteGross(
+        evaluation.proposal.jupiter.grossMicroUsd,
+        input.strategy.jupiterMinimumGrossOrderMicroUsd,
+        input.maximumGrossMicroUsd,
+      );
+      input.indicativeQuoteGross.set(outcome, suggested);
+      if (!input.exactQuotedOutcomes.has(outcome)) input.rollingQuoteGross.set(outcome, suggested);
+      continue;
+    }
+
+    const quotedGross = route.jupiterAsk.priceMicroUsd * route.jupiterAsk.contractsMicro /
+      ONE_CONTRACT_MICRO;
+    if (evaluation.eligible) {
+      let nextGross = evaluation.proposal.jupiter.grossMicroUsd;
+      const usedFullExecutableQuote = evaluation.proposal.quantityMicro + 10_000n >=
+        route.jupiterAsk.contractsMicro;
+      const indicativeTarget = input.indicativeQuoteGross.get(outcome) ?? nextGross;
+      if (usedFullExecutableQuote && indicativeTarget > quotedGross) {
+        // Grow in bounded 25% steps only after the current executable size is
+        // profitable. This converges toward the largest indicated size without
+        // jumping straight across an unknown Jupiter price-impact curve.
+        nextGross = quotedGross + maximumBigint(250_000n, quotedGross / 4n);
+        if (nextGross > indicativeTarget) nextGross = indicativeTarget;
+      }
+      input.rollingQuoteGross.set(outcome, clampRollingQuoteGross(
+        nextGross,
+        input.strategy.jupiterMinimumGrossOrderMicroUsd,
+        input.maximumGrossMicroUsd,
+      ));
+      continue;
+    }
+
+    if (evaluation.reason === "NO_FEE_ADJUSTED_ROUTE" ||
+      evaluation.reason === "ENTRY_EDGE_BELOW_MINIMUM") {
+      // A large exact build can cross enough Jupiter depth to erase an edge
+      // that still exists at a smaller size. Step down and keep discovering;
+      // the $5 Prediction floor (or explicit sub-$5 strategy floor) remains.
+      input.rollingQuoteGross.set(outcome, clampRollingQuoteGross(
+        quotedGross * 3n / 4n,
+        input.strategy.jupiterMinimumGrossOrderMicroUsd,
+        input.maximumGrossMicroUsd,
+      ));
+    }
+  }
+}
+
+function clampRollingQuoteGross(value: bigint, minimumGross: bigint, maximumGross: bigint): bigint {
+  if (value < minimumGross) return minimumGross;
+  return value > maximumGross ? maximumGross : value;
+}
+
+function maximumBigint(left: bigint, right: bigint): bigint {
+  return left > right ? left : right;
 }
 
 async function runPaperSettlementLoop(input: {
@@ -2848,7 +3153,9 @@ function printReferenceStatus(
 
 function pairEventCoalesceKey(event: PairEvent): string | null {
   if (event.type === "polymarket_book") return "polymarket_book";
-  if (event.type === "jupiter_book") return "jupiter_book";
+  if (event.type === "jupiter_book") {
+    return event.source === "price_websocket" ? "jupiter_indicative_book" : "jupiter_executable_book";
+  }
   return null;
 }
 
@@ -2944,8 +3251,8 @@ Behavior:
     and evaluates the best complementary YES/NO route across all qualifying dates and strikes.
   - Requires identical start/end times and a strict opening-reference difference below $30 by default.
   - --any-complementary-route evaluates both complementary directions and selects the best qualifying net edge.
-  - Streams Polymarket books and Jupiter's public Degen top-of-book prices.
-  - Reserves authenticated exact Jupiter builds for qualified live-entry preflight/execution.
+  - Streams Polymarket books and Jupiter's public Degen top prices for indicative route/size selection.
+  - Live mode continuously rolls authenticated exact executable Jupiter builds; only fresh builds can arm entry.
   - Uses Prediction API at $5+; direct Forecast outcome-token Swap V2 below $5 requires explicit opt-in.
   - Includes Polymarket and Jupiter taker-fee estimates before logging arb_opportunity records.
   - Marks every record as non-guaranteed because the closing oracle sampling differs.
@@ -2963,7 +3270,7 @@ Options:
   --jupiter-poll-ms=200             Jupiter REST exit refresh target while a position is open
   --max-polymarket-age-ms=750       Reject candidates using an older Polymarket snapshot
   --max-jupiter-age-ms=2000         Reject candidates using an older Jupiter snapshot
-  --jupiter-request-interval-ms=110 Shared Developer-tier API interval; live builds have priority
+  --jupiter-request-interval-ms=125 Shared 8-RPS Developer-tier interval; critical builds have priority
   --max-consecutive-jupiter-errors=5 Persistent-error warning threshold; never ends a round
   --daily-threshold-poll-ms=5000     Refresh/rank daily POLY-* ladder pricing
   --daily-threshold-discovery-refresh-ms=300000 Rebuild the subscribed daily market set
@@ -2990,7 +3297,7 @@ Options:
   --max-venue-allocation-usd=50      Entry cap at each venue per position
   --jupiter-minimum-order-usd=5      Strategy floor matching Jupiter Prediction minimum
   --polymarket-minimum-order-usd=1   Minimum Polymarket marketable BUY collateral
-  --jupiter-quote-usd=MAX_ALLOCATION Gross cap for websocket screening; defaults to the per-venue allocation
+  --jupiter-quote-usd=MAX_ALLOCATION Maximum rolling executable-quote gross; adaptively sized below this cap
   --minimum-entry-edge-usd=0.001     Nominal edge required per contract after entry fees
   --minimum-entry-profit-usd=0.10    Nominal total edge required for entry
   --minimum-exit-profit-usd=0.10     Legacy threshold; live positions hold through resolution
