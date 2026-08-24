@@ -40,9 +40,9 @@ type ForecastExecutionGateway = Pick<
 
 /**
  * Uses Jupiter's recommended Prediction API for Forecast orders that meet its
- * $5 build minimum. Direct Swap V2 for smaller native outcome-token orders is
- * available only through an explicit constructor opt-in. Standard prediction
- * markets have no outcome mint and always use the Prediction API.
+ * $5 build minimum. Direct Swap V2 is enabled by default for smaller native
+ * outcome-token orders. Standard prediction markets have no outcome mint and
+ * always use the Prediction API.
  */
 export class JupiterHybridLiveExecutor {
   readonly #forecast: ForecastExecutionGateway;
@@ -63,7 +63,7 @@ export class JupiterHybridLiveExecutor {
     this.#prediction = input.prediction;
     this.#predictionMinimumBuyMicroUsd = input.predictionMinimumBuyMicroUsd ??
       JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD;
-    this.#allowSubMinimumForecastSwap = input.allowSubMinimumForecastSwap ?? false;
+    this.#allowSubMinimumForecastSwap = input.allowSubMinimumForecastSwap ?? true;
   }
 
   get ownerPubkey(): string {

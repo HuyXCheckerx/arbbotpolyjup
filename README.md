@@ -4,7 +4,7 @@ Risk-first arbitrage research and execution between Polymarket and prediction ma
 
 The first target is a pair of binary contracts such as “BTC above strike `K` at time `T`”. The bot buys complementary outcomes only when they form the same economic contract and their worst-case, taker-only cost is below the guaranteed payout after fees and safety buffers.
 
-The repository contains read-only discovery tools and an explicitly gated real-money adapter for native Jupiter Forecast versus Polymarket BTC 5m/15m markets. Live mode is experimental and non-atomic; the monitor remains read-only.
+The production BTC 5m/15m and daily-threshold scanner/trader is Rust. The browser dashboard and retained TypeScript discovery/regression tools are outside the live execution path. Live mode is experimental and non-atomic; monitor mode remains read-only.
 
 ## Non-negotiable invariants
 
@@ -27,7 +27,7 @@ The repository contains read-only discovery tools and an explicitly gated real-m
 
 ## Run the scanner
 
-Requirements: Node.js 24+ and pnpm.
+Requirements: Rust 1.90+, plus Node.js 24+ and pnpm for the dashboard and retained tools/tests.
 
 ```bash
 pnpm install
@@ -73,7 +73,7 @@ Run the separate native Jupiter Forecast versus Polymarket short-window scanner:
 pnpm monitor:short-window
 ```
 
-It runs two independent pair loops: Polymarket 5m versus Jupiter Forecast 5m, and Polymarket 15m versus Jupiter Forecast 15m. Each pair must have identical start/end times. Opening-reference difference is recorded for basis-risk diagnostics but no longer rejects a pair. It streams Polymarket books plus the public Jupiter Degen top-price WebSocket, includes both taker fees, and sizes the largest screened position that stays within both venue allocations and preserves the configured conservative edge. Authenticated size-specific Jupiter builds are reserved for candidates that reach live-entry preflight and remain the authoritative liquidity/profitability check. These candidates are explicitly non-guaranteed because Polymarket closes on Chainlink TWAP 60s while Jupiter Forecast closes on Chainlink spot. See [Short-window monitor](docs/SHORT_WINDOW_MONITOR.md).
+It runs two independent pair loops: Polymarket 5m versus Jupiter Forecast 5m, and Polymarket 15m versus Jupiter Forecast 15m. Each pair must have identical start/end times. Opening-reference difference is recorded for basis-risk diagnostics but no longer rejects a pair. Rust consumes the Polymarket market WebSocket (REST is stale-data fallback) plus the public Jupiter Degen top-price WebSocket, includes both taker fees, and evaluates both complementary routes. Authenticated size-specific Jupiter builds are reserved for candidates that reach live-entry preflight and remain the authoritative liquidity/profitability check. These candidates are explicitly non-guaranteed because Polymarket closes on Chainlink TWAP 60s while Jupiter Forecast closes on Chainlink spot. See [Short-window monitor](docs/SHORT_WINDOW_MONITOR.md).
 
 Run the real-money bot after completing wallet setup and readiness checks:
 
@@ -87,7 +87,7 @@ pnpm bot:short-window
 pnpm bot:short-window:live
 ```
 
-Do not run either command before completing the setup, approval, funding, and recovery instructions in [Real-money live trader](docs/LIVE_TRADING.md). Native Jupiter Forecast execution uses Prediction for deposits of at least `$5` and opt-in Swap V2 below that minimum. Prediction fills are reconciled from confirmed on-chain outcome-token and USDC deltas rather than quoted output. The cross-chain pair is still not atomic and is not guaranteed arbitrage. Live sizing and the dashboard's available cash are refreshed from the real Polymarket collateral and Jupiter USDC wallet balances; there is no seeded paper balance.
+Do not run either command before completing the setup, approval, funding, and recovery instructions in [Real-money live trader](docs/LIVE_TRADING.md). Native Jupiter Forecast execution uses Prediction for deposits of at least `$5` and Swap V2 by default below that minimum, down to the bot's `$0.10` strategy floor. Prediction fills are reconciled from confirmed on-chain outcome-token and USDC deltas rather than quoted output. The cross-chain pair is still not atomic and is not guaranteed arbitrage. Live sizing and the dashboard's available cash are refreshed from the real Polymarket collateral and Jupiter USDC wallet balances; there is no seeded paper balance.
 
 Run the live dashboard in another terminal:
 
@@ -97,11 +97,11 @@ pnpm dashboard:dev
 
 Open `http://localhost:3000`. The local dashboard reads the running short-window scanner's status API and explains waiting/skipped rounds, feed health, exact opening references, both venues' best asks, and the best fee-adjusted route. The scanner must remain running in the first terminal.
 
-To run the alternative route-agnostic version, use `pnpm bot:short-window:any-route`. It evaluates both `Poly UP + Jup DOWN` and `Poly DOWN + Jup UP` on every qualified round and submits whichever has the best qualifying fee-adjusted edge. It intentionally keeps the same live state and status-port lock as the reference-directed version, so the two live bots cannot safely run at the same time. Because this mode ignores opening-reference direction, both legs can lose if settlement lands inside the venues' reference gap.
+Every Rust live command evaluates `Poly UP + Jup DOWN` and `Poly DOWN + Jup UP` and submits whichever has the best qualifying fee-adjusted edge. `pnpm bot:short-window:any-route` is retained as an output-file alias. The aliases share the same live state and status-port lock, so they cannot safely run together. Both legs can lose if settlement lands inside the venues' reference gap.
 
-Add `--json` to the scanner for machine-readable output. `JUPITER_API_KEY` is optional for the currently observed read-only endpoints. Without a key, the Jupiter client serializes requests at 2.1-second intervals. In live mode, one shared 110 ms Developer-tier scheduler covers Prediction and Swap quote requests, while latency-sensitive live builds take priority over background discovery.
+Candidates and errors are appended as JSONL through `--output`. `JUPITER_API_KEY` is required for Prediction discovery and must have Prediction plus Swap product access. The shared authenticated scheduler uses one request every `100ms`, matching this bot's Developer 10 RPS plan. Public Degen WebSocket discovery consumes no authenticated build requests, and candidate entry/recovery builds receive priority.
 
 ## Live execution boundary
 
-The live adapter is restricted to native `bisonfi` Jupiter Forecast markets discovered as `BISON-...` outcomes. It rejects Jupiter's Polymarket-routed markets as shared liquidity. Prediction API remains the market-discovery and resolution source. Native Forecast entries default to the `$5` Prediction order minimum; smaller Swap V2 legs require the explicit `--allow-sub-five-jupiter-swap` opt-in. After execution, the bot projects all four joint resolution cases from confirmed quantities: Polymarket-only win, Jupiter-only win, both win, and both lose. A known but imperfect two-leg fill is isolated for quote-based repair without globally halting unrelated pairs; an unknown fill identity or quantity still triggers the global circuit breaker. Forecast settlement is booked from the real USDC credit, and empty Token-2022 accounts are closed to reclaim rent. No software guard can make the venues' resolution observations or Polygon and Solana execution atomic.
+The live adapter uses native `bisonfi` Jupiter Forecast markets discovered as `BISON-...` outcomes and verified standard `POLY-*` Jupiter Prediction pairs. Native Forecast entries use Prediction at `$5+` and direct Swap V2 below `$5`, down to a `$0.10` strategy floor by default. Standard `POLY-*` markets retain an effective `$5` Prediction floor. The Rust coordinator persists intent and releases both prepared legs concurrently, then derives fills and costs from actual token and cash changes. It projects all four joint resolution cases, isolates known mismatches for bounded recovery, claims/redeems settled winners, verifies actual settlement wallet credits, and closes empty Token-2022 accounts to reclaim rent. Confirmed-but-not-yet-observed redemptions remain durable and are not resubmitted. Unknown identity, quantity, cash debit, or payout is never reported as profit. No software guard can make the venues' resolution observations or Polygon and Solana execution atomic.
 # arbbotpolyjup

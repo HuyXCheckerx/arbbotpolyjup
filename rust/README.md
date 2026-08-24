@@ -1,58 +1,84 @@
-# Jupol Rust migration
+# Jupol Rust runtime
 
-This directory is a side-by-side native migration of the trading runtime. The
-existing `npm run bot:short-window` entrypoint remains the production command
-until every live-execution gate below is complete. Do not point both runtimes at
-the same wallet and state file concurrently.
+The production short-window scanner and live trader run entirely in Rust. The
+dashboard remains browser JavaScript, and the old TypeScript runtime is retained
+as a regression/reference implementation; neither is on the live execution hot
+path.
 
-## Implemented
+## Crates
 
-- `jupol-domain`: exact `i128` micro-USD and micro-contract parsing, formatting,
-  fee calculation, complementary-route evaluation, depth walking, entry sizing,
-  and green-exit evaluation.
-- `jupol-runtime`: bounded coalescing market-data queue and priority-aware shared
-  Jupiter request scheduler.
-- `jupol-http`: pooled HTTP/1.1 + HTTP/2 transport with timeouts, bounded retries,
-  and Jupiter rate-limit delay handling.
-- `jupol-state`: schema-v1 live-state compatibility, including the TypeScript
-  `"123n"` bigint representation and atomic temporary-file replacement.
-- `jupol-jupiter`: developer-key Prediction API operations used by the live hot
-  path: trading status, buy/close build, signed execution, order/position poll,
-  and exact order-book conversion.
+- `jupol-domain`: exact fixed-point prices, quantities, fees, route ranking and
+  sizing. Trading math contains no floating-point arithmetic.
+- `jupol-runtime`: bounded/coalescing queues and the shared priority Jupiter
+  request scheduler.
+- `jupol-http`: pooled HTTP transport, timeouts and bounded rate-limit retries.
+- `jupol-jupiter`: Prediction API, Swap V2, public Degen price WebSocket,
+  transaction signing, confirmation, fill reconciliation, claim and rent
+  reclaim.
+- `jupol-polymarket`: Gamma discovery, CLOB market WebSocket with REST fallback,
+  authenticated exact-share FOK orders, balance reconciliation, approvals and
+  gasless redemption.
+- `jupol-solana`: RPC, balances, transaction simulation/submission/confirmation,
+  owned-token deltas and empty token-account closure.
+- `jupol-state`: TypeScript schema-v1-compatible durable state with atomic
+  sibling temporary-file replacement.
+- `jupol-live`: durable concurrent two-venue execution, four-state exposure
+  accounting, bounded recovery and settlement.
+- `jupol-scanner`: market discovery, 5m/15m and daily threshold loops, status API,
+  structured JSONL diagnostics and the CLI.
 
-The Rust sizing search sorts each venue book once. Repeated binary-search probes
-walk borrowed sorted slices and allocate no temporary vectors.
+## Build and verify
 
-## Commands
+Rust 1.90 or newer is required.
 
-```powershell
-npm run rust:check
-npm run rust:test
-npm run rust:bench:domain
+```bash
+cargo build --release -p jupol-scanner
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-On the initial Windows development machine, the release benchmark completed one
-million full exact entry-sizing evaluations in about 2.29 seconds, or about
-2.29 microseconds per evaluation. This is a microbenchmark, not an order-fill or
-profit claim; network and venue matching latency remain dominant in live trades.
+Or run the repository wrapper:
 
-## Required before switching the live command
+```bash
+npm run rust:check
+```
 
-- Integrate Polymarket's official `polymarket_client_sdk_v2` 0.6 client (it
-  supports both the V1 USDC.e host and V2 pUSD host), then port and test CLOB
-  authentication, signing, FOK submission,
-  approvals, redemption, and balance reconciliation.
-- Port Solana transaction decoding/signing, RPC balance checks, simulation,
-  confirmation, and Jupiter claim handling.
-- Port Forecast Swap fallback, both WebSocket feeds, market discovery, reference
-  streams, window selection, and recovery/reconciliation logic.
-- Port the live trader state machine and reproduce all TypeScript fault-injection
-  tests, especially ambiguous submission and one-sided exposure cases.
-- Serve the existing dashboard/status JSON from the Rust process.
-- Run shadow mode against the same public feeds without signing, compare every
-  proposal and rejection reason, then perform readiness checks with zero open or
-  unresolved exposure before changing the production script.
+## Run
 
-The browser dashboard assets can remain JavaScript without affecting trading
-latency; the native status server will serve them as static files. Rewriting the
-browser UI to WebAssembly is intentionally not on the execution critical path.
+```bash
+# Read only
+cargo run --release -p jupol-scanner -- monitor
+
+# Real orders; also requires LIVE_TRADING_CONFIRMATION in .env
+cargo run --release -p jupol-scanner -- live
+
+# Read-only wallet/API checks
+cargo run --release -p jupol-scanner -- readiness
+
+# Reconcile an interrupted durable state and make only bounded repairs
+cargo run --release -p jupol-scanner -- recover
+```
+
+Use only one live process per wallet and state file. Port `3210` is bound before
+wallet/API initialization and acts as the local single-instance lock.
+
+## Jupiter Developer plan
+
+Prediction discovery/builds and Swap V2 orders share one scheduler at 100 ms
+spacing, matching a 10 RPS Developer plan. Signed `/execute` handoff has critical
+priority. The public Degen WebSocket and Polymarket WebSocket consume no Jupiter
+API budget.
+
+A plan/key existing is not enough by itself: the key must have both Prediction
+and Swap product access. A Prediction `401 Unauthorized` is terminal and the CLI
+exits with a portal-permission message instead of retrying forever.
+
+## Execution boundary
+
+Each entry persists an intent, signs both exact orders, then releases the
+Polymarket FOK and Jupiter transaction concurrently. It re-reads conditional
+tokens, USDC/collateral balances and Solana transaction deltas before booking a
+fill. Unknown quantities or costs remain recovery work; they are never reported
+as profit. This reduces process overhead, but cross-chain execution and the two
+venues' different resolution observations can never be atomic.

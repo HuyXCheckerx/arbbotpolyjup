@@ -1,0 +1,36 @@
+[package]
+name = "jupol-scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "jupol"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+futures.workspace = true
+jupol-domain = { path = "../jupol-domain" }
+jupol-http = { path = "../jupol-http" }
+jupol-jupiter = { path = "../jupol-jupiter" }
+jupol-live = { path = "../jupol-live" }
+jupol-polymarket = { path = "../jupol-polymarket" }
+jupol-runtime = { path = "../jupol-runtime" }
+jupol-solana = { path = "../jupol-solana" }
+jupol-state = { path = "../jupol-state" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

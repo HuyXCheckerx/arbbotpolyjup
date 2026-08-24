@@ -4,9 +4,12 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use jupol_domain::Micro;
 use serde::{Deserialize, Serialize};
+
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -42,12 +45,60 @@ pub enum LivePositionPhase {
     Open,
     ExitingJupiter,
     ExitingPolymarket,
+    RecoveryPlanning,
     AwaitingResolution,
     ExposureError,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionScenarioCode {
+    PolymarketOnlyWin,
+    JupiterOnlyWin,
+    BothWin,
+    BothLose,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ResolutionScenario {
+    pub code: ResolutionScenarioCode,
+    pub polymarket_won: bool,
+    pub jupiter_won: bool,
+    #[serde(with = "micro_n")]
+    pub payout_micro_usd: Micro,
+    #[serde(with = "micro_n")]
+    pub pnl_micro_usd: Micro,
+    pub rationale: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostFillAction {
+    HoldOrExitNormally,
+    QuoteRepair,
+    ManualReconciliation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostFillRiskPlan {
+    pub action: PostFillAction,
+    pub reason: String,
+    pub scenarios: Vec<ResolutionScenario>,
+    #[serde(with = "micro_n")]
+    pub intended_single_winner_floor_micro_usd: Micro,
+    #[serde(with = "micro_n")]
+    pub maximum_modeled_loss_micro_usd: Micro,
+    #[serde(with = "micro_n")]
+    pub venue_size_mismatch_micro: Micro,
+    #[serde(default, with = "optional_micro_n")]
+    pub venue_size_mismatch_bps: Option<Micro>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct LivePosition {
     pub id: String,
     pub pair: LivePairIdentity,
@@ -55,6 +106,12 @@ pub struct LivePosition {
     pub entered_at_ms: i64,
     pub jupiter_order_pubkey: Option<String>,
     pub jupiter_position_pubkey: String,
+    #[serde(default)]
+    pub jupiter_entry_position_pubkey: Option<String>,
+    #[serde(default, with = "optional_micro_n")]
+    pub jupiter_quoted_contracts_micro: Option<Micro>,
+    #[serde(default)]
+    pub jupiter_execution_reconciliation_source: Option<String>,
     #[serde(with = "micro_n")]
     pub jupiter_contracts_micro: Micro,
     #[serde(with = "micro_n")]
@@ -75,16 +132,38 @@ pub struct LivePosition {
     pub polymarket_settlement_payout_micro_usd: Micro,
     #[serde(with = "micro_n")]
     pub jupiter_settlement_payout_micro_usd: Micro,
+    #[serde(default)]
+    pub polymarket_settlement_transaction_signature: Option<String>,
+    #[serde(default, with = "optional_micro_n")]
+    pub polymarket_redemption_collateral_before_micro_usd: Option<Micro>,
+    #[serde(default)]
+    pub jupiter_settlement_transaction_signature: Option<String>,
+    #[serde(default)]
+    pub jupiter_rent_reclaimed: bool,
+    #[serde(default, with = "micro_n")]
+    pub jupiter_rent_reclaimed_lamports: Micro,
+    #[serde(default)]
+    pub jupiter_rent_reclaim_transaction_signatures: Vec<String>,
     pub entry_submission_skew_ms: Option<i64>,
     pub exit_submission_skew_ms: Option<i64>,
     pub diagnostic_test_entry: bool,
+    #[serde(default)]
+    pub entry_zero_exposure_proof: Option<String>,
+    #[serde(default)]
+    pub post_fill_risk_plan: Option<PostFillRiskPlan>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub settlement_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveTraderState {
     pub schema_version: u32,
+    #[serde(default)]
+    pub accounting_version: Option<u32>,
+    #[serde(default, with = "optional_micro_n")]
+    pub legacy_unverified_realized_profit_micro_usd: Option<Micro>,
     pub sequence: u64,
     pub halted: bool,
     pub halt_reason: Option<String>,
@@ -103,6 +182,8 @@ impl Default for LiveTraderState {
     fn default() -> Self {
         Self {
             schema_version: 1,
+            accounting_version: Some(2),
+            legacy_unverified_realized_profit_micro_usd: None,
             sequence: 0,
             halted: false,
             halt_reason: None,
@@ -194,24 +275,34 @@ pub fn save_live_state(path: &Path, state: &LiveTraderState) -> Result<(), State
         fs::create_dir_all(parent)?;
     }
     let temporary = temporary_path(path);
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)?;
-    let mut writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, state)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-    drop(writer);
-    fs::rename(&temporary, path)?;
-    Ok(())
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&temporary)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, state)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
-    value.push(".tmp");
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    value.push(format!(".tmp.{}.{sequence}", std::process::id()));
     PathBuf::from(value)
 }
 
@@ -366,5 +457,15 @@ mod tests {
         save_live_state(&path, &second).expect("replacement state save");
         assert_eq!(load_live_state(&path).expect("replacement load"), second);
         fs::remove_dir_all(directory).expect("remove test-owned directory");
+    }
+
+    #[test]
+    fn temporary_state_paths_do_not_collide() {
+        let path = Path::new("logs/state.json");
+        let first = temporary_path(path);
+        let second = temporary_path(path);
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), path.parent());
+        assert_eq!(second.parent(), path.parent());
     }
 }

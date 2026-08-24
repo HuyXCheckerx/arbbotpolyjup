@@ -182,7 +182,13 @@ test("live trader uses a 30-second entry cutoff for both durations", async () =>
 test("daily binary pairs request the selected Jupiter NO side", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-daily-no-"));
   const jupiter = new MockJupiter([]);
-  const trader = createTrader(jupiter, new MockPolymarket([]), join(directory, "state.json"));
+  const trader = createTrader(
+    jupiter,
+    new MockPolymarket([]),
+    join(directory, "state.json"),
+    false,
+    100_000n,
+  );
   await trader.initialize();
   const polymarketBook = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n);
   const jupiterBook = book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n);
@@ -210,6 +216,7 @@ test("daily binary pairs request the selected Jupiter NO side", async () => {
   });
   assert.equal(decision.type, "entry");
   assert.equal(jupiter.lastBuyIsYes, false);
+  assert.ok((jupiter.lastBuyGrossMicroUsd ?? 0n) >= 5_000_000n);
 });
 
 test("live trader signs a fresh exact Jupiter build before Polymarket and executes it immediately after fill", async () => {
@@ -2143,6 +2150,7 @@ class MockJupiter implements LiveJupiterGateway {
   claimPayoutMicroUsd: bigint | null = null;
   reclaimedLamports = 2_074_080n;
   lastBuyIsYes: boolean | null = null;
+  lastBuyGrossMicroUsd: bigint | null = null;
   #lastBuild: JupiterPredictionOrderBuild | null = null;
   #submittedContractsMicro = 0n;
   #prepareBuyCalls = 0;
@@ -2165,6 +2173,7 @@ class MockJupiter implements LiveJupiterGateway {
       throw new Error("HTTP 429: Too many requests");
     }
     this.lastBuyIsYes = input.isYes ?? true;
+    this.lastBuyGrossMicroUsd = input.depositAmountMicroUsd;
     const buyPriceMicroUsd = this.#prepareBuyCalls > 1 && this.postScreeningBuyPriceMicroUsd !== null
       ? this.postScreeningBuyPriceMicroUsd
       : this.buyPriceMicroUsd;

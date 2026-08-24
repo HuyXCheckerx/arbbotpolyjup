@@ -1,20 +1,22 @@
 [package]
-name = "jupol-jupiter"
+name = "jupol-polymarket"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+alloy.workspace = true
+chrono.workspace = true
+ethers.workspace = true
 futures.workspace = true
+hex.workspace = true
 jupol-domain = { path = "../jupol-domain" }
 jupol-http = { path = "../jupol-http" }
-jupol-runtime = { path = "../jupol-runtime" }
-jupol-solana = { path = "../jupol-solana" }
-reqwest.workspace = true
+polymarket_client_sdk_v2.workspace = true
+rs-builder-relayer-client.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-solana-sdk.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 

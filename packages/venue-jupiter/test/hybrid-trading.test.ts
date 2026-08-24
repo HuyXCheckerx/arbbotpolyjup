@@ -14,21 +14,20 @@ import {
 } from "../src/hybrid-trading.ts";
 import type { PreparedJupiterSubmission, SubmittedJupiterOrder } from "../src/trading.ts";
 
-test("hybrid executor uses Prediction at $5+ and Swap V2 only for smaller Forecast buys", async () => {
+test("hybrid executor uses Prediction at $5+ and Swap V2 for a $0.10 Forecast buy by default", async () => {
   const calls: string[] = [];
   const forecast = gateway("forecast", "/swap/v2/execute", "swap-v2:BISON-UP:mint", calls);
   const prediction = gateway("prediction", "/prediction/v1/execute", "prediction-position", calls);
   const hybrid = new JupiterHybridLiveExecutor({
     forecast,
     prediction,
-    allowSubMinimumForecastSwap: true,
   });
 
   const small = await hybrid.prepareBuy({
     marketId: "BISON-UP",
     outcomeMint: "mint",
     isYes: true,
-    depositAmountMicroUsd: JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD - 1n,
+    depositAmountMicroUsd: 100_000n,
   });
   const minimum = await hybrid.prepareBuy({
     marketId: "BISON-UP",
@@ -96,11 +95,12 @@ test("hybrid executor routes normalized Forecast positions to token settlement",
   ]);
 });
 
-test("hybrid executor requires explicit opt-in for a sub-$5 Forecast swap", async () => {
+test("hybrid executor permits an explicit opt-out from sub-$5 Forecast swaps", async () => {
   const calls: string[] = [];
   const hybrid = new JupiterHybridLiveExecutor({
     forecast: gateway("forecast", "/swap/v2/execute", "swap-v2:BISON-UP:mint", calls),
     prediction: gateway("prediction", "/prediction/v1/execute", "prediction-position", calls),
+    allowSubMinimumForecastSwap: false,
   });
   await assert.rejects(
     hybrid.prepareBuy({

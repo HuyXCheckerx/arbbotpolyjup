@@ -28,7 +28,10 @@ import type {
   JupiterPredictionPosition,
 } from "../../../packages/venue-jupiter/src/client.ts";
 import { forecastSwapPositionId } from "../../../packages/venue-jupiter/src/forecast-swap.ts";
-import { jupiterExecutionPath } from "../../../packages/venue-jupiter/src/hybrid-trading.ts";
+import {
+  JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD,
+  jupiterExecutionPath,
+} from "../../../packages/venue-jupiter/src/hybrid-trading.ts";
 import type {
   PreparedJupiterSubmission,
   SubmittedJupiterOrder,
@@ -570,11 +573,20 @@ export class ShortWindowLiveTrader {
           ),
         }
       : null;
+    const pairStrategy = {
+      ...this.#config.strategy,
+      // Only native Forecast pairs expose an outcome mint and can use Swap V2
+      // below the Prediction API's observed $5 order floor.
+      jupiterMinimumGrossOrderMicroUsd: jupiterMinimumOrderForPair(
+        input.pair,
+        this.#config.strategy.jupiterMinimumGrossOrderMicroUsd,
+      ),
+    };
     const entry = forcedTestEntry ? null : evaluateShortWindowEntry({
       route: conservativeBestRoute,
       polymarketAvailableMicroUsd: entryPolymarketCapacity,
       jupiterAvailableMicroUsd: entryJupiterCapacity,
-      config: this.#config.strategy,
+      config: pairStrategy,
     });
     if (!forcedTestEntry && entry && !entry.eligible) return { type: "skip", reason: entry.reason };
     if (forcedTestEntry && !input.bestRoute) return { type: "skip", reason: "ONE_SHOT_TEST_WAITING_FOR_BOTH_BOOKS" };
@@ -595,7 +607,7 @@ export class ShortWindowLiveTrader {
     this.#busy = true;
     try {
       let entryJupiterGrossMicroUsd = forcedTestEntry
-        ? input.jupiterEntryBuild?.order.orderCostMicroUsd ?? this.#config.strategy.jupiterMinimumGrossOrderMicroUsd
+        ? input.jupiterEntryBuild?.order.orderCostMicroUsd ?? pairStrategy.jupiterMinimumGrossOrderMicroUsd
         : entry && entry.eligible ? entry.proposal.jupiter.grossMicroUsd : 0n;
       let entryContractsMicro = forcedTestEntry
         ? input.jupiterEntryBuild?.order.newContractsMicro ?? this.#config.strategy.polymarketMinimumContractsMicro
@@ -997,18 +1009,23 @@ export class ShortWindowLiveTrader {
       // Rolling executable builds are price-discovery inputs only. Every real
       // entry gets a new Jupiter order build so an older polling response can
       // never become the transaction submitted after the Polymarket FOK.
-      build = await this.#jupiter.prepareBuy({
-        marketId: pair.jupiterMarketId,
-        depositAmountMicroUsd: jupiterDepositMicroUsd,
-        isYes: expectedJupiterIsYes(pair),
-        ...(pair.jupiterOutcomeMint ? { outcomeMint: pair.jupiterOutcomeMint } : {}),
-      });
-      buildAtMs = Date.now();
-      quotedContractsMicro = build.order.newContractsMicro;
       // Refresh the selected token's executable CLOB immediately before
       // signing. The websocket book is useful for discovery but should not be
-      // the final authority for an irreversible FOK.
-      const freshPolymarketBook = await this.#polymarket.fetchBuyAsks(pair.polymarketTokenId);
+      // the final authority for an irreversible FOK. This REST read and the
+      // exact Jupiter build are independent, so issue them concurrently to
+      // remove one network round trip from the entry hot path.
+      const [freshJupiter, freshPolymarketBook] = await Promise.all([
+        this.#jupiter.prepareBuy({
+          marketId: pair.jupiterMarketId,
+          depositAmountMicroUsd: jupiterDepositMicroUsd,
+          isYes: expectedJupiterIsYes(pair),
+          ...(pair.jupiterOutcomeMint ? { outcomeMint: pair.jupiterOutcomeMint } : {}),
+        }).then((freshBuild) => ({ build: freshBuild, builtAtMs: Date.now() })),
+        this.#polymarket.fetchBuyAsks(pair.polymarketTokenId),
+      ]);
+      build = freshJupiter.build;
+      buildAtMs = freshJupiter.builtAtMs;
+      quotedContractsMicro = build.order.newContractsMicro;
       executablePolymarketAsks = haircutBookLevels(
         freshPolymarketBook.asks,
         this.#config.polymarketDepthHaircutBps,
@@ -1255,11 +1272,9 @@ export class ShortWindowLiveTrader {
           preparedJupiter = fresh.prepared;
           quoteAgeAtSubmissionMs = fresh.ageMs;
         }
-        position.jupiterOrderPubkey = build.order.orderPubkey;
-        position.jupiterPositionPubkey = managedJupiterPositionPubkey(pair, build.order.positionPubkey);
-        position.jupiterEntryPositionPubkey = build.order.positionPubkey;
-        position.jupiterQuotedContractsMicro = build.order.newContractsMicro;
-        await this.#save();
+        // The per-attempt build was persisted with the entry intent above;
+        // prepareFreshSubmission persists any replacement. Avoid another
+        // atomic file write on the build-to-submit critical path.
         quoteAgeAtSubmissionMs = buildAtMs === null ? null : Math.max(0, Date.now() - buildAtMs);
         if (quoteAgeAtSubmissionMs !== null &&
           quoteAgeAtSubmissionMs > this.#config.maximumJupiterSubmissionQuoteAgeMs) {
@@ -1572,6 +1587,14 @@ export class ShortWindowLiveTrader {
       targetContractsMicro,
       guaranteedJupiterOutputContracts(seedBuild),
     );
+    if (!pair.jupiterOutcomeMint &&
+      depositAmountMicroUsd < JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD) {
+      throw new Error(
+        `POST_FILL_HEDGE_BELOW_PREDICTION_MINIMUM: required ` +
+        `$${formatUsd(depositAmountMicroUsd)}, minimum ` +
+        `$${formatUsd(JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD)}; unwind the Polymarket fill`,
+      );
+    }
     let latest: JupiterPredictionOrderBuild | null = null;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const maximumJupiterSpend = minimum(
@@ -2883,10 +2906,14 @@ function validateJupiterEntryBuild(input: {
       "configuration",
     );
   }
-  if (build.order.orderCostMicroUsd < config.strategy.jupiterMinimumGrossOrderMicroUsd) {
+  const jupiterGrossFloor = jupiterMinimumOrderForPair(
+    pair,
+    config.strategy.jupiterMinimumGrossOrderMicroUsd,
+  );
+  if (build.order.orderCostMicroUsd < jupiterGrossFloor) {
     rejectEntryPreflight(
       "JUPITER_BELOW_GROSS_FLOOR",
-      "Jupiter size-specific quote is below the configured strategy gross floor",
+      `Jupiter size-specific quote is below the effective $${formatUsd(jupiterGrossFloor)} gross floor`,
       "market_changed",
     );
   }
@@ -3300,6 +3327,15 @@ function settledError(result: PromiseSettledResult<unknown>): string {
 
 function absoluteNumber(value: number): number {
   return value < 0 ? -value : value;
+}
+
+function jupiterMinimumOrderForPair(
+  pair: LivePairIdentity,
+  configuredMinimumMicroUsd: bigint,
+): bigint {
+  return pair.jupiterOutcomeMint
+    ? configuredMinimumMicroUsd
+    : maximum(configuredMinimumMicroUsd, JUPITER_PREDICTION_MINIMUM_BUY_MICRO_USD);
 }
 
 function minimum(left: bigint, right: bigint): bigint {

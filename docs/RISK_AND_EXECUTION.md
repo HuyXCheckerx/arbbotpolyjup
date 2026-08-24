@@ -24,12 +24,16 @@ Use a protected market order with `FOK`:
 
 ### Jupiter
 
-The live path accepts only native Forecast order builds whose documented execution model is `atomic_swap`. The order build returns an executable quote, not proof of the final fractional contract quantity.
+The live path accepts native Forecast `atomic_swap` builds and verified standard
+Prediction keeper builds. The order build returns an executable transaction and
+quote, not proof of the final fractional contract quantity.
 
 Consequences:
 
 - `executionModel=atomic_swap` is treated as filled only after transaction confirmation and reconciliation of the owner's real outcome-token and USDC balance deltas.
-- A null or keeper execution model does not satisfy the strict taker-only requirement and is rejected before signing.
+- A standard Prediction keeper build must include its order/position identity,
+  signer set, blockhash metadata and supported execution endpoint. Unknown
+  execution models are rejected before signing.
 
 ## Execution strategy
 
@@ -67,8 +71,11 @@ If the concurrent results are not equal and final:
 
 1. Reconcile both venues using order IDs, transaction signatures, and token/position balances.
 2. Persist the exact or conservatively observed residual exposure.
-3. Halt all new entries and alert the operator.
-4. Do not automatically chase the missing leg; manual neutralization is required under the configured recovery policy.
+3. Isolate the position; globally halt only if identity, quantity or submission
+   status is unknown.
+4. A known mismatch may use a fresh Polymarket top-up/trim only after proving the
+   configured slippage and maximum-loss bounds before signing. Otherwise retain
+   it for manual reconciliation/settlement; never blindly chase the missing leg.
 
 A BTC perpetual is not an exact hedge for a binary contract. It may be considered only as a separately approved disaster hedge with a documented delta model; it is not part of MVP recovery.
 
@@ -90,7 +97,7 @@ Configuration must include, at minimum:
 | Maximum data age and clock drift | Rejects stale comparisons |
 | No-entry window before close | Avoids close/settlement races |
 
-Initial live limits should be no larger than Jupiter’s minimum order (currently documented as $5) plus enough size to meet Polymarket’s minimum order. Increase only from measured fill and recovery data.
+Initial live limits should stay near the smallest size that both venues actually accept and that still covers fees. The bot uses an observed `$5` floor for Jupiter Prediction and permits native Forecast Swap V2 down to a configurable `$0.10` strategy floor, but a tiny route can still be unavailable or uneconomic. Increase only from measured fill and recovery data.
 
 ## Circuit breakers
 

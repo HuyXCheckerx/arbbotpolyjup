@@ -1,351 +1,336 @@
-# How to run the Jupol arbitrage bot
+# How to run Jupol
 
-Run every command from:
+Run commands from the repository root:
 
 ```bash
 cd /Users/perycent/Downloads/Jupol
 ```
 
-## Choose a mode
+The production scanner and trader are Rust. The browser dashboard and the old
+TypeScript regression suite remain JavaScript/TypeScript, but they do not sign,
+submit, reconcile, settle, or redeem live orders.
 
-| Goal | Command | Can place real orders? |
+## Commands and side effects
+
+| Goal | Command | Can change venue/on-chain state? |
 | --- | --- | --- |
-| Safest first run: reference-directed monitor | `pnpm monitor:short-window` | No |
-| Monitor both complementary routes | `pnpm monitor:short-window:any-route` | No |
-| Reference-directed live bot | `pnpm bot:short-window:live` | Yes |
-| Live bot that takes whichever complementary route qualifies | `pnpm bot:short-window:any-route` | Yes |
-| Check both live wallets and venue readiness | `pnpm check:live:readiness` | No orders or transactions |
-| Check only Polymarket readiness | `pnpm check:polymarket:live` | No orders or transactions |
-| Create missing Polymarket approvals | `pnpm setup:polymarket:live` | May submit approval transactions, never market orders |
+| Monitor 5m, 15m and daily BTC markets | `pnpm monitor:short-window` | No |
+| Monitor short-window only | `pnpm monitor:short-window --no-daily-threshold` | No |
+| Check both wallets and APIs | `pnpm check:live:readiness` | No |
+| Check only Polymarket | `pnpm check:polymarket:live` | No |
+| Start live trading | `pnpm bot:short-window:live` | Yes |
+| Reconcile/repair interrupted positions | `pnpm recover:live` | **Yes, may submit bounded repair orders** |
+| Create Polymarket approvals | `pnpm setup:polymarket:live` | Yes |
+| Redeem settled Polymarket positions | `pnpm redeem:polymarket` | Yes |
 
-`pnpm bot:short-window` is an alias of `pnpm bot:short-window:live`.
+Every Rust monitor/live command evaluates both complementary directions and
+chooses the best qualified one: `Poly UP + Jup DOWN` or `Poly DOWN + Jup UP`.
+The `:any-route` package aliases now differ only in their JSONL output filename.
+There is no opening-reference-difference limit; the difference is diagnostic
+only. Because the two venues can use different final observations, this is a
+basis trade and not guaranteed arbitrage.
 
-The reference-directed version chooses the complementary route implied by the two venues' opening references. The any-route version evaluates both `Poly UP + Jup DOWN` and `Poly DOWN + Jup UP`, then takes the best route that passes every fee, size, freshness, and live-risk check. Any-route mode has greater basis risk: both purchased outcomes can lose if the venues settle inside their opening-reference gap.
-
-All short-window commands monitor BTC 5-minute and 15-minute pairs. Daily “Bitcoin above ___ on date?” markets are also enabled by default. Add `--no-daily-threshold` if you want only the 5-minute and 15-minute strategy.
-
-## Install and verify
+## Install and build
 
 Requirements:
 
-- Node.js 24 or newer;
-- pnpm;
-- internet access to Polymarket, Jupiter, Solana RPC, and the public price streams.
-
-Install dependencies and run all checks:
+- Rust 1.90 or newer;
+- Node.js 24 and pnpm for the dashboard and retained regression tests;
+- network access to Jupiter, Polymarket and a reliable Solana RPC.
 
 ```bash
 pnpm install
+npm install --prefix apps/dashboard
+cargo build --release -p jupol-scanner
 pnpm check
 ```
 
-`pnpm check` does not place orders. Run it after changing code or updating dependencies.
+The optimized executable is `target/release/jupol`. On a server, start that
+binary directly after building instead of compiling through `cargo run` on each
+restart.
 
-## Read-only runs
+## Configure `.env`
 
-Start with the normal reference-directed monitor:
-
-```bash
-pnpm monitor:short-window
-```
-
-Monitor both complementary routes without trading:
-
-```bash
-pnpm monitor:short-window:any-route
-```
-
-Monitor only the short-window markets, excluding daily strike markets:
-
-```bash
-pnpm monitor:short-window -- --no-daily-threshold
-```
-
-Useful bounded runs:
-
-```bash
-# Stop after the first synchronized sample.
-pnpm monitor:short-window -- --once
-
-# Stop after 100 synchronized samples.
-pnpm monitor:short-window -- --max-samples=100
-
-# Stop after the first recorded fee-adjusted candidate.
-pnpm monitor:short-window -- --max-opportunities=1
-```
-
-Choose a separate output file or status port:
-
-```bash
-pnpm monitor:short-window -- \
-  --output=logs/my-read-only-run.jsonl \
-  --web-port=3211
-```
-
-Read-only mode may use `--no-web`. Live mode may not, because its status port is also the single-instance safety lock.
-
-## Configure live credentials
-
-Use dedicated, low-balance wallets. Do not use a main wallet or seed phrase.
-
-Create the local environment file:
+Use dedicated, low-balance wallets, never a main wallet or seed phrase.
 
 ```bash
 cp -n .env.example .env
 chmod 600 .env
 ```
 
-Set these values in `.env`:
+Set:
 
 ```text
-JUPITER_API_KEY=your_jupiter_api_key
+JUPITER_API_KEY=your_developer_key
 JUPITER_SOLANA_PRIVATE_KEY=your_dedicated_solana_secret
-SOLANA_RPC_URL=https://your-solana-rpc.example
+SOLANA_RPC_URL=https://your-low-latency-solana-rpc
 
 POLYMARKET_PRIVATE_KEY=0xyour_dedicated_polygon_signer_key
-POLYMARKET_WALLET_ADDRESS=0xyour_polymarket_funder_address
+POLYMARKET_WALLET_ADDRESS=0xyour_polymarket_funder_or_deposit_wallet
+POLYMARKET_SIGNATURE_TYPE=poly1271
 POLYMARKET_RELAYER_API_KEY=your_polymarket_relayer_key
-POLYMARKET_RELAYER_API_KEY_ADDRESS=0xthe_relayer_key_owner_address
+POLYMARKET_RELAYER_API_KEY_ADDRESS=0xthe_key_owner_address
 
 LIVE_TRADING_CONFIRMATION=I_ACCEPT_REAL_MONEY_RISK
 ```
 
-Important details:
+Key details:
 
-- `POLYMARKET_PRIVATE_KEY` must be a `0x`-prefixed 32-byte key.
-- `JUPITER_SOLANA_PRIVATE_KEY` accepts a base58 secret key or a JSON byte array.
-- `POLYMARKET_WALLET_ADDRESS` is the funded Polymarket account controlled by the signer. It can differ from the signer address.
-- `POLYMARKET_RELAYER_API_KEY_ADDRESS` is the owner address shown beside the key in Polymarket settings. Do not assume it equals the wallet address.
-- Never commit, paste, screenshot, or include `.env` in logs or support messages.
-- The packaged live and readiness commands load `.env` automatically. You do not need to run `source .env`.
+- `JUPITER_SOLANA_PRIVATE_KEY` accepts base58 or a JSON byte array.
+- `POLYMARKET_PRIVATE_KEY` is a `0x`-prefixed 32-byte signer key.
+- `POLYMARKET_WALLET_ADDRESS` may differ from the signer for a deposit/proxy
+  wallet. Select `eoa`, `proxy`, `gnosis_safe`, or `poly1271` accurately.
+- New deposit wallets use `poly1271`; older Polymarket proxy accounts use
+  `proxy`. `pnpm check:live:readiness` verifies that the configured address is
+  exactly the address derived from the signer and selected wallet type.
+- Production CLOB V2 runs at `https://clob.polymarket.com` and uses pUSD atomic
+  balances. Do not use the retired pre-cutover `clob-v2` testing host.
+- The relayer key owner address is the address displayed with the key in
+  Polymarket settings; do not assume it equals the funded wallet.
+- The Rust CLI loads `.env` automatically. Do not paste secrets into commands,
+  logs, screenshots, or support messages.
 
-Suggested minimum funding for the default settings:
+### Jupiter Developer key: 10 RPS and product access
 
-- Jupiter wallet: at least `$50` USDC and `0.001 SOL`;
-- Polymarket wallet: at least `$50` collateral plus any gas required by its wallet type.
+All authenticated Prediction and Swap V2 requests share one process-wide
+100 ms scheduler, matching the Developer plan's 10 RPS. Entry and recovery work
+has priority and jumps queued discovery; `/execute` still consumes the same
+bucket so the process cannot cause its own 429 by bypassing the plan limit.
+Public Degen and Polymarket WebSockets do not consume this budget.
 
-## Prepare and verify live trading
+The Developer plan and product access are separate. The key must be enabled for
+both **Prediction** and **Swap** in the Jupiter portal. If startup reports:
 
-First check Polymarket without submitting anything:
+```text
+Jupiter rejected JUPITER_API_KEY ... Prediction product permission
+```
+
+the program received a real `401 Unauthorized`. Enable/allow-list Prediction or
+replace the key; changing retry timing cannot fix it.
+
+## Safe first run
+
+Read-only monitoring:
+
+```bash
+pnpm monitor:short-window --no-daily-threshold
+```
+
+One synchronized sample and no status server:
+
+```bash
+pnpm monitor:short-window --once --no-web --no-daily-threshold
+```
+
+With the `pnpm <script>` shorthand, pass Rust CLI options directly. Do not add
+an extra standalone `--`; that would reach `jupol` as an option terminator and
+make a following option such as `--once` an unexpected positional argument.
+
+The short-window scanner uses the Polymarket market WebSocket with REST only as
+a stale/missing-book fallback, plus Jupiter's public Degen price WebSocket for
+screening. A candidate must still pass a new authenticated, executable Jupiter
+build immediately before an order can be armed.
+
+Then run read-only live readiness:
 
 ```bash
 pnpm check:polymarket:live
+pnpm check:live:readiness
 ```
 
-If approvals are missing, run the setup-only command:
+Readiness verifies the configured wallet identity, real collateral/USDC, CLOB
+allowances, Jupiter status, and the SOL reserve. It never signs or submits an
+order or transaction.
+
+If Polymarket allowances are missing, explicitly run:
 
 ```bash
 pnpm setup:polymarket:live
 ```
 
-This command may submit approval or wallet-deployment transactions. It exits after setup and cannot continue into market trading.
+That command may send approval/deployment transactions and exits afterward.
 
-Then run the complete read-only live readiness check:
-
-```bash
-pnpm check:live:readiness
-```
-
-Do not start live trading until this passes with the wallet addresses and balances you expect.
-
-## Start the live bot
-
-Reference-directed live strategy:
+## Start live trading
 
 ```bash
 pnpm bot:short-window:live
 ```
 
-Take whichever complementary route currently offers the best qualified edge:
+Short-window only:
 
 ```bash
-pnpm bot:short-window:any-route
+pnpm bot:short-window:live --no-daily-threshold
 ```
 
-Only 5-minute and 15-minute markets, with daily strike markets disabled:
+Do not run two live variants at once. Live mode binds `127.0.0.1:3210` before
+wallet/API setup, making the status port a single-instance lock, and uses the
+same durable state by default.
+
+The live path:
+
+1. ranks both complementary routes from fresh WebSocket data;
+2. gets a new exact Jupiter Prediction or Swap build;
+3. re-reads Polymarket depth and prepares an exact-share FOK;
+4. persists an intent before exposure;
+5. releases the signed Polymarket and Jupiter submissions concurrently;
+6. reconciles actual conditional tokens, wallet collateral/USDC and Solana
+   transaction deltas before recording quantities or cost;
+7. computes Polymarket-only-win, Jupiter-only-win, both-win and both-lose P&L;
+8. holds reconciled exposure to settlement, automatically redeems/claims, and
+   reclaims empty Forecast token-account rent.
+
+Unknown quantity, identity, or cash debit is kept in recovery state and is not
+reported as realized profit. Known mismatches can use only the configured
+bounded repair. Live mode re-runs recovery every 15 seconds, waits out ambiguous
+Swap handoffs, and never races a pending Jupiter keeper order. Cross-chain
+execution is still non-atomic.
+
+Jupiter Prediction is used for `$5+` native Forecast orders and all standard
+`POLY-*` markets. Native Forecast orders below `$5` may use direct Swap V2 down
+to the configured `$0.10` strategy floor when an outcome mint and viable route
+exist.
+
+## Current controls
+
+Show the authoritative list:
 
 ```bash
-pnpm bot:short-window:live -- --no-daily-threshold
+pnpm bot:short-window:live --help
 ```
 
-Do not run the two live variants simultaneously. They share the default durable state and port `3210`; the port lock intentionally prevents a second live executor.
+Common options:
 
-Live trading remains non-atomic across Polygon and Solana. A detected candidate is not guaranteed profit because Polymarket settles from a 60-second Chainlink TWAP while Jupiter Forecast settles from Chainlink spot.
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--max-venue-allocation-usd` | `$50` | Maximum cost at either venue for one position |
+| `--minimum-venue-balance-usd` | `$50` | Startup wallet requirement |
+| `--maximum-open-positions` | `5` | Portfolio-wide unsettled-position limit |
+| `--minimum-entry-edge-usd` | `$0.001` | Minimum edge per contract |
+| `--minimum-entry-profit-usd` | `$0.10` | Minimum total modeled edge |
+| `--jupiter-minimum-order-usd` | `$0.10` | Native Forecast Swap floor; Prediction remains `$5` |
+| `--polymarket-minimum-order-usd` | `$1` | Marketable BUY minimum |
+| `--maximum-slippage-bps` | `100` | Entry/repair protection, allowed range 1–500 |
+| `--polymarket-depth-haircut-bps` | `2000` | Ignores the last 20% of displayed depth |
+| `--maximum-jupiter-submit-quote-age-ms` | `500` | Build-to-handoff ceiling, including a conservative 250 ms critical-slot budget |
+| `--maximum-emergency-hedge-loss-usd` | `$1` | Bound for a post-fill repair |
+| `--jupiter-fill-timeout-ms` | `20000` | Confirmation/reconciliation timeout |
+| `--max-polymarket-age-ms` | `750` | Maximum entry snapshot age |
+| `--max-jupiter-age-ms` | `2000` | Maximum indicative snapshot age |
+| `--polymarket-poll-ms` | `5000` | REST fallback cadence; WebSocket is primary |
+| `--entry-cutoff-seconds` | `30` | Final no-entry window; values below 30 are rejected |
+| `--disable-sub-five-jupiter-swap` | off | Require Jupiter Prediction's `$5` minimum |
+| `--no-daily-threshold` | off | Disable daily Bitcoin-above-strike mirrors |
+| `--output` | Rust JSONL path | Append-only diagnostics/candidates |
+| `--live-state` | shared state path | Durable exposure and settlement state |
+| `--web-port` | `3210` | Status API and live instance lock |
 
-For native Jupiter Forecast markets, live execution is hybrid:
-
-- Jupiter Prediction `/orders` → `/execute` is used when the Jupiter deposit is at least `$5`, matching Jupiter's recommended website-style path;
-- direct outcome-token Swap V2 is used below `$5`, because Prediction rejects smaller builds;
-- Prediction `/execute` amounts are never treated as fills: the bot confirms the transaction and measures the wallet's real outcome-token credit and USDC debit;
-- after both legs execute, the bot predicts Polymarket-only win, Jupiter-only win, both-win, and both-lose P&L from confirmed fills. Because the venues use different resolution observations, the last two cases are real basis outcomes. A known but imperfect fill is isolated as `recovery_planning` while unrelated pairs remain enabled; an unknown fill still halts globally;
-- Forecast winners are credited from the confirmed settlement USDC delta, and empty Token-2022 outcome accounts are closed automatically to reclaim SOL rent;
-- live mode continuously rolls unsigned executable builds through a shared `125ms` scheduler (`8 RPS`) for price discovery only, leaving headroom below the Developer plan's `10 RPS` limit; critical entry/recovery work jumps ahead of discovery;
-- every real entry requests a new Jupiter build. A signed build is submitted only while it is at most `100ms` old; otherwise it is discarded and rebuilt once. A second expiry prevents Jupiter submission and invokes Polymarket-only automatic recovery.
-
-## Customize risk and entry requirements
-
-Example with smaller allocation and stricter entry requirements:
+Example conservative live run:
 
 ```bash
 pnpm bot:short-window:live -- \
-  --minimum-venue-balance-usd=50 \
-  --max-venue-allocation-usd=20 \
-  --maximum-open-positions=1 \
-  --maximum-slippage-bps=50 \
-  --maximum-jupiter-submit-quote-age-ms=100 \
-  --maximum-emergency-hedge-loss-usd=0.50 \
-  --minimum-entry-edge-usd=0.02 \
-  --minimum-entry-profit-usd=0.25
-```
-
-Example using any-route mode, no daily markets, and a separate log:
-
-```bash
-pnpm bot:short-window:any-route -- \
   --no-daily-threshold \
-  --max-venue-allocation-usd=20 \
+  --max-venue-allocation-usd=10 \
   --maximum-open-positions=1 \
-  --output=logs/live-any-route-short-window-only.jsonl
+  --minimum-entry-profit-usd=0.25 \
+  --maximum-slippage-bps=50
 ```
 
-Common controls:
+## Dashboard
 
-| Option | Default | Effect |
-| --- | ---: | --- |
-| `--max-venue-allocation-usd=50` | `$50` | Maximum cost at each venue for one position |
-| `--maximum-open-positions=5` | `5` | Portfolio-wide unsettled-position limit; wallet balances can impose a lower practical limit |
-| `--minimum-entry-edge-usd=0.001` | `$0.001` | Minimum modeled edge per contract after entry fees |
-| `--minimum-entry-profit-usd=0.10` | `$0.10` | Minimum modeled total entry profit |
-| Exit policy | hold until resolution | Automatic profit-taking exits are disabled; recovery hedges and settlement remain enabled |
-| `--maximum-slippage-bps=100` | `100 bps` | Maximum live price protection per leg; allowed range is 1–500 bps |
-| `--maximum-jupiter-submit-quote-age-ms=100` | `0.1 seconds` | Requires a new per-attempt Jupiter build and discards/rebuilds once rather than submitting an older transaction |
-| `--maximum-emergency-hedge-loss-usd=1` | `$1` | Base post-fill hedge-loss budget; after Polymarket fills, it may expand to that leg's already-at-risk entry cost. It does not relax pre-entry profit checks or hard allocation limits |
-| `--jupiter-quote-usd=MAX_ALLOCATION` | per-position allocation | Maximum rolling executable-quote gross; exact sizing adapts below this cap |
-| `--jupiter-fill-timeout-ms=20000` | `20 seconds` | Jupiter fill/reconciliation timeout |
-| `--market-log-interval-ms=30000` | `30 seconds` | Suppresses repetitive snapshots without slowing execution evaluation |
-| `--max-polymarket-age-ms=750` | `0.75 seconds` | Rejects entry decisions based on an older Polymarket snapshot |
-| `--max-jupiter-age-ms=2000` | `2 seconds` | Rejects entry decisions based on an older Jupiter snapshot |
-| `--jupiter-request-interval-ms=125` | `125 ms` | Caps the shared main bucket at 8 RPS; critical builds jump ahead of rolling discovery |
-| `--no-daily-threshold` | off | Disables daily Bitcoin-above-strike markets |
-| `--web-port=3210` | `3210` | Local status API and live single-instance lock |
-| `--output=PATH` | standard JSONL path | Selects the append-only event log |
-| `--live-state=PATH` | standard state path | Selects the durable live exposure state |
-
-New entries are always disabled during the final 30 seconds of both short-window durations. This cutoff is fixed in the strategy and is not a command-line option.
-
-Show the complete current option list:
+In another terminal:
 
 ```bash
-pnpm monitor:short-window -- --help
-```
-
-## Deliberate one-shot live test
-
-This mode can intentionally submit one unprofitable real trade. It is not a paper test.
-
-Add the second confirmation to `.env`:
-
-```text
-LIVE_TEST_ENTRY_CONFIRMATION=I_ACCEPT_ONE_UNPROFITABLE_TEST_TRADE
-```
-
-Then run:
-
-```bash
-pnpm bot:short-window:live -- --live-test-entry
-```
-
-All identity, balance, allocation, freshness, depth, slippage, and reconciliation checks remain active, but entry-profit minimums are bypassed for one submission attempt.
-
-## Run the dashboard
-
-Keep the scanner or bot in the first terminal. In a second terminal:
-
-```bash
-cd /Users/perycent/Downloads/Jupol
 pnpm dashboard:dev
 ```
 
-Open:
+Open `http://localhost:3000`. The status source is
+`http://127.0.0.1:3210/api/status`. For another scanner port, use
+`http://localhost:3000/?scannerPort=3211`. The dashboard is read-only.
+
+## Logs and durable state
+
+Defaults:
 
 ```text
-http://localhost:3000
-```
-
-The scanner status endpoint is `http://127.0.0.1:3210/api/status`. If the scanner uses another port, such as `--web-port=3211`, open the dashboard with:
-
-```text
-http://localhost:3000/?scannerPort=3211
-```
-
-The dashboard is read-only and cannot place orders.
-
-## Logs and state
-
-Default reference-directed files:
-
-```text
-logs/btc-poly-jup-short-window-arb.jsonl
+logs/btc-poly-jup-short-window-rust.jsonl
 logs/btc-poly-jup-short-window-live-state.json
 ```
 
-The any-route script uses:
-
-```text
-logs/btc-poly-jup-short-window-any-route.jsonl
-```
-
-It still shares the default live-state file unless you explicitly select another one.
-
-Watch candidates:
+Inspect candidates and execution errors:
 
 ```bash
-tail -f logs/btc-poly-jup-short-window-arb.jsonl | \
-  jq --unbuffered -c 'select(.type == "arb_opportunity")'
+tail -f logs/btc-poly-jup-short-window-rust.jsonl | \
+  jq --unbuffered -c 'select(.type == "candidate" or .type == "daily_threshold_candidate" or .type == "execution_error")'
 ```
 
-Watch live entries, exits, recovery plans, recovery, and halts:
+Inspect the durable state without editing it:
 
 ```bash
-tail -f logs/btc-poly-jup-short-window-arb.jsonl | \
-  jq --unbuffered -c 'select(.type == "live_entry" or .type == "live_exit" or .type == "live_recovery_plan" or .type == "live_recovery" or .type == "live_halt")'
+cargo run --release -p jupol-scanner -- state
 ```
 
-Every live-entry execution record distinguishes `jupiter.result: "skipped"` from an actual rejection and includes `submissionAttempted`, `signed`, `executionPath`, `endpoint`, `requestId`, `usedPreflightBuild`, `quoteAgeAtSubmissionMs`, `freshBuildRetryCount`, `quotedContractsMicro`, `filledContractsMicro`, `contractShortfallMicro`, `quotedCostMicroUsd`, `executedCostMicroUsd`, `reconciliationSource`, and the transaction signature. Rolling Jupiter builds are used only to discover and size candidates; a real entry always requests a new build. A build older than the configured submission ceiling is discarded and rebuilt once. If that replacement is also stale, it is never submitted and the existing Polymarket-only automatic recovery path runs.
+State writes use a unique sibling temporary file, sync it, and atomically
+replace the destination. Live mode's instance lock prevents two coordinators;
+the unique temporary names also avoid the Windows `.tmp` source collision seen
+in the previous runtime.
 
-The first run after upgrading archives the old quote-derived realized P&L as `legacyUnverifiedRealizedProfitMicroUsd` and displays verified realized P&L from zero. Do not treat the archived figure as wallet profit. A legacy state containing an open Jupiter fill halts with `LEGACY_UNVERIFIED_JUPITER_FILL` for manual transaction reconciliation.
+## Stop, recover, redeem
 
-The JSONL and durable state contain public order, transaction, and exposure information but should still be protected.
+Press `Ctrl-C` once and allow an active entry/reconciliation to finish. Never
+delete the state to clear a halt: a new file forgets exposure but cannot close
+it on either venue.
 
-## Stop safely
-
-Press `Ctrl-C` once and wait for the session-end message. The live bot persists managed positions before exiting. Do not kill it during signing, submission, reconciliation, redemption, or state persistence unless there is no safer alternative.
-
-## Restart or recover after a halt
-
-1. Do not delete, edit, or replace the halted state file.
-2. Check the actual Polymarket conditional-token balance and Jupiter outcome-token balance for the recorded markets.
-3. Preserve the JSONL and state file as the exposure audit trail.
-4. Restart with the same command and state file when you want the bot to attempt its supported automatic read-only reconciliation and post-resolution recovery.
-5. A bounded residual can continue to normal hold/exit management. An excessive or negative single-winner residual becomes a position-level `quote_repair` plan instead of halting every pair. The dashboard shows all four terminal P&Ls and the maximum modeled loss. The bot does not yet place a top-up or trim merely because one leg is smaller: it must first obtain fresh executable quotes and prove the proposed repair improves the complete portfolio. If either venue's fill is unknown or pending, global halt remains appropriate; determine the exact exposure and neutralize it manually if necessary.
-6. Use a new `--live-state` only after every old exposure is accounted for on both venues.
-
-Example after fully completed manual recovery:
+First inspect the state and both real wallets. Then, if the recorded identities
+are correct, run the explicit recovery command:
 
 ```bash
-pnpm bot:short-window:live -- \
-  --live-state=logs/live-state-after-manual-recovery.json
+pnpm recover:live --maximum-repair-loss-usd=1 --maximum-slippage-bps=100
 ```
 
-A new state file does not close or forget positions on-chain; it only tells the new process that it is not managing the old exposure.
+This command is **not read-only**. It re-observes both legs and may buy or sell a
+Polymarket FOK only when the resulting repair is within both bounds. If costs or
+identities remain unknown, it leaves the position for manual reconciliation.
 
-## Common messages
+Live mode automatically handles supported settlement. To manually retry
+Polymarket redemption for markets still present in state:
 
-- `ENTRY_CUTOFF_REACHED`: fewer than 30 seconds remain, so the bot correctly refuses a new position.
-- `ENTRY_PREFLIGHT_COOLDOWN`: a recent exact-quote or venue preflight failed; the affected pair is waiting for its short classified retry delay.
-- `POST_FILL_HEDGE_LOSS_LIMIT_EXCEEDED`: one venue already filled, but the available Jupiter hedge exceeded both `--maximum-emergency-hedge-loss-usd` and the already-at-risk Polymarket entry cost; the bot attempts the supported first-leg unwind and otherwise halts with the reconciled exposure.
-- No candidates: displayed raw asks may cease to qualify after taker fees, minimum collateral, exact Swap pricing, available depth, or the configured profit floors.
-- Port `3210` already occupied: another scanner/live bot may be running. Inspect it before choosing another port; never bypass the live lock to run two bots against the same state.
-- Degen price WebSocket repeatedly disconnects: the client reconnects automatically. Live execution still requires a fresh authenticated rolling build; the socket is only an indicative size selector. If Jupiter has moved its public frontend service, set `JUPITER_PREDICTION_PRICE_WEBSOCKET_URL` only after verifying the replacement endpoint and payload schema.
+```bash
+pnpm redeem:polymarket
+```
 
-For the detailed execution and recovery model, read [docs/LIVE_TRADING.md](docs/LIVE_TRADING.md). For market qualification, fee handling, and record formats, read [docs/SHORT_WINDOW_MONITOR.md](docs/SHORT_WINDOW_MONITOR.md).
+Or target one market already present in the durable state:
+
+```bash
+pnpm redeem:polymarket --market-id=MARKET_ID
+```
+
+Redemption sends a gasless relayer transaction.
+An arbitrary market ID outside the state is refused because its payout could
+not be attached to an entry or included safely in realized P&L.
+
+Automatic settlement records realized P&L from confirmed wallet credits. A
+confirmed Polymarket redemption is saved as pending before credit observation,
+so a restart rechecks that transaction instead of submitting the redemption
+again. Jupiter claim accounting likewise uses the confirmed owned-USDC credit,
+not the API's pre-transaction payout estimate.
+
+## Common failures
+
+- `401 Unauthorized`: the key lacks Prediction product access or is invalid;
+  enable it in the Jupiter portal. The 10 RPS plan alone does not grant access.
+- `429`: another process may share the same key, or the upstream bucket is
+  tighter than expected. This process already spaces the shared bucket at
+  100 ms.
+- `ENTRY_CUTOFF`: fewer than 30 seconds remain; no new entry is allowed.
+- `JUPITER_BUILD_EXPIRED`: local preparation plus the reserved 10 RPS execution
+  slot cannot fit inside the 500 ms freshness ceiling; the transaction is
+  discarded, never submitted stale.
+- `VENUE_MINIMUM_REJECTED`: exact price/quantity fell below Jupiter Prediction,
+  Swap routing, or Polymarket's current minimum.
+- stale Polymarket feed: the WebSocket reconnects automatically and the REST
+  fallback refreshes every five seconds; stale data cannot arm entry.
+- port `3210` in use: another scanner/live process is running. Do not evade this
+  protection for the same wallets/state.
+
+For the risk model, see [docs/LIVE_TRADING.md](docs/LIVE_TRADING.md). For the Rust
+crate layout, see [rust/README.md](rust/README.md).

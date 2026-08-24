@@ -136,7 +136,13 @@ Evaluate both directions and solve for the largest safe `q` using full depth. Ju
 
 ## Proposed architecture
 
-Use a TypeScript/Node.js service for the MVP because both venues document JavaScript/TypeScript transaction flows and the critical latency is network/exchange latency. Revisit Rust only after measurement shows runtime overhead is material.
+The original MVP used TypeScript/Node.js. The production short-window scanner,
+execution coordinator, venue adapters, state, reconciliation and settlement are
+now Rust; TypeScript remains for historical discovery/regression tests and the
+browser dashboard remains JavaScript. Network and venue latency still dominate,
+so the runtime also relies on WebSocket discovery, pooled clients and prepared
+concurrent submission rather than expecting a language rewrite alone to improve
+fills.
 
 ```text
 market discovery
