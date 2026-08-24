@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  assertPolymarketBuyLimitOrder,
   assertPolymarketMarketableBuyMinimum,
   assertPolymarketMarketOrderPrecision,
 } from "../src/trading.ts";
@@ -29,5 +30,32 @@ test("Polymarket marketable BUY rejects collateral below one dollar before submi
   assert.throws(
     () => assertPolymarketMarketableBuyMinimum(990_000n),
     /below the \$1 minimum/,
+  );
+});
+
+test("Polymarket BUY limit accepts tick-dependent maker precision and exact two-decimal shares", () => {
+  assert.doesNotThrow(() => assertPolymarketBuyLimitOrder(
+    { makerAmount: "12358000", takerAmount: "61790000" },
+    61_790_000n,
+    200_000n,
+  ));
+});
+
+test("Polymarket BUY limit rejects changed shares or spend above its price ceiling", () => {
+  assert.throws(
+    () => assertPolymarketBuyLimitOrder(
+      { makerAmount: "12358000", takerAmount: "61780000" },
+      61_790_000n,
+      200_000n,
+    ),
+    /changed the BUY limit share quantity/,
+  );
+  assert.throws(
+    () => assertPolymarketBuyLimitOrder(
+      { makerAmount: "12358001", takerAmount: "61790000" },
+      61_790_000n,
+      200_000n,
+    ),
+    /above the configured maximum price/,
   );
 });

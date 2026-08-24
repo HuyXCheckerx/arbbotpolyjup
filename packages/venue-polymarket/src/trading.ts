@@ -9,7 +9,13 @@ import {
 import { fetchBalanceAllowance, fetchTickSize, updateBalanceAllowance } from "@polymarket/client/actions";
 import { privateKey } from "@polymarket/client/viem";
 
-import { formatContracts, formatUsd, parseContracts, parseUsd } from "../../domain/src/fixed.ts";
+import {
+  ONE_CONTRACT_MICRO,
+  formatContracts,
+  formatUsd,
+  parseContracts,
+  parseUsd,
+} from "../../domain/src/fixed.ts";
 import type { BookLevel } from "../../domain/src/types.ts";
 
 type OfficialSecureClient = Awaited<ReturnType<typeof createSecureClient>>;
@@ -214,7 +220,11 @@ export class PolymarketLiveExecutor {
       postOnly: false,
     });
     const signedOrder: OfficialSignedOrder = { ...limitOrder, orderType: OrderType.FOK, postOnly: false };
-    assertPolymarketMarketOrderPrecision(signedOrder);
+    assertPolymarketBuyLimitOrder(
+      signedOrder,
+      input.contractsMicro,
+      maximumLimitPriceMicroUsd,
+    );
     return { kind: "buy", signedOrder };
   }
 
@@ -325,6 +335,32 @@ export function assertPolymarketMarketOrderPrecision(
   const takerAmount = BigInt(order.takerAmount);
   if (makerAmount % 10_000n !== 0n || takerAmount % 100n !== 0n) {
     throw new Error("Polymarket SDK produced a market order outside the CLOB 2/4-decimal amount limits");
+  }
+}
+
+export function assertPolymarketBuyLimitOrder(
+  order: Pick<OfficialSignedOrder, "makerAmount" | "takerAmount">,
+  requestedContractsMicro: bigint,
+  maximumPriceMicroUsd: bigint,
+): void {
+  const makerAmount = BigInt(order.makerAmount);
+  const takerAmount = BigInt(order.takerAmount);
+  if (requestedContractsMicro <= 0n || maximumPriceMicroUsd <= 0n || makerAmount <= 0n || takerAmount <= 0n) {
+    throw new Error("Polymarket SDK produced a non-positive BUY limit order");
+  }
+  if (takerAmount !== requestedContractsMicro) {
+    throw new Error(
+      `Polymarket SDK changed the BUY limit share quantity from ` +
+      `${formatContracts(requestedContractsMicro)} to ${formatContracts(takerAmount)}`,
+    );
+  }
+  const maximumMakerAmount = (
+    maximumPriceMicroUsd * requestedContractsMicro + ONE_CONTRACT_MICRO - 1n
+  ) / ONE_CONTRACT_MICRO;
+  if (makerAmount > maximumMakerAmount) {
+    throw new Error(
+      `Polymarket SDK produced a BUY limit maker amount above the configured maximum price`,
+    );
   }
 }
 

@@ -842,9 +842,9 @@ export class ShortWindowLiveTrader {
         freshPolymarketBook.asks,
         this.#config.polymarketDepthHaircutBps,
       );
-      // Marketable Polymarket BUYs permit four share decimals. Hedge only that
-      // executable precision; the sub-0.0001 Jupiter remainder is well below
-      // the explicit one-cent cross-venue tolerance.
+      // The official Polymarket limit-order SDK signs share size to two
+      // decimals. Hedge only that executable precision; the sub-0.01 Jupiter
+      // remainder remains below the explicit one-cent cross-venue tolerance.
       const polymarketContractsMicro = floorToPolymarketSharePrecision(
         guaranteedJupiterOutputContracts(build),
       );
@@ -955,12 +955,12 @@ export class ShortWindowLiveTrader {
     position.remainingEntryCostMicroUsd = position.polymarketEntryCostMicroUsd;
     await this.#save();
 
-    // A Polymarket BUY spends an exact dollar amount, so price improvement can
-    // produce more shares than its indicative target. Use the already-signed
-    // exact Jupiter build when it is still fresh and within the bounded size
-    // mismatch. Otherwise requote from the observed fill. This normally leaves
-    // only /execute on the post-fill critical path without reviving stale-build
-    // slippage failures.
+    // The Polymarket FOK targets an exact two-decimal share quantity; price
+    // improvement reduces spend instead of increasing exposure. Use the
+    // already-signed Jupiter build when it is still fresh and matches the
+    // observed fill. Otherwise requote from the observed fill. This normally
+    // leaves only /execute on the post-fill critical path without reviving
+    // stale-build slippage failures.
     let jupiterResult: PromiseSettledResult<SubmittedJupiterOrder>;
     let jupiterSubmissionAttempted = false;
     let jupiterSigned = preparedJupiter !== null;
@@ -2424,7 +2424,7 @@ function tradeGross(priceMicroUsd: bigint, quantityMicro: bigint): bigint {
 }
 
 function floorToPolymarketSharePrecision(quantityMicro: bigint): bigint {
-  return quantityMicro / 100n * 100n;
+  return quantityMicro / 10_000n * 10_000n;
 }
 
 function guaranteedJupiterOutputContracts(build: JupiterPredictionOrderBuild): bigint {

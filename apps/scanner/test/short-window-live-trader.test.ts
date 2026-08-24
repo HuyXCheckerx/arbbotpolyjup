@@ -414,6 +414,7 @@ test("live trader reprices the exact Jupiter quote against Polymarket multi-leve
   assert.equal(polymarket.preparedBuy?.maximumPriceMicroUsd, 350_000n);
   assert.equal((polymarket.preparedBuy?.maximumPriceMicroUsd ?? 1n) % 10_000n, 0n);
   assert.ok((polymarket.preparedBuy?.contractsMicro ?? 0n) > 0n);
+  assert.equal((polymarket.preparedBuy?.contractsMicro ?? 1n) % 10_000n, 0n);
   assert.equal(
     polymarket.preparedBuy?.contractsMicro,
     decision.type === "entry" ? decision.position.originalContractsMicro : null,
