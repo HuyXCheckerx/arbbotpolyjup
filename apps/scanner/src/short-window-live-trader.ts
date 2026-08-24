@@ -195,6 +195,7 @@ export interface LivePosition {
   entrySubmissionSkewMs: number | null;
   exitSubmissionSkewMs: number | null;
   diagnosticTestEntry: boolean;
+  entryZeroExposureProof?: "polymarket_fok_killed_before_jupiter_submission" | null;
   postFillRiskPlan?: LivePostFillRiskPlan | null;
   lastError: string | null;
   settlementError?: string | null;
@@ -434,6 +435,7 @@ export class ShortWindowLiveTrader {
       position.entrySubmissionSkewMs ??= null;
       position.exitSubmissionSkewMs ??= null;
       position.diagnosticTestEntry ??= false;
+      position.entryZeroExposureProof ??= null;
       position.postFillRiskPlan ??= null;
       if (position.phase === "exposure_error" &&
         isKnownTerminalOneSidedEntry(position) &&
@@ -1153,6 +1155,7 @@ export class ShortWindowLiveTrader {
       entrySubmissionSkewMs: null,
       exitSubmissionSkewMs: null,
       diagnosticTestEntry: forcedTestEntry,
+      entryZeroExposureProof: null,
       lastError: null,
       settlementError: null,
     };
@@ -1348,8 +1351,19 @@ export class ShortWindowLiveTrader {
         isTerminalJupiterExecutionRejection(jupiterResult) &&
         isTerminalZeroFillPolymarketResult(polymarketResult)) {
         position.lastError = reason;
+        if (!jupiterSubmissionAttempted) {
+          position.entryZeroExposureProof = "polymarket_fok_killed_before_jupiter_submission";
+        }
         await this.#save();
-        const recovery = await this.#recoverZeroExposureEntry(position, "entry_execution", reason);
+        const recovery = !jupiterSubmissionAttempted
+          ? await this.#completeZeroExposureRecovery(
+              position,
+              "entry_execution",
+              reason,
+              observedPolymarket,
+              0n,
+            )
+          : await this.#recoverZeroExposureEntry(position, "entry_execution", reason);
         if (recovery) {
           return {
             type: "recovery",
@@ -2061,11 +2075,10 @@ export class ShortWindowLiveTrader {
     const recoveries: LiveRecoveryDiagnostics[] = [];
     for (const position of [...this.#state.positions]) {
       if (!isPersistedZeroExposureEntryRecoveryCandidate(position, Date.now())) continue;
-      const recovery = await this.#recoverZeroExposureEntry(
-        position,
-        source,
-        position.lastError ?? "terminal concurrent-entry failure",
-      );
+      const reason = position.lastError ?? "terminal concurrent-entry failure";
+      const recovery = isDefinitiveNoSubmissionZeroExposure(position)
+        ? await this.#completeZeroExposureRecovery(position, source, reason, 0n, 0n)
+        : await this.#recoverZeroExposureEntry(position, source, reason);
       if (recovery) recoveries.push(recovery);
     }
     return recoveries;
@@ -2176,55 +2189,100 @@ export class ShortWindowLiveTrader {
       if (jupiterPosition.positionPubkey !== position.jupiterPositionPubkey ||
         jupiterPosition.marketId !== position.pair.jupiterMarketId ||
         jupiterPosition.isYes !== expectedJupiterIsYes(position.pair)) {
+        position.lastError = zeroExposureReconciliationError(
+          reason,
+          "IDENTITY_MISMATCH",
+          `expected position=${position.jupiterPositionPubkey} market=${position.pair.jupiterMarketId} ` +
+          `isYes=${expectedJupiterIsYes(position.pair)}, observed position=${jupiterPosition.positionPubkey} ` +
+          `market=${jupiterPosition.marketId} isYes=${jupiterPosition.isYes}`,
+        );
+        this.#lastAction = `RECOVERY BLOCKED ${position.pair.duration}: ${position.lastError}`;
+        await this.#save();
         return null;
       }
       if (polymarketContractsMicro > CONTRACT_TOLERANCE_MICRO ||
         jupiterPosition.contractsMicro > CONTRACT_TOLERANCE_MICRO) {
+        position.lastError = zeroExposureReconciliationError(
+          reason,
+          "FOUND_BALANCE",
+          `Polymarket=${formatContracts(polymarketContractsMicro)}, ` +
+          `Jupiter=${formatContracts(jupiterPosition.contractsMicro)}`,
+        );
+        this.#lastAction = `RECOVERY BLOCKED ${position.pair.duration}: ${position.lastError}`;
+        await this.#save();
         return null;
       }
-      const recovery: LiveRecoveryDiagnostics = {
-        code: "ZERO_EXPOSURE_CONFIRMED_AFTER_TERMINAL_ENTRY_FAILURE",
+      return await this.#completeZeroExposureRecovery(
+        position,
         source,
-        recoveredAtMs: Date.now(),
-        positionId: position.id,
-        pairKey: position.pair.key,
-        duration: position.pair.duration,
         reason,
-        observedPolymarketContractsMicro: polymarketContractsMicro,
-        observedJupiterContractsMicro: jupiterPosition.contractsMicro,
-      };
-      this.#state.positions = this.#state.positions.filter((candidate) => candidate.id !== position.id);
-      // Zero exposure is not a completed trade. The old behavior permanently
-      // suppressed every later opportunity in the same still-open round via
-      // PAIR_ALREADY_TRADED. Retain the one-shot diagnostic guard separately,
-      // and let normal live trading retry after a short market-change cooldown.
-      if (source === "entry_execution" && !this.#config.forceOneEntry &&
-        Date.now() < position.pair.endMs - ENTRY_CUTOFF_MS) {
-        this.#entryPreflightCooldowns.set(position.pair.key, {
-          untilMs: Date.now() + MARKET_CHANGE_COOLDOWN_MS,
-          stage: "complete",
-          code: "ZERO_EXPOSURE_TERMINAL_ENTRY_RETRY",
-        });
-      }
-      const remainingAmbiguous = this.#state.positions.find((candidate) =>
-        !isManagedKnownPosition(candidate)
+        polymarketContractsMicro,
+        jupiterPosition.contractsMicro,
       );
-      if (!remainingAmbiguous) {
-        this.#state.halted = false;
-        this.#state.haltReason = null;
-      }
-      this.#lastAction = `AUTO RECOVERY ${position.pair.duration}: terminal entry failure confirmed zero exposure ` +
-        `on both venues; ${position.id} was cleared` +
-        (Date.now() < position.pair.endMs - ENTRY_CUTOFF_MS && !this.#config.forceOneEntry
-          ? " and the still-open pair may retry after cooldown."
-          : ".");
-      await this.#save();
-      return recovery;
-    } catch {
+    } catch (error) {
       // Recovery is fail-closed. A later runtime pass can retry read-only
       // balance confirmation; no order is ever placed by this path.
+      position.lastError = zeroExposureReconciliationError(
+        reason,
+        "READ_FAILED",
+        errorMessage(error),
+      );
+      this.#lastAction = `RECOVERY RETRY ${position.pair.duration}: ${position.lastError}`;
+      await this.#save().catch(() => undefined);
       return null;
     }
+  }
+
+  async #completeZeroExposureRecovery(
+    position: LivePosition,
+    source: LiveRecoverySource,
+    reason: string,
+    observedPolymarketContractsMicro: bigint,
+    observedJupiterContractsMicro: bigint,
+  ): Promise<LiveRecoveryDiagnostics | null> {
+    if (!hasZeroRecordedEntryExposure(position) ||
+      observedPolymarketContractsMicro > CONTRACT_TOLERANCE_MICRO ||
+      observedJupiterContractsMicro > CONTRACT_TOLERANCE_MICRO) {
+      return null;
+    }
+    const recovery: LiveRecoveryDiagnostics = {
+      code: "ZERO_EXPOSURE_CONFIRMED_AFTER_TERMINAL_ENTRY_FAILURE",
+      source,
+      recoveredAtMs: Date.now(),
+      positionId: position.id,
+      pairKey: position.pair.key,
+      duration: position.pair.duration,
+      reason,
+      observedPolymarketContractsMicro,
+      observedJupiterContractsMicro,
+    };
+    this.#state.positions = this.#state.positions.filter((candidate) => candidate.id !== position.id);
+    // Zero exposure is not a completed trade. The old behavior permanently
+    // suppressed every later opportunity in the same still-open round via
+    // PAIR_ALREADY_TRADED. Retain the one-shot diagnostic guard separately,
+    // and let normal live trading retry after a short market-change cooldown.
+    if (source === "entry_execution" && !this.#config.forceOneEntry &&
+      Date.now() < position.pair.endMs - ENTRY_CUTOFF_MS) {
+      this.#entryPreflightCooldowns.set(position.pair.key, {
+        untilMs: Date.now() + MARKET_CHANGE_COOLDOWN_MS,
+        stage: "complete",
+        code: "ZERO_EXPOSURE_TERMINAL_ENTRY_RETRY",
+      });
+    }
+    const remainingAmbiguous = this.#state.positions.find((candidate) =>
+      !isManagedKnownPosition(candidate)
+    );
+    if (!remainingAmbiguous) {
+      this.#state.halted = false;
+      this.#state.haltReason = null;
+    }
+    this.#lastAction = `AUTO RECOVERY ${position.pair.duration}: terminal entry failure confirmed zero exposure ` +
+      `on both venues; ${position.id} was cleared` +
+      (Date.now() < position.pair.endMs - ENTRY_CUTOFF_MS && !this.#config.forceOneEntry
+        ? " and the still-open pair may retry after cooldown."
+        : ".");
+    await this.#save();
+    return recovery;
   }
 
   async #halt(position: LivePosition, reason: string): Promise<LiveDecision> {
@@ -2592,12 +2650,38 @@ function hasZeroRecordedEntryExposure(position: LivePosition): boolean {
 }
 
 function isPersistedZeroExposureEntryRecoveryCandidate(position: LivePosition, atMs: number): boolean {
+  if (position.phase !== "exposure_error" || !hasZeroRecordedEntryExposure(position)) return false;
+  // A killed Polymarket FOK plus a Jupiter submission that was never attempted
+  // is already a complete proof of zero new exposure. It is safe to clear
+  // immediately, including on restart before the market closes.
+  if (isDefinitiveNoSubmissionZeroExposure(position)) return true;
   // Once the market has closed, an unfilled keeper order can no longer create
   // late exposure. The recovery pass still verifies both real token balances
   // before clearing the halt, so this safely covers standard POLY-* orders as
   // well as terminal Forecast Swap failures.
-  return position.phase === "exposure_error" && atMs >= position.pair.endMs &&
-    hasZeroRecordedEntryExposure(position);
+  return atMs >= position.pair.endMs;
+}
+
+function isDefinitiveNoSubmissionZeroExposure(position: LivePosition): boolean {
+  if (!hasZeroRecordedEntryExposure(position)) return false;
+  if (position.entryZeroExposureProof === "polymarket_fok_killed_before_jupiter_submission") {
+    return true;
+  }
+  // Backward-compatible inference for state files written before the
+  // structured proof field existed. This exact message is produced only by
+  // JupiterSubmissionSkippedError before submitPreparedAndWait is called.
+  return position.lastError?.toLowerCase().includes(
+    "jupiter submission skipped because polymarket did not fill first",
+  ) === true;
+}
+
+function zeroExposureReconciliationError(
+  reason: string,
+  code: "IDENTITY_MISMATCH" | "FOUND_BALANCE" | "READ_FAILED",
+  detail: string,
+): string {
+  const [baseReason] = reason.split("; ZERO_EXPOSURE_RECONCILIATION_", 1);
+  return `${baseReason ?? reason}; ZERO_EXPOSURE_RECONCILIATION_${code}: ${detail}`;
 }
 
 function isTerminalJupiterExecutionRejection(

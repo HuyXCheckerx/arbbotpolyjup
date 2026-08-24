@@ -42,7 +42,8 @@ Execution outcomes are handled separately from resolution outcomes:
 
 | Confirmed execution state | Action | Reason |
 |---|---|---|
-| Zero contracts on both venues | Clear the attempt and retry after cooldown when time permits | There is no exposure to repair |
+| Polymarket FOK killed and Jupiter submission never attempted | Clear immediately and retry after cooldown when time permits | The killed FOK plus non-submission is already deterministic proof of zero new exposure; no Jupiter position RPC may turn it into a false halt |
+| Zero contracts after a Jupiter submission was attempted | Clear only after balance/identity reconciliation | A submitted or ambiguous transaction can land despite a transport failure |
 | Polymarket-only fill | Attempt the existing protected FOK unwind; halt if the unwind result or remaining balance is uncertain | A blind Jupiter catch-up can lock in a larger loss, and an ambiguous sell can hide residual exposure |
 | Jupiter-only fill with confirmed zero Polymarket balance | Isolate as `quote_repair` | Exact exposure is known, but an opposite-leg quote or Jupiter unwind is needed before acting |
 | Both fills, size/cost floors pass | Normal hold/exit management | Intended single-winner economics remain acceptable, with four-state basis risk still reported |

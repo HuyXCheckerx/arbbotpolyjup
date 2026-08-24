@@ -831,6 +831,7 @@ test("terminal zero-fill entry failures recover and can retry the still-open pai
     "Jupiter Forecast Swap execution failed (6001): Slippage tolerance exceeded",
   );
   jupiter.positionContractsMicro = 0n;
+  jupiter.getPositionError = new Error("position RPC must not gate deterministic no-submission recovery");
   const polymarket = new MockPolymarket(events);
   polymarket.buyRejectionError = new PolymarketFokSubmissionError(
     "FOK_NOT_FILLED",
@@ -872,6 +873,7 @@ test("terminal zero-fill entry failures recover and can retry the still-open pai
   assert.equal(decision.execution?.jupiter.submissionAttempted, false);
   assert.equal(decision.execution?.jupiter.signed, true);
   assert.equal(decision.execution?.jupiter.transactionSignature, null);
+  assert.equal(events.includes("jupiter:get-position"), false);
   assert.equal(trader.snapshot().halted, false);
   assert.equal(trader.snapshot().openPositions, 0);
   const persisted = await loadLiveState(statePath);
@@ -1141,7 +1143,7 @@ test("an emergency Jupiter hedge is submitted but never reported as a profitable
   assert.equal(trader.snapshot().halted, false);
 });
 
-test("terminal entry failure remains halted when balance reconciliation finds exposure", async () => {
+test("a pre-existing Jupiter balance cannot turn a never-submitted entry into new exposure", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-nonzero-entry-recovery-"));
   const events: string[] = [];
   const jupiter = new MockJupiter(events);
@@ -1177,9 +1179,11 @@ test("terminal entry failure remains halted when balance reconciliation finds ex
     atMs: 1_000,
   });
 
-  assert.equal(decision.type, "halt");
-  assert.equal(trader.snapshot().halted, true);
-  assert.equal(trader.snapshot().openPositions, 1);
+  assert.equal(decision.type, "recovery");
+  assert.equal(decision.execution?.jupiter.submissionAttempted, false);
+  assert.equal(events.includes("jupiter:get-position"), false);
+  assert.equal(trader.snapshot().halted, false);
+  assert.equal(trader.snapshot().openPositions, 0);
 });
 
 test("persisted terminal Jupiter failure auto-recovers after close when both token balances are zero", async () => {
@@ -1223,6 +1227,70 @@ test("persisted terminal Jupiter failure auto-recovers after close when both tok
   assert.equal(recoveries[0]?.code, "ZERO_EXPOSURE_CONFIRMED_AFTER_TERMINAL_ENTRY_FAILURE");
   assert.equal(restarted.snapshot().halted, false);
   assert.equal(restarted.snapshot().openPositions, 0);
+  assert.deepEqual((await loadLiveState(statePath)).positions, []);
+});
+
+test("startup immediately clears a legacy killed-FOK state when Jupiter was never submitted", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-startup-no-submit-recovery-"));
+  const statePath = join(directory, "state.json");
+  const nowMs = Date.now();
+  const identity = {
+    ...pair("UP", "DOWN"),
+    key: "15m:killed-fok-before-jupiter",
+    startMs: nowMs - 60_000,
+    endMs: nowMs + 600_000,
+  };
+  const reason = "Sequential entry left Jupiter execution unresolved; Polymarket observed 0 contracts: " +
+    "Jupiter submission skipped because Polymarket did not fill first: Polymarket FOK buy rejected " +
+    "(400): order couldn't be fully filled. FOK orders are fully filled or killed.";
+  await saveLiveState(statePath, {
+    schemaVersion: 1,
+    accountingVersion: 2,
+    sequence: 1,
+    halted: true,
+    haltReason: reason,
+    realizedProfitMicroUsd: 0n,
+    polymarketCashMicroUsd: 75_000_000n,
+    jupiterCashMicroUsd: 93_000_000n,
+    forcedEntrySubmissionAttempted: false,
+    completedPairs: [],
+    positions: [{
+      id: "live-1",
+      pair: identity,
+      phase: "exposure_error",
+      enteredAtMs: nowMs - 1_000,
+      jupiterOrderPubkey: null,
+      jupiterPositionPubkey: "swap-v2:jup-down:down-mint",
+      jupiterContractsMicro: 0n,
+      polymarketContractsMicro: 0n,
+      jupiterEntryCostMicroUsd: 0n,
+      polymarketEntryCostMicroUsd: 0n,
+      remainingEntryCostMicroUsd: 0n,
+      originalContractsMicro: 0n,
+      realizedProfitMicroUsd: 0n,
+      polymarketSettled: false,
+      jupiterSettled: false,
+      polymarketSettlementPayoutMicroUsd: 0n,
+      jupiterSettlementPayoutMicroUsd: 0n,
+      entrySubmissionSkewMs: null,
+      exitSubmissionSkewMs: null,
+      diagnosticTestEntry: false,
+      lastError: reason,
+    }],
+  });
+  const events: string[] = [];
+  const jupiter = new MockJupiter(events);
+  jupiter.getPositionError = new Error("legacy deterministic recovery must not query Jupiter");
+  const trader = createTrader(jupiter, new MockPolymarket(events), statePath);
+
+  await trader.initialize();
+
+  const recoveries = trader.drainRecoveryDiagnostics();
+  assert.equal(recoveries.length, 1);
+  assert.equal(recoveries[0]?.source, "startup");
+  assert.equal(events.includes("jupiter:get-position"), false);
+  assert.equal(trader.snapshot().halted, false);
+  assert.equal(trader.snapshot().openPositions, 0);
   assert.deepEqual((await loadLiveState(statePath)).positions, []);
 });
 
@@ -2000,6 +2068,7 @@ class MockJupiter implements LiveJupiterGateway {
   prepareBuyFailuresAfterFirst = 0;
   submitError: Error | null = null;
   submitFailuresRemaining: number | null = null;
+  getPositionError: Error | null = null;
   positionContractsMicro: bigint | null = null;
   claimPayoutMicroUsd: bigint | null = null;
   reclaimedLamports = 2_074_080n;
@@ -2109,6 +2178,8 @@ class MockJupiter implements LiveJupiterGateway {
   }
 
   async getPosition(positionPubkey: string): Promise<JupiterPredictionPosition> {
+    this.#events.push("jupiter:get-position");
+    if (this.getPositionError) throw this.getPositionError;
     return {
       positionPubkey,
       marketId: this.#lastBuild?.order.marketId ?? "jup-down",
