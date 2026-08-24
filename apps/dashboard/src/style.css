@@ -272,10 +272,15 @@ body {
   gap: 10px;
 }
 
-/* Position Hedge Status Styles: Green (Perfect) vs Red (Bad/Imbalanced) */
+/* Position hedge status: exact, bounded two-sided residual, or unsafe exposure. */
 .position-card.hedged-perfect {
   border-color: var(--green-border);
   background: linear-gradient(180deg, rgba(16, 185, 129, 0.06) 0%, rgba(22, 26, 34, 0.9) 100%);
+}
+
+.position-card.hedged-residual {
+  border-color: var(--amber-border);
+  background: linear-gradient(180deg, rgba(245, 158, 11, 0.06) 0%, rgba(22, 26, 34, 0.9) 100%);
 }
 
 .position-card.hedged-bad {
@@ -324,6 +329,12 @@ body {
   background: var(--red-bg);
   color: var(--red);
   border: 1px solid var(--red-border);
+}
+
+.hedge-badge.amber {
+  background: var(--amber-bg);
+  color: var(--amber);
+  border: 1px solid var(--amber-border);
 }
 
 .pos-legs-grid {
@@ -379,6 +390,8 @@ body {
 .pos-bottom-row {
   display: flex;
   justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
   align-items: center;
   font-size: 10px;
   padding-top: 6px;

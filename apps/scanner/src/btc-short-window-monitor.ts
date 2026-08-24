@@ -69,6 +69,8 @@ import {
 import {
   buildJupiterAtomicQuoteBook,
   buildJupiterForecastOrderBook,
+  initialJupiterRollingQuoteGross,
+  jupiterRollingQuoteRetryDelayMs,
   JupiterRollingAtomicQuoteBookState,
   JupiterPredictionPriceBookState,
   type JupiterBuyQuoteGateway,
@@ -626,6 +628,12 @@ async function main(): Promise<void> {
             : "prediction_api_minimum_5_usd"
           : null,
         maximumJupiterSubmissionQuoteAgeMs: liveTrade ? maximumJupiterSubmissionQuoteAgeMs : null,
+        jupiterInitialExecutableQuoteUsd: liveTrade
+          ? formatUsd(initialJupiterRollingQuoteGross(
+              strategyConfiguration.jupiterMinimumGrossOrderMicroUsd,
+              jupiterQuoteGrossMicroUsd,
+            ))
+          : null,
         jupiterRequestIntervalMs: liveTrade ? jupiterRequestIntervalMs : null,
         maximumEmergencyHedgeLossUsd: liveTrade ? formatUsd(maximumEmergencyHedgeLossMicroUsd) : null,
         minimumEntryEdgeUsdPerContract: formatUsd(minimumEntryEdgePerContractMicroUsd),
@@ -1412,10 +1420,13 @@ async function monitorQualifiedPair(input: {
   const rollingQuoteGross = new Map<ShortWindowOutcome, bigint>();
   const indicativeQuoteGross = new Map<ShortWindowOutcome, bigint>();
   const outcomes = [...new Set(input.routes.map((route) => route.jupiterOutcome))];
-  const exactQuotedOutcomes = new Set<ShortWindowOutcome>();
+  const initialRollingQuoteGrossMicroUsd = initialJupiterRollingQuoteGross(
+    input.configuration.strategy.jupiterMinimumGrossOrderMicroUsd,
+    input.configuration.jupiterFallbackGrossMicroUsd,
+  );
   for (const outcome of outcomes) {
-    rollingQuoteGross.set(outcome, input.configuration.jupiterFallbackGrossMicroUsd);
-    indicativeQuoteGross.set(outcome, input.configuration.jupiterFallbackGrossMicroUsd);
+    rollingQuoteGross.set(outcome, initialRollingQuoteGrossMicroUsd);
+    indicativeQuoteGross.set(outcome, initialRollingQuoteGrossMicroUsd);
   }
   let samples = 0;
   let opportunities = 0;
@@ -1448,7 +1459,7 @@ async function monitorQualifiedPair(input: {
     acceptsEntryQuotes: () => input.liveTrader?.acceptsEntryQuotes(pairKey(input.pair)) ?? false,
     quoteGateway: input.jupiterQuoteGateway,
     quoteGrossMicroUsd: (outcome) =>
-      rollingQuoteGross.get(outcome) ?? input.configuration.jupiterFallbackGrossMicroUsd,
+      rollingQuoteGross.get(outcome) ?? initialRollingQuoteGrossMicroUsd,
     fallbackGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
     maximumQuoteAgeMs: input.configuration.maximumReusableJupiterQuoteAgeMs,
     intervalMs: input.configuration.jupiterPollMs,
@@ -1539,7 +1550,6 @@ async function monitorQualifiedPair(input: {
             maximumGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
             rollingQuoteGross,
             indicativeQuoteGross,
-            exactQuotedOutcomes,
             exact: false,
           });
         }
@@ -1561,7 +1571,6 @@ async function monitorQualifiedPair(input: {
             maximumGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
             rollingQuoteGross,
             indicativeQuoteGross,
-            exactQuotedOutcomes,
             exact: false,
           });
         }
@@ -1569,7 +1578,6 @@ async function monitorQualifiedPair(input: {
         latestJupiter = event.book;
         latestJupiterBuilds = event.entryBuilds ?? new Map();
         latestJupiterBuildAtMs = event.entryBuildAtMs ?? new Map();
-        for (const outcome of latestJupiterBuilds.keys()) exactQuotedOutcomes.add(outcome);
         const ageMs = Math.max(0, Date.now() - latestJupiter.receivedAtMs);
         input.statusStore.updateBook(
           input.pair.duration,
@@ -1588,7 +1596,6 @@ async function monitorQualifiedPair(input: {
           maximumGrossMicroUsd: input.configuration.jupiterFallbackGrossMicroUsd,
           rollingQuoteGross,
           indicativeQuoteGross,
-          exactQuotedOutcomes,
           exact: true,
         });
       }
@@ -2004,17 +2011,25 @@ async function pollJupiterOrderBook(input: {
     });
     const nextSequence = new Map<ShortWindowOutcome, number>();
     const consecutiveErrors = new Map<ShortWindowOutcome, number>();
+    const successfullyQuotedOutcomes = new Set<ShortWindowOutcome>();
     // One selected route gets three overlapping lanes. Any-route mode gets two
     // per outcome. Across 5m and 15m this is enough concurrency to fill the
     // shared 8-RPS scheduler even when an individual build takes ~700ms.
     const lanesPerOutcome = outcomes.length === 1 ? 3 : 2;
     await Promise.all(outcomes.flatMap((outcome) =>
-      Array.from({ length: lanesPerOutcome }, () => quoteLane(outcome))
+      Array.from({ length: lanesPerOutcome }, (_, lane) => quoteLane(outcome, lane))
     ));
 
-    async function quoteLane(outcome: ShortWindowOutcome): Promise<void> {
+    async function quoteLane(outcome: ShortWindowOutcome, lane: number): Promise<void> {
       while (!input.signal.aborted) {
         if (input.needsExitBook() || !input.acceptsEntryQuotes()) {
+          await waitForAbort(Math.min(250, input.intervalMs), input.signal);
+          continue;
+        }
+        // Start each outcome with one conservative probe lane. Overlapping
+        // lanes activate only after the provider proves it can build that
+        // outcome, and stand down again after repeated construction failures.
+        if (lane > 0 && !successfullyQuotedOutcomes.has(outcome)) {
           await waitForAbort(Math.min(250, input.intervalMs), input.signal);
           continue;
         }
@@ -2047,6 +2062,7 @@ async function pollJupiterOrderBook(input: {
             maximumAgeMs: input.maximumQuoteAgeMs,
           });
           consecutiveErrors.set(outcome, 0);
+          successfullyQuotedOutcomes.add(outcome);
           if (!snapshot || input.signal.aborted) continue;
           input.queue.push({
             type: "jupiter_book",
@@ -2064,7 +2080,8 @@ async function pollJupiterOrderBook(input: {
           if (input.signal.aborted) break;
           const errors = (consecutiveErrors.get(outcome) ?? 0) + 1;
           consecutiveErrors.set(outcome, errors);
-          nextDelayMs = jupiterRetryDelayMs(input.intervalMs, errors);
+          if (errors >= 2) successfullyQuotedOutcomes.delete(outcome);
+          nextDelayMs = jupiterRollingQuoteRetryDelayMs(input.intervalMs, errors);
           input.queue.push({
             type: "jupiter_error",
             message: `Jupiter rolling ${outcome} atomic quote failed: ${errorMessage(error)}`,
@@ -2106,7 +2123,6 @@ function retargetRollingJupiterQuotes(input: {
   maximumGrossMicroUsd: bigint;
   rollingQuoteGross: Map<ShortWindowOutcome, bigint>;
   indicativeQuoteGross: Map<ShortWindowOutcome, bigint>;
-  exactQuotedOutcomes: ReadonlySet<ShortWindowOutcome>;
   exact: boolean;
 }): void {
   const evaluated = evaluateCrossVenueRoutes(input.polymarketBook, input.jupiterBook, input.routes);
@@ -2119,14 +2135,16 @@ function retargetRollingJupiterQuotes(input: {
       config: input.strategy,
     });
     if (!input.exact) {
-      if (!evaluation.eligible) continue;
+      if (!evaluation.eligible) {
+        input.indicativeQuoteGross.set(outcome, input.strategy.jupiterMinimumGrossOrderMicroUsd);
+        continue;
+      }
       const suggested = clampRollingQuoteGross(
         evaluation.proposal.jupiter.grossMicroUsd,
         input.strategy.jupiterMinimumGrossOrderMicroUsd,
         input.maximumGrossMicroUsd,
       );
       input.indicativeQuoteGross.set(outcome, suggested);
-      if (!input.exactQuotedOutcomes.has(outcome)) input.rollingQuoteGross.set(outcome, suggested);
       continue;
     }
 
@@ -2149,6 +2167,22 @@ function retargetRollingJupiterQuotes(input: {
         input.strategy.jupiterMinimumGrossOrderMicroUsd,
         input.maximumGrossMicroUsd,
       ));
+      continue;
+    }
+
+    if (route.isFeeAdjustedCandidate) {
+      const indicativeTarget = input.indicativeQuoteGross.get(outcome) ?? quotedGross;
+      const usedFullExecutableQuote = route.commonTopContractsMicro + 10_000n >=
+        route.jupiterAsk.contractsMicro;
+      if (usedFullExecutableQuote && indicativeTarget > quotedGross) {
+        let nextGross = quotedGross + maximumBigint(250_000n, quotedGross / 4n);
+        if (nextGross > indicativeTarget) nextGross = indicativeTarget;
+        input.rollingQuoteGross.set(outcome, clampRollingQuoteGross(
+          nextGross,
+          input.strategy.jupiterMinimumGrossOrderMicroUsd,
+          input.maximumGrossMicroUsd,
+        ));
+      }
       continue;
     }
 

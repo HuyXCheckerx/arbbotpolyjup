@@ -675,7 +675,10 @@ export class ShortWindowLiveTrader {
       polymarketCostUsd: string;
       jupiterCostUsd: string;
       totalCostUsd: string;
+      minimumAlignedPnlUsd: string;
       contractSkew: string;
+      contractSkewBps: string | null;
+      hedgeStatus: "perfect" | "bounded_residual" | "exposure_error";
       isHedged: boolean;
       polymarketSettled: boolean;
       jupiterSettled: boolean;
@@ -701,9 +704,19 @@ export class ShortWindowLiveTrader {
         const polyMicro = pos.polymarketContractsMicro;
         const jupMicro = pos.jupiterContractsMicro;
         const diffMicro = polyMicro > jupMicro ? polyMicro - jupMicro : jupMicro - polyMicro;
+        const matchedMicro = minimum(polyMicro, jupMicro);
+        const totalCostMicroUsd = pos.polymarketEntryCostMicroUsd + pos.jupiterEntryCostMicroUsd;
+        const contractSkewBps = matchedMicro > 0n ? diffMicro * 10_000n / matchedMicro : null;
         const isHedged = diffMicro <= CONTRACT_TOLERANCE_MICRO &&
           (pos.phase === "open" || pos.phase === "awaiting_resolution") &&
           !pos.lastError;
+        const isBoundedResidual = !isHedged &&
+          (pos.phase === "open" || pos.phase === "awaiting_resolution") &&
+          !pos.lastError &&
+          polyMicro > CONTRACT_TOLERANCE_MICRO &&
+          jupMicro > CONTRACT_TOLERANCE_MICRO &&
+          contractSkewBps !== null &&
+          contractSkewBps <= MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS;
         return {
           id: pos.id,
           pairKey: pos.pair.key,
@@ -720,8 +733,11 @@ export class ShortWindowLiveTrader {
           jupiterContracts: jupContracts,
           polymarketCostUsd: formatUsd(pos.polymarketEntryCostMicroUsd),
           jupiterCostUsd: formatUsd(pos.jupiterEntryCostMicroUsd),
-          totalCostUsd: formatUsd(pos.polymarketEntryCostMicroUsd + pos.jupiterEntryCostMicroUsd),
+          totalCostUsd: formatUsd(totalCostMicroUsd),
+          minimumAlignedPnlUsd: formatUsd(matchedMicro - totalCostMicroUsd),
           contractSkew: formatContracts(diffMicro),
+          contractSkewBps: contractSkewBps === null ? null : contractSkewBps.toString(),
+          hedgeStatus: isHedged ? "perfect" : isBoundedResidual ? "bounded_residual" : "exposure_error",
           isHedged,
           polymarketSettled: pos.polymarketSettled,
           jupiterSettled: pos.jupiterSettled,

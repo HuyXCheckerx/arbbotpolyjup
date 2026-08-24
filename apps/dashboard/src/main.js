@@ -109,10 +109,20 @@ function renderPositions(positions = [], awaitingCount = 0) {
 
   let html = "";
   for (const pos of positions) {
-    const isPerfect = pos.isHedged && pos.phase !== "exposure_error" && !pos.lastError;
-    const badgeClass = isPerfect ? "green" : "red";
-    const badgeLabel = isPerfect ? "✔ PERFECTLY HEDGED" : "✖ EXPOSURE IMBALANCE";
-    const cardClass = isPerfect ? "hedged-perfect" : "hedged-bad";
+    const hedgeStatus = pos.hedgeStatus || (pos.isHedged ? "perfect" : "exposure_error");
+    const isPerfect = hedgeStatus === "perfect";
+    const isBoundedResidual = hedgeStatus === "bounded_residual";
+    const residualPercent = pos.contractSkewBps === null || pos.contractSkewBps === undefined
+      ? null
+      : (Number(pos.contractSkewBps) / 100).toFixed(2);
+    const badgeClass = isPerfect ? "green" : isBoundedResidual ? "amber" : "red";
+    const badgeLabel = isPerfect
+      ? "✔ PERFECTLY HEDGED"
+      : isBoundedResidual
+        ? `◆ HEDGED · ${escapeHtml(residualPercent || "0.00")}% RESIDUAL`
+        : "✖ EXPOSURE ERROR";
+    const cardClass = isPerfect ? "hedged-perfect" : isBoundedResidual ? "hedged-residual" : "hedged-bad";
+    const skewColor = isPerfect ? "var(--green)" : isBoundedResidual ? "var(--amber)" : "var(--red)";
 
     const polySideClass = pos.polymarketOutcome.toUpperCase() === "UP" ? "up" : "down";
     const jupSideClass = pos.jupiterOutcome.toUpperCase() === "UP" ? "up" : "down";
@@ -129,6 +139,15 @@ function renderPositions(positions = [], awaitingCount = 0) {
     const jupiterCostUsd = escapeHtml(pos.jupiterCostUsd);
     const skewVal = escapeHtml(pos.contractSkew || "0.00");
     const totalOutlay = pos.totalCostUsd ? `$${escapeHtml(pos.totalCostUsd)}` : "—";
+    const minimumAlignedPnl = pos.minimumAlignedPnlUsd === null || pos.minimumAlignedPnlUsd === undefined
+      ? null
+      : Number(pos.minimumAlignedPnlUsd);
+    const minimumAlignedPnlLabel = minimumAlignedPnl === null || Number.isNaN(minimumAlignedPnl)
+      ? "—"
+      : formatUsd(minimumAlignedPnl);
+    const minimumAlignedPnlColor = minimumAlignedPnl !== null && minimumAlignedPnl >= 0
+      ? "var(--green)"
+      : "var(--red)";
     const realizedProfitUsd = escapeHtml(pos.realizedProfitUsd || "0.00");
     const enteredAt = escapeHtml(formatTime(pos.enteredAt));
     const phaseLabel = escapeHtml(pos.phase ? pos.phase.replace("_", " ").toUpperCase() : "OPEN");
@@ -193,8 +212,9 @@ function renderPositions(positions = [], awaitingCount = 0) {
         </div>
 
         <div class="pos-bottom-row">
-          <div>Delta Skew: <b style="color:${isPerfect ? 'var(--green)' : 'var(--red)'}">${skewVal} contracts</b></div>
+          <div>Delta Skew: <b style="color:${skewColor}">${skewVal} contracts</b></div>
           <div>Total Capital: <b>${totalOutlay}</b></div>
+          <div>Min Aligned PnL: <b style="color:${minimumAlignedPnlColor}">${minimumAlignedPnlLabel}</b></div>
           <div>Realized PnL: <b>$${realizedProfitUsd}</b></div>
           <div>Entered: <b>${enteredAt}</b></div>
         </div>

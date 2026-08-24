@@ -539,6 +539,11 @@ test("live trader executes a fresh screening build without a redundant post-fill
   assert.equal(decision.type, "entry");
   assert.equal(events.filter((event) => event === "jupiter:prepare-buy").length, 1);
   assert.equal(decision.execution?.jupiter.usedPreflightBuild, true);
+  const position = trader.snapshot().positions[0];
+  assert.equal(position?.hedgeStatus, "bounded_residual");
+  assert.equal(position?.isHedged, false);
+  assert.ok(Number(position?.contractSkewBps) <= 500);
+  assert.ok(Number(position?.minimumAlignedPnlUsd) > 0);
 });
 
 test("live trader reuses a screening quote through the configured poll-jitter window", async () => {

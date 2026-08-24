@@ -95,7 +95,10 @@ export interface LivePositionSnapshot {
   polymarketCostUsd: string;
   jupiterCostUsd: string;
   totalCostUsd: string;
+  minimumAlignedPnlUsd: string;
   contractSkew: string;
+  contractSkewBps: string | null;
+  hedgeStatus: "perfect" | "bounded_residual" | "exposure_error";
   isHedged: boolean;
   polymarketSettled: boolean;
   jupiterSettled: boolean;

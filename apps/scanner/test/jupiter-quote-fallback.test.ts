@@ -6,10 +6,24 @@ import {
   buildJupiterAtomicQuoteBook,
   buildJupiterForecastOrderBook,
   buildJupiterMarketPricingBook,
+  initialJupiterRollingQuoteGross,
+  jupiterRollingQuoteRetryDelayMs,
   JupiterPredictionPriceBookState,
   JupiterRollingAtomicQuoteBookState,
   type JupiterBuyQuoteGateway,
 } from "../src/jupiter-quote-fallback.ts";
+
+test("seeds executable discovery at the Jupiter minimum instead of the screening maximum", () => {
+  assert.equal(initialJupiterRollingQuoteGross(5_000_000n, 50_000_000n), 5_000_000n);
+  assert.equal(initialJupiterRollingQuoteGross(5_000_000n, 4_000_000n), 4_000_000n);
+});
+
+test("persistent rolling quote build failures back off to ten seconds", () => {
+  assert.equal(jupiterRollingQuoteRetryDelayMs(200, 1), 400);
+  assert.equal(jupiterRollingQuoteRetryDelayMs(200, 5), 6_400);
+  assert.equal(jupiterRollingQuoteRetryDelayMs(200, 6), 10_000);
+  assert.equal(jupiterRollingQuoteRetryDelayMs(200, 20), 10_000);
+});
 
 test("queries and maps the selected Forecast outcome market instead of always using UP", async () => {
   const calls: string[] = [];

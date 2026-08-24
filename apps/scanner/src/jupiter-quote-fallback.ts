@@ -6,6 +6,29 @@ import type { JupiterPredictionPriceUpdate } from "../../../packages/venue-jupit
 
 const CONTRACT_STEP_MICRO = 10_000n;
 
+export function initialJupiterRollingQuoteGross(
+  minimumGrossMicroUsd: bigint,
+  maximumScreeningGrossMicroUsd: bigint,
+): bigint {
+  if (minimumGrossMicroUsd <= 0n || maximumScreeningGrossMicroUsd <= 0n) {
+    throw new Error("Jupiter rolling quote gross limits must be positive");
+  }
+  return minimumGrossMicroUsd < maximumScreeningGrossMicroUsd
+    ? minimumGrossMicroUsd
+    : maximumScreeningGrossMicroUsd;
+}
+
+export function jupiterRollingQuoteRetryDelayMs(
+  baseIntervalMs: number,
+  consecutiveErrors: number,
+): number {
+  if (!Number.isInteger(baseIntervalMs) || baseIntervalMs < 1) {
+    throw new Error("Jupiter rolling quote base interval must be a positive integer");
+  }
+  const exponent = Math.min(Math.max(1, Math.trunc(consecutiveErrors)), 6);
+  return Math.min(10_000, baseIntervalMs * (2 ** exponent));
+}
+
 export interface JupiterBuyQuoteGateway {
   prepareBuy(input: {
     marketId: string;
