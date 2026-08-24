@@ -212,7 +212,7 @@ Common controls:
 | `--max-reference-difference-usd=30` | `$30` | Requires the opening references to differ by strictly less than this amount |
 | `--max-venue-allocation-usd=50` | `$50` | Maximum cost at each venue for one position |
 | `--maximum-open-positions=5` | `5` | Portfolio-wide unsettled-position limit; wallet balances can impose a lower practical limit |
-| `--minimum-entry-edge-usd=0.01` | `$0.01` | Minimum modeled edge per contract after entry fees |
+| `--minimum-entry-edge-usd=0.001` | `$0.001` | Minimum modeled edge per contract after entry fees |
 | `--minimum-entry-profit-usd=0.10` | `$0.10` | Minimum modeled total entry profit |
 | Exit policy | hold until resolution | Automatic profit-taking exits are disabled; recovery hedges and settlement remain enabled |
 | `--maximum-slippage-bps=100` | `100 bps` | Maximum live price protection per leg; allowed range is 1–500 bps |

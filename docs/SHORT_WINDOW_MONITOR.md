@@ -141,7 +141,7 @@ pnpm monitor:short-window -- --help
 | `--allow-sub-five-jupiter-swap` | off | Explicitly permit direct RTSE Swap V2 Forecast orders below `$5` |
 | `--polymarket-minimum-order-usd` | `1` | Minimum collateral for a marketable Polymarket BUY; sizing scales cheap legs up to this floor |
 | `--jupiter-quote-usd` | follows `--max-venue-allocation-usd` (`50`) | Gross cap used to synthesize entry-screening depth from Degen top prices |
-| `--minimum-entry-edge-usd` | `0.01` | Minimum nominal entry edge per contract after entry fees |
+| `--minimum-entry-edge-usd` | `0.001` | Minimum nominal entry edge per contract after entry fees |
 | `--minimum-entry-profit-usd` | `0.10` | Minimum nominal total entry edge |
 | `--minimum-exit-profit-usd` | `0.10` | Legacy threshold retained for compatibility; live automatic exits are disabled |
 | `--maximum-open-positions` | `5` | Portfolio-wide unsettled-position cap |

@@ -233,7 +233,7 @@ async function main(): Promise<void> {
   const jupiterQuoteGrossMicroUsd = configuredJupiterQuoteGrossMicroUsd > maximumVenueAllocationMicroUsd
     ? maximumVenueAllocationMicroUsd
     : configuredJupiterQuoteGrossMicroUsd;
-  const minimumEntryEdgePerContractMicroUsd = parseUsd(args.string("minimum-entry-edge-usd", "0.01"));
+  const minimumEntryEdgePerContractMicroUsd = parseUsd(args.string("minimum-entry-edge-usd", "0.001"));
   const minimumEntryEdgeTotalMicroUsd = parseUsd(args.string("minimum-entry-profit-usd", "0.10"));
   const minimumExitProfitMicroUsd = parseUsd(args.string("minimum-exit-profit-usd", "0.10"));
   const maximumOpenPositions = args.integer("maximum-open-positions", 5);
@@ -2991,7 +2991,7 @@ Options:
   --jupiter-minimum-order-usd=5      Strategy floor matching Jupiter Prediction minimum
   --polymarket-minimum-order-usd=1   Minimum Polymarket marketable BUY collateral
   --jupiter-quote-usd=MAX_ALLOCATION Gross cap for websocket screening; defaults to the per-venue allocation
-  --minimum-entry-edge-usd=0.01      Nominal edge required per contract after entry fees
+  --minimum-entry-edge-usd=0.001     Nominal edge required per contract after entry fees
   --minimum-entry-profit-usd=0.10    Nominal total edge required for entry
   --minimum-exit-profit-usd=0.10     Legacy threshold; live positions hold through resolution
   --maximum-open-positions=5         Portfolio-wide concurrent position cap

@@ -41,7 +41,7 @@ All gates must pass:
 7. Require at least five contracts of common top-level depth.
 8. Require the Jupiter leg's gross spend to be at least `$5`.
 9. Keep each venue's entry cost, including its entry taker fee, at or below `$50` and its available paper balance.
-10. Require at least `$0.01` nominal edge per contract and `$0.10` total nominal edge after both entry taker fees.
+10. Require at least `$0.001` nominal edge per contract and `$0.10` total nominal edge after both entry taker fees.
 11. Allow up to two portfolio positions at a time and never re-enter the same pair after an exit.
 
 The reference ordering selects the route:
