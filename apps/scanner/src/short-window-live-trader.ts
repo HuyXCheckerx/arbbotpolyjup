@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import {
@@ -54,6 +55,7 @@ const POLYMARKET_MARKET_AMOUNT_PRECISION_REJECTION =
 const POLYMARKET_MARKETABLE_BUY_MINIMUM_REJECTION =
   "invalid amount for a marketable buy order";
 const POLYMARKET_PRICE_TICK_MICRO_USD = 10_000n;
+const liveStateSaveQueues = new Map<string, Promise<void>>();
 
 export interface LivePairIdentity {
   key: string;
@@ -2050,10 +2052,33 @@ export async function loadLiveState(path: string): Promise<LiveTraderState> {
 }
 
 export async function saveLiveState(path: string, state: LiveTraderState): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(state, bigintReplacer, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, path);
+  // Capture the requested version before another asynchronous trader action
+  // can mutate the shared state object. Saves for the same file are then
+  // committed in call order, so a slower earlier write cannot overwrite a
+  // newer state snapshot.
+  const payload = `${JSON.stringify(state, bigintReplacer, 2)}\n`;
+  const previous = liveStateSaveQueues.get(path) ?? Promise.resolve();
+  const operation = previous.catch(() => undefined).then(async () => {
+    await mkdir(dirname(path), { recursive: true });
+    // The 5m loop, 15m loop, balance recovery, and settlement monitor can all
+    // persist state concurrently. A shared `${path}.tmp` lets one Windows
+    // rename consume another writer's source file and raises ENOENT. A unique
+    // sibling keeps the final rename atomic without that collision.
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, payload, { mode: 0o600 });
+      await rename(temporary, path);
+    } catch (error) {
+      await unlink(temporary).catch(() => undefined);
+      throw error;
+    }
+  });
+  liveStateSaveQueues.set(path, operation);
+  try {
+    await operation;
+  } finally {
+    if (liveStateSaveQueues.get(path) === operation) liveStateSaveQueues.delete(path);
+  }
 }
 
 function emptyState(): LiveTraderState {

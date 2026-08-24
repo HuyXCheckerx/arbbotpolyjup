@@ -164,7 +164,6 @@ export class JupiterPredictionPriceBookState {
   readonly #outcomes: readonly ShortWindowOutcome[];
   readonly #grossAmountMicroUsd: bigint;
   readonly #updates = new Map<string, JupiterPredictionPriceUpdate>();
-  #lastTopSignature = "";
 
   constructor(input: {
     upMarketId: string;
@@ -190,10 +189,6 @@ export class JupiterPredictionPriceBookState {
 
     const yes = this.#logicalSide("UP");
     const no = this.#logicalSide("DOWN");
-    const signature = `${topSignature(yes.bids)}:${topSignature(yes.asks)}:` +
-      `${topSignature(no.bids)}:${topSignature(no.asks)}`;
-    if (signature === this.#lastTopSignature) return null;
-    this.#lastTopSignature = signature;
     const updates = this.#outcomes
       .map((outcome) => this.#updates.get(this.#marketId(outcome)))
       .filter((value): value is JupiterPredictionPriceUpdate => value !== undefined);
@@ -201,8 +196,11 @@ export class JupiterPredictionPriceBookState {
       venue: "jupiter",
       provider: "bisonfi_price_websocket",
       marketId: this.marketIds().join("|"),
-      receivedAtMs: Math.max(...updates.map((value) => value.receivedAtMs)),
-      sourceTimestampMs: Math.max(...updates.map((value) => value.sourceTimestampMs)),
+      // The oldest included ticker controls composite freshness. A new UP
+      // message must not make an old DOWN quote safe for route selection (or
+      // vice versa).
+      receivedAtMs: Math.min(...updates.map((value) => value.receivedAtMs)),
+      sourceTimestampMs: Math.min(...updates.map((value) => value.sourceTimestampMs)),
       yes,
       no,
     };
@@ -408,11 +406,6 @@ function priceLevel(priceMicroUsd: bigint, grossAmountMicroUsd: bigint): BookLev
     priceMicroUsd,
     contractsMicro: ceilDivide(quantityMicro, CONTRACT_STEP_MICRO) * CONTRACT_STEP_MICRO,
   }];
-}
-
-function topSignature(levels: readonly BookLevel[]): string {
-  const level = levels[0];
-  return level ? `${level.priceMicroUsd}:${level.contractsMicro}` : "-";
 }
 
 function ceilDivide(numerator: bigint, denominator: bigint): bigint {

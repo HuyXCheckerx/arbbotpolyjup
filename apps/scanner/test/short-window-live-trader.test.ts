@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,7 +29,34 @@ import {
   type LiveJupiterGateway,
   type LivePairIdentity,
   type LivePolymarketGateway,
+  type LiveTraderState,
 } from "../src/short-window-live-trader.ts";
+
+test("live state saves serialize concurrent atomic replacements", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "jupol-live-concurrent-save-"));
+  const statePath = join(directory, "state.json");
+  const state = (sequence: number): LiveTraderState => ({
+    schemaVersion: 1,
+    sequence,
+    halted: false,
+    haltReason: null,
+    realizedProfitMicroUsd: BigInt(sequence),
+    polymarketCashMicroUsd: 100_000_000n,
+    jupiterCashMicroUsd: 100_000_000n,
+    forcedEntrySubmissionAttempted: false,
+    completedPairs: [],
+    positions: [],
+  });
+
+  await Promise.all(Array.from({ length: 32 }, (_, sequence) =>
+    saveLiveState(statePath, state(sequence))
+  ));
+
+  const persisted = await loadLiveState(statePath);
+  assert.equal(persisted.sequence, 31);
+  assert.equal(persisted.realizedProfitMicroUsd, 31n);
+  assert.deepEqual(await readdir(directory), ["state.json"]);
+});
 
 test("live trader replaces persisted cash with real wallet balances and accepts refreshes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "jupol-live-wallet-balances-"));

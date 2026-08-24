@@ -210,7 +210,8 @@ test("maps both Degen price websocket tickers into an ask-only entry book", () =
   });
   assert.ok(book);
   assert.equal(book.provider, "bisonfi_price_websocket");
-  assert.equal(book.sourceTimestampMs, 1_005);
+  assert.equal(book.receivedAtMs, 1_010);
+  assert.equal(book.sourceTimestampMs, 1_000);
   assert.deepEqual(book.yes, {
     bids: [],
     asks: [{ priceMicroUsd: 400_000n, contractsMicro: 12_500_000n }],
@@ -219,6 +220,32 @@ test("maps both Degen price websocket tickers into an ask-only entry book", () =
     bids: [],
     asks: [{ priceMicroUsd: 600_000n, contractsMicro: 8_340_000n }],
   });
+
+  const refreshed = state.apply({
+    marketId: "event-UP",
+    sourceTimestampMs: 2_000,
+    receivedAtMs: 2_010,
+    yesBidMicroUsd: 390_000n,
+    yesAskMicroUsd: 400_000n,
+    noBidMicroUsd: 0n,
+    noAskMicroUsd: 0n,
+  });
+  assert.ok(refreshed);
+  assert.equal(refreshed.receivedAtMs, 1_015);
+  assert.equal(refreshed.sourceTimestampMs, 1_005);
+
+  const bothRefreshed = state.apply({
+    marketId: "event-DOWN",
+    sourceTimestampMs: 2_005,
+    receivedAtMs: 2_015,
+    yesBidMicroUsd: 580_000n,
+    yesAskMicroUsd: 600_000n,
+    noBidMicroUsd: 0n,
+    noAskMicroUsd: 0n,
+  });
+  assert.ok(bothRefreshed);
+  assert.equal(bothRefreshed.receivedAtMs, 2_010);
+  assert.equal(bothRefreshed.sourceTimestampMs, 2_000);
 });
 
 function build(marketId: string, gross: bigint, contracts: bigint): JupiterPredictionOrderBuild {
