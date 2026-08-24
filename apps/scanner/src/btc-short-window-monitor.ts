@@ -225,7 +225,12 @@ async function main(): Promise<void> {
   const maximumVenueAllocationMicroUsd = parseUsd(args.string("max-venue-allocation-usd", "50"));
   const jupiterMinimumOrderMicroUsd = parseUsd(args.string("jupiter-minimum-order-usd", "0.01"));
   const polymarketMinimumOrderMicroUsd = parseUsd(args.string("polymarket-minimum-order-usd", "1"));
-  const jupiterQuoteGrossMicroUsd = parseUsd(args.string("jupiter-quote-usd", "5"));
+  const configuredJupiterQuoteGrossMicroUsd = parseUsd(
+    args.string("jupiter-quote-usd", formatUsd(maximumVenueAllocationMicroUsd)),
+  );
+  const jupiterQuoteGrossMicroUsd = configuredJupiterQuoteGrossMicroUsd > maximumVenueAllocationMicroUsd
+    ? maximumVenueAllocationMicroUsd
+    : configuredJupiterQuoteGrossMicroUsd;
   const minimumEntryEdgePerContractMicroUsd = parseUsd(args.string("minimum-entry-edge-usd", "0.01"));
   const minimumEntryEdgeTotalMicroUsd = parseUsd(args.string("minimum-entry-profit-usd", "0.10"));
   const minimumExitProfitMicroUsd = parseUsd(args.string("minimum-exit-profit-usd", "0.10"));
@@ -2967,7 +2972,7 @@ Options:
   --max-venue-allocation-usd=50      Entry cap at each venue per position
   --jupiter-minimum-order-usd=0.01   Strategy floor for direct Forecast token swaps
   --polymarket-minimum-order-usd=1   Minimum Polymarket marketable BUY collateral
-  --jupiter-quote-usd=5              Gross cap used to size websocket entry screening
+  --jupiter-quote-usd=MAX_ALLOCATION Gross cap for websocket screening; defaults to the per-venue allocation
   --minimum-entry-edge-usd=0.01      Nominal edge required per contract after entry fees
   --minimum-entry-profit-usd=0.10    Nominal total edge required for entry
   --minimum-exit-profit-usd=0.10     Legacy threshold; live positions hold through resolution
@@ -2979,7 +2984,7 @@ Options:
   --max-venue-allocation-usd=50      Entry cap at each venue per position
   --jupiter-minimum-order-usd=0.01   Strategy floor for direct Forecast token swaps
   --polymarket-minimum-order-usd=1   Minimum Polymarket marketable BUY collateral
-  --jupiter-quote-usd=5              Gross cap used to size websocket entry screening
+  --jupiter-quote-usd=MAX_ALLOCATION Gross cap for websocket screening; defaults to the per-venue allocation
   --minimum-entry-edge-usd=0.01      Nominal edge required per contract after entry fees
   --minimum-entry-profit-usd=0.10    Nominal total edge required for entry
   --minimum-exit-profit-usd=0.10     Legacy threshold; live positions hold through resolution

@@ -11,7 +11,7 @@ For each current BTC 5-minute and 15-minute round, the process:
 1. Pairs only equal-duration markets with identical start and end times.
 2. Requires exact opening references to differ by strictly less than `$30`.
 3. Selects the complementary route implied by the two opening references.
-4. Discovers entries from Jupiter's public Degen top-price WebSocket with a `$5` screening gross cap, then requests one exact executable build only after a candidate reaches preflight. The exact build must preserve an all-in edge of at least `$0.01` per contract and `$0.10` total after fees and price impact.
+4. Discovers entries from Jupiter's public Degen top-price WebSocket with synthetic screening depth capped by the per-position Jupiter allocation, then requests one exact executable build only after a candidate reaches preflight. The strategy selects the largest screened size that fits both venue budgets and preserves at least `$0.01` per contract and `$0.10` total after modeled fees. Live entry reserves the configured 5% post-fill normalization allowance plus the configured slippage allowance beneath the hard venue cap, so a price-improved Polymarket fill can still be fully hedged. The exact build must preserve the same profit limits after price impact and slippage protection.
 5. Uses Jupiter Prediction `/orders` → `/execute` for native Forecast deposits of at least `$5`, matching the recommended website-style path. Smaller native Forecast legs use direct outcome-token Swap V2 because Prediction enforces a `$5` build minimum. Standard `POLY-*` prediction markets always use Prediction.
 6. Limits each leg of each position to `$50`, including modeled/quoted entry fees, and permits at most five concurrent unsettled positions. Real wallet balances can impose a lower practical limit.
 7. Verifies Polymarket balances and approvals before exposing the Jupiter leg. The same read supplies the pre-entry token-balance snapshot, avoiding a redundant API round trip.
@@ -180,7 +180,7 @@ The JSONL contains public market/order/transaction identifiers but no wallet sec
 | Maximum allocation per venue per position | `$50` |
 | Maximum concurrent unsettled positions | `5` |
 | Jupiter strategy floor | `$0.01` |
-| Jupiter websocket entry-screening gross cap | `$5` |
+| Jupiter websocket entry-screening gross cap | Follows the `$50` maximum venue allocation unless overridden |
 | Minimum entry edge per contract | `$0.01` |
 | Minimum total entry edge | `$0.10` |
 | Exit policy | Hold through resolution; no automatic profit-taking |
@@ -204,7 +204,7 @@ pnpm bot:short-window:live -- \
   --minimum-entry-profit-usd=0.25
 ```
 
-`--minimum-venue-balance-usd` is a startup readiness requirement, not fake or credited cash. All sizing uses balances read from the two real wallets.
+`--minimum-venue-balance-usd` is a startup readiness requirement, not fake or credited cash. All sizing uses balances read from the two real wallets. With the default 5% normalization allowance and 1% slippage setting, the largest entry can consume up to `hard venue capacity / 1.06`; the remaining capacity is reserved only for post-fill hedge normalization.
 
 ## Stop and recovery
 

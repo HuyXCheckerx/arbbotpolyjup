@@ -5,6 +5,7 @@ import { eligibleCrossVenueRoutes, evaluateCrossVenueRoutes } from "../src/short
 import {
   evaluateShortWindowEntry,
   evaluateShortWindowExit,
+  quoteBuyAcrossLevels,
   type ShortWindowStrategyConfig,
 } from "../src/short-window-strategy.ts";
 import type { BinaryOrderBook } from "../src/types.ts";
@@ -20,7 +21,7 @@ const CONFIG: ShortWindowStrategyConfig = {
   minimumExitProfitMicroUsd: 100_000n,
 };
 
-test("sizes the smallest fee-adjusted entry that meets Jupiter's $5 minimum", () => {
+test("sizes the largest fee-adjusted entry that fits venue budgets", () => {
   const route = evaluateCrossVenueRoutes(
     book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n, 50_000_000n),
     book("jupiter", 460_000n, 550_000n, 450_000n, 540_000n, 50_000_000n),
@@ -40,7 +41,51 @@ test("sizes the smallest fee-adjusted entry that meets Jupiter's $5 minimum", ()
   assert.ok(result.proposal.jupiter.allInMicroUsd <= 25_000_000n);
   assert.ok(result.proposal.edgeMicroUsdPerContract >= 10_000n);
   assert.ok(result.proposal.nominalEdgeMicroUsd >= 100_000n);
-  assert.ok(result.proposal.quantityMicro < 10_000_000n, "uses minimal qualifying size instead of the full book");
+  assert.ok(
+    result.proposal.quantityMicro > 40_000_000n,
+    "uses the available profitable budget instead of stopping at the first qualifying size",
+  );
+});
+
+test("stops at the largest size that preserves the conservative per-contract edge", () => {
+  const polymarket = book("polymarket", 400_000n, 610_000n, 390_000n, 600_000n, 100_000_000n);
+  polymarket.yes.asks = [
+    { priceMicroUsd: 400_000n, contractsMicro: 10_000_000n },
+    { priceMicroUsd: 600_000n, contractsMicro: 90_000_000n },
+  ];
+  const jupiter = book("jupiter", 460_000n, 500_000n, 450_000n, 490_000n, 100_000_000n);
+  const route = evaluateCrossVenueRoutes(
+    polymarket,
+    jupiter,
+    eligibleCrossVenueRoutes(72_000_000_000n, 72_004_000_000n),
+  )[0] ?? null;
+  const config = {
+    ...CONFIG,
+    polymarketMaximumAllocationMicroUsd: 100_000_000n,
+    jupiterMaximumAllocationMicroUsd: 100_000_000n,
+    jupiterMinimumGrossOrderMicroUsd: 10_000n,
+  };
+  const result = evaluateShortWindowEntry({
+    route,
+    polymarketAvailableMicroUsd: 100_000_000n,
+    jupiterAvailableMicroUsd: 100_000_000n,
+    config,
+  });
+
+  assert.equal(result.eligible, true);
+  if (!result.eligible || !route) return;
+  assert.ok(result.proposal.quantityMicro > 10_000_000n);
+  assert.ok(result.proposal.quantityMicro < 100_000_000n);
+  assert.ok(result.proposal.edgeMicroUsdPerContract >= config.minimumEntryEdgeMicroUsdPerContract);
+
+  const nextQuantity = result.proposal.quantityMicro + 10_000n;
+  const nextPolymarket = quoteBuyAcrossLevels(route.polymarketAsks, nextQuantity, "polymarket");
+  const nextJupiter = quoteBuyAcrossLevels(route.jupiterAsks, nextQuantity, "jupiter");
+  assert.ok(nextPolymarket && nextJupiter);
+  if (!nextPolymarket || !nextJupiter) return;
+  const nextEdgePerContract = (nextQuantity - nextPolymarket.allInMicroUsd - nextJupiter.allInMicroUsd) *
+    1_000_000n / nextQuantity;
+  assert.ok(nextEdgePerContract < config.minimumEntryEdgeMicroUsdPerContract);
 });
 
 test("rejects an otherwise positive route when the $5 Jupiter order cannot fit the budgets", () => {

@@ -435,11 +435,19 @@ export class ShortWindowLiveTrader {
 
     const availablePolymarket = maximum(0n, this.#polymarketCash());
     const availableJupiter = maximum(0n, this.#jupiterCash());
+    const entryPolymarketCapacity = conservativeEntryCapacity(
+      minimum(availablePolymarket, this.#config.strategy.polymarketMaximumAllocationMicroUsd),
+      this.#config.maximumSlippageBps,
+    );
+    const entryJupiterCapacity = conservativeEntryCapacity(
+      minimum(availableJupiter, this.#config.strategy.jupiterMaximumAllocationMicroUsd),
+      this.#config.maximumSlippageBps,
+    );
     const forcedTestEntry = this.#config.forceOneEntry;
     const entry = forcedTestEntry ? null : evaluateShortWindowEntry({
       route: input.bestRoute,
-      polymarketAvailableMicroUsd: availablePolymarket,
-      jupiterAvailableMicroUsd: availableJupiter,
+      polymarketAvailableMicroUsd: entryPolymarketCapacity,
+      jupiterAvailableMicroUsd: entryJupiterCapacity,
       config: this.#config.strategy,
     });
     if (!forcedTestEntry && entry && !entry.eligible) return { type: "skip", reason: entry.reason };
@@ -473,8 +481,8 @@ export class ShortWindowLiveTrader {
           builtAtMs: input.jupiterEntryBuildAtMs,
           pair: input.pair,
           polymarketAsks: input.bestRoute.polymarketAsks,
-          polymarketAvailableMicroUsd: availablePolymarket,
-          jupiterAvailableMicroUsd: availableJupiter,
+          polymarketAvailableMicroUsd: entryPolymarketCapacity,
+          jupiterAvailableMicroUsd: entryJupiterCapacity,
           config: this.#config,
         })) {
         // The screening quote is already an executable Swap V2 transaction.
@@ -1231,8 +1239,6 @@ export class ShortWindowLiveTrader {
     const quotedContractsMicro = build.order.newContractsMicro;
     const sizeDifference = absolute(quotedContractsMicro - targetContractsMicro);
     const mismatchBps = sizeDifference * 10_000n / targetContractsMicro;
-    if (sizeDifference > CONTRACT_TOLERANCE_MICRO &&
-      mismatchBps > MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS) return false;
 
     const matchedContractsMicro = minimum(quotedContractsMicro, targetContractsMicro);
     const matchedPolymarketCost = polymarketEntryCostMicroUsd * matchedContractsMicro /
@@ -1256,6 +1262,11 @@ export class ShortWindowLiveTrader {
         `maximumLoss=$${formatUsd(this.#config.maximumEmergencyHedgeLossMicroUsd)}`,
       );
     }
+    // Reject a clearly loss-making partial quote immediately. Otherwise, a
+    // large price move would be reported as an allocation failure only after
+    // pointlessly scaling the quote toward the now-unacceptable target size.
+    if (sizeDifference > CONTRACT_TOLERANCE_MICRO &&
+      mismatchBps > MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS) return false;
     return true;
   }
 
@@ -2298,6 +2309,15 @@ function applyBps(priceMicroUsd: bigint, bps: number, direction: "up" | "down"):
   const roundedUp = (rawMinimum + POLYMARKET_PRICE_TICK_MICRO_USD - 1n) /
     POLYMARKET_PRICE_TICK_MICRO_USD * POLYMARKET_PRICE_TICK_MICRO_USD;
   return minimum(maximumTickPrice, roundedUp);
+}
+
+function conservativeEntryCapacity(hardCapacityMicroUsd: bigint, maximumSlippageBps: number): bigint {
+  const reserveBps = MAXIMUM_POST_FILL_HEDGE_MISMATCH_BPS +
+    BigInt(Math.max(0, Math.trunc(maximumSlippageBps)));
+  // Keep the configured allocation as the hard emergency-hedge ceiling. The
+  // entry uses the largest base amount whose bounded post-fill growth still
+  // fits beneath that ceiling.
+  return hardCapacityMicroUsd * 10_000n / (10_000n + reserveBps);
 }
 
 function bigintReplacer(_key: string, value: unknown): unknown {

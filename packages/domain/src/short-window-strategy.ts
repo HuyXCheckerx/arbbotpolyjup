@@ -134,7 +134,7 @@ export function evaluateShortWindowEntry(input: {
     return { eligible: false, reason: "JUPITER_MINIMUM_ORDER_UNREACHABLE" };
   }
 
-  const proposal = minimumQualifyingProposal({
+  const proposal = largestQualifyingProposal({
     route,
     minimumQuantityMicro,
     maximumQuantityMicro: affordableQuantityMicro,
@@ -197,17 +197,17 @@ export function evaluateShortWindowExit(input: {
   };
 }
 
-function minimumQualifyingProposal(input: {
+function largestQualifyingProposal(input: {
   route: EvaluatedCrossVenueRoute;
   minimumQuantityMicro: bigint;
   maximumQuantityMicro: bigint;
   config: ShortWindowStrategyConfig;
 }): ShortWindowEntryProposal | null {
+  let largest: ShortWindowEntryProposal | null = null;
   let segmentStart = input.minimumQuantityMicro;
   for (const segmentEnd of depthBreakpoints(input.route, segmentStart, input.maximumQuantityMicro)) {
     const startProposal = entryProposal(input.route, segmentStart);
-    if (meetsEntryMinimums(startProposal, input.config)) return startProposal;
-    if (!meetsPerContractMinimum(startProposal, input.config)) return null;
+    if (!meetsPerContractMinimum(startProposal, input.config)) return largest;
 
     let viableEnd = segmentEnd;
     const endProposal = entryProposal(input.route, segmentEnd);
@@ -221,14 +221,14 @@ function minimumQualifyingProposal(input: {
     }
     const viableProposal = entryProposal(input.route, viableEnd);
     if (meetsEntryMinimums(viableProposal, input.config)) {
-      return firstQualifyingQuantity(input.route, segmentStart, viableEnd, input.config);
+      largest = viableProposal;
     }
-    if (viableEnd < segmentEnd) return null;
-    if (viableProposal.nominalEdgeMicroUsd < startProposal.nominalEdgeMicroUsd) return null;
+    if (viableEnd < segmentEnd) return largest;
+    if (viableProposal.nominalEdgeMicroUsd < startProposal.nominalEdgeMicroUsd) return largest;
     segmentStart = segmentEnd + CONTRACT_STEP_MICRO;
     if (segmentStart > input.maximumQuantityMicro) break;
   }
-  return null;
+  return largest;
 }
 
 function entryProposal(route: EvaluatedCrossVenueRoute, quantityMicro: bigint): ShortWindowEntryProposal {
@@ -359,22 +359,6 @@ function quoteAcrossLevels(
       ? grossMicroUsd + takerFeeMicroUsd
       : grossMicroUsd - takerFeeMicroUsd,
   };
-}
-
-function firstQualifyingQuantity(
-  route: EvaluatedCrossVenueRoute,
-  minimumQuantityMicro: bigint,
-  maximumQuantityMicro: bigint,
-  config: ShortWindowStrategyConfig,
-): ShortWindowEntryProposal {
-  let low = minimumQuantityMicro / CONTRACT_STEP_MICRO;
-  let high = maximumQuantityMicro / CONTRACT_STEP_MICRO;
-  while (low < high) {
-    const middle = (low + high) / 2n;
-    if (meetsEntryMinimums(entryProposal(route, middle * CONTRACT_STEP_MICRO), config)) high = middle;
-    else low = middle + 1n;
-  }
-  return entryProposal(route, low * CONTRACT_STEP_MICRO);
 }
 
 function lastQuantityMeetingPerContractMinimum(
