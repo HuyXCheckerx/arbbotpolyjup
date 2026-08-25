@@ -161,7 +161,7 @@ impl Default for RunArgs {
             max_jupiter_age_ms: 2_000,
             jupiter_order_input_usd: "5".to_owned(),
             jupiter_order_request_interval_ms: DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS,
-            maximum_jupiter_submit_quote_age_ms: 250,
+            maximum_jupiter_submit_quote_age_ms: 400,
             entry_cutoff_seconds: 30,
             minimum_venue_balance_usd: "50".to_owned(),
             max_venue_allocation_usd: "50".to_owned(),
@@ -170,7 +170,7 @@ impl Default for RunArgs {
             minimum_entry_edge_usd: "0.001".to_owned(),
             minimum_entry_profit_usd: "0.10".to_owned(),
             minimum_post_fill_profit_usd: "0".to_owned(),
-            maximum_slippage_bps: 100,
+            maximum_slippage_bps: 300,
             polymarket_depth_haircut_bps: 2_000,
             maximum_emergency_hedge_loss_usd: "1".to_owned(),
             jupiter_fill_timeout_ms: 20_000,
@@ -1484,7 +1484,9 @@ fn engine_config(args: &RunArgs) -> Result<EngineConfig> {
             minimum_exit_profit_micro_usd: parse_usd("0.10")?,
         },
         minimum_venue_balance_micro_usd: minimum_venue_balance,
-        maximum_jupiter_submit_quote_age_ms: args.maximum_jupiter_submit_quote_age_ms,
+        maximum_jupiter_submit_quote_age_ms: env_optional("JUPITER_MAX_QUOTE_AGE_MS")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(args.maximum_jupiter_submit_quote_age_ms),
         entry_cutoff_ms: args.entry_cutoff_seconds.saturating_mul(1_000),
         max_polymarket_age_ms: args.max_polymarket_age_ms,
         max_jupiter_age_ms: args.max_jupiter_age_ms,
