@@ -32,7 +32,10 @@ use jupol_jupiter::{
     PREDICTION_MINIMUM_BUY_MICRO_USD, PredictionOrderBuild, PreparedJupiterSubmission,
     SwapClientOptions,
 };
-use jupol_live::{EntryDisposition, LiveCoordinator, LiveEntryRequest, capture_entry_balances};
+use jupol_live::{
+    EntryBalanceSnapshot, EntryDisposition, LiveCoordinator, LiveEntryRequest,
+    capture_entry_balances,
+};
 use jupol_polymarket::{
     PolymarketExecutor, PolymarketGammaClient, PolymarketMarketData, PolymarketOptions,
     PolymarketRelayer, PolymarketRelayerOptions, PolymarketStreamMarket,
@@ -378,6 +381,28 @@ impl Drop for OrderDiscoveryHandle {
     }
 }
 
+#[derive(Clone, Default)]
+struct LiveBalanceCache {
+    inner: Arc<std::sync::RwLock<Option<EntryBalanceSnapshot>>>,
+}
+
+impl LiveBalanceCache {
+    fn get(&self) -> Option<EntryBalanceSnapshot> {
+        *self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn update(&self, snapshot: EntryBalanceSnapshot) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(snapshot);
+    }
+}
+
 struct RuntimePair {
     pair: CrossVenuePair,
     jupiter_book: Option<BinaryOrderBook>,
@@ -511,7 +536,12 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                 None
             }
         };
-        (Some(jupiter), Some(polymarket), Some(coordinator), relayer)
+        (
+            Some(Arc::new(jupiter)),
+            Some(Arc::new(polymarket)),
+            Some(coordinator),
+            relayer,
+        )
     } else {
         (None, None, None, None)
     };
@@ -552,6 +582,30 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
             up?;
             down?;
         }
+    }
+    let balance_cache = LiveBalanceCache::default();
+    if let (Some(polymarket), Some(jupiter)) =
+        (polymarket_executor.clone(), jupiter_executor.clone())
+    {
+        let cache = balance_cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(2_500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let (Ok(poly_cash), Ok(jup_cash)) = tokio::join!(
+                    polymarket.collateral_balance_micro_usd(),
+                    jupiter.usdc_balance()
+                ) {
+                    cache.update(EntryBalanceSnapshot {
+                        polymarket_contracts: 0,
+                        polymarket_collateral_micro_usd: poly_cash,
+                        jupiter_contracts: 0,
+                        jupiter_usdc_micro: jup_cash,
+                    });
+                }
+            }
+        });
     }
     let mut order_discovery = new_order_discovery(
         &pairs,
@@ -613,7 +667,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                         attempt_settlements(
                             coordinator,
                             relayer.as_ref(),
-                            polymarket_executor.as_ref(),
+                            polymarket_executor.as_deref(),
                             &gamma,
                             jupiter,
                             config.jupiter_fill_timeout,
@@ -732,6 +786,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                     &polymarket_data,
                                     coordinator,
                                     &config,
+                                    &balance_cache,
                                 ).await {
                                     Ok(Some(disposition)) => {
                                         runtime.last_preflight_error = None;
@@ -741,6 +796,12 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                         );
                                         if let (Ok(poly_cash), Ok(jup_cash)) = (poly_cash, jup_cash) {
                                             coordinator.update_cash_snapshots(poly_cash, jup_cash)?;
+                                            balance_cache.update(EntryBalanceSnapshot {
+                                                polymarket_contracts: 0,
+                                                polymarket_collateral_micro_usd: poly_cash,
+                                                jupiter_contracts: 0,
+                                                jupiter_usdc_micro: jup_cash,
+                                            });
                                         }
                                         status.event(event_for_disposition(runtime.pair.duration.label(), &disposition)).await;
                                         writer.append(json!({
@@ -920,40 +981,42 @@ fn new_order_discovery(
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(request_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut next_target = 0_usize;
         let mut sequences = [0_u64; 2];
         let mut last_errors: [Option<String>; 2] = [None, None];
         let mut in_flight = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                _ = interval.tick(), if in_flight.len() < MAXIMUM_ORDER_DISCOVERY_IN_FLIGHT => {
-                    let target_index = next_target;
-                    next_target = (next_target + 1) % targets.len();
-                    sequences[target_index] = sequences[target_index].saturating_add(1);
-                    let sequence = sequences[target_index];
-                    let target = targets[target_index].clone();
-                    let request_quoter = quoter.clone();
-                    in_flight.spawn(async move {
-                        let requested_at_ms = unix_ms();
-                        let result = request_quoter
-                            .prepare_buy(
-                                &target.market_id,
-                                &target.outcome_mint,
-                                gross_micro_usd,
-                            )
-                            .await;
-                        let prepared = result
-                            .as_ref()
-                            .ok()
-                            .and_then(|build| request_quoter.prepare_submission(build.clone()).ok());
-                        OrderDiscoveryResult {
-                            target,
-                            sequence,
-                            requested_at_ms,
-                            result,
-                            prepared,
+                _ = interval.tick() => {
+                    for (target_index, target) in targets.iter().enumerate() {
+                        if in_flight.len() >= MAXIMUM_ORDER_DISCOVERY_IN_FLIGHT {
+                            break;
                         }
-                    });
+                        sequences[target_index] = sequences[target_index].saturating_add(1);
+                        let sequence = sequences[target_index];
+                        let target = target.clone();
+                        let request_quoter = quoter.clone();
+                        in_flight.spawn(async move {
+                            let requested_at_ms = unix_ms();
+                            let result = request_quoter
+                                .prepare_buy(
+                                    &target.market_id,
+                                    &target.outcome_mint,
+                                    gross_micro_usd,
+                                )
+                                .await;
+                            let prepared = result
+                                .as_ref()
+                                .ok()
+                                .and_then(|build| request_quoter.prepare_submission(build.clone()).ok());
+                            OrderDiscoveryResult {
+                                target,
+                                sequence,
+                                requested_at_ms,
+                                result,
+                                prepared,
+                            }
+                        });
+                    }
                 }
                 completed = in_flight.join_next(), if !in_flight.is_empty() => {
                     let Ok(completed) = completed.expect("guarded non-empty JoinSet") else {
@@ -1025,6 +1088,7 @@ async fn try_live_entry(
     polymarket_data: &PolymarketMarketData,
     coordinator: &mut LiveCoordinator,
     config: &EngineConfig,
+    balance_cache: &LiveBalanceCache,
 ) -> Result<Option<EntryDisposition>> {
     let jupiter_market = match route.jupiter_outcome {
         ShortWindowOutcome::Up => &runtime.pair.jupiter_up,
@@ -1038,20 +1102,37 @@ async fn try_live_entry(
         ShortWindowOutcome::Up => runtime.pair.polymarket_up_token(),
         ShortWindowOutcome::Down => runtime.pair.polymarket_down_token(),
     };
-    // Balance observation and the authoritative Polymarket refresh happen
-    // while the independent `/order` pipeline continues producing newer
-    // Jupiter builds. Read the store only after both finish so these safety
-    // checks do not consume the selected transaction's freshness window.
-    let (before, fresh_poly) = tokio::join!(
-        capture_entry_balances(polymarket, jupiter, token_id, Some(outcome_mint), "", true,),
-        polymarket_data.binary_order_book(
-            &runtime.pair.polymarket.market_id,
-            runtime.pair.polymarket_up_token(),
-            runtime.pair.polymarket_down_token(),
-        ),
-    );
-    let before = before?;
-    let fresh_poly = fresh_poly?;
+
+    // Fast-path: use background-cached balance if available; fall back to live query if cold.
+    let before = if let Some(cached) = balance_cache.get() {
+        cached
+    } else {
+        capture_entry_balances(polymarket, jupiter, token_id, Some(outcome_mint), "", true).await?
+    };
+
+    // Fast-path: use real-time WebSocket book if fresh (<=500ms); fall back to REST only if stale.
+    let fresh_poly = if let Some(ref poly_book) = runtime.polymarket_book {
+        let age_ms = unix_ms().saturating_sub(poly_book.received_at_ms);
+        if age_ms <= 500 {
+            poly_book.clone()
+        } else {
+            polymarket_data
+                .binary_order_book(
+                    &runtime.pair.polymarket.market_id,
+                    runtime.pair.polymarket_up_token(),
+                    runtime.pair.polymarket_down_token(),
+                )
+                .await?
+        }
+    } else {
+        polymarket_data
+            .binary_order_book(
+                &runtime.pair.polymarket.market_id,
+                runtime.pair.polymarket_up_token(),
+                runtime.pair.polymarket_down_token(),
+            )
+            .await?
+    };
     let timed_build = order_store
         .latest(route.jupiter_outcome)
         .ok_or_else(|| anyhow!("executable Jupiter order disappeared during preflight"))?;

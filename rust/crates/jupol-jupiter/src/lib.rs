@@ -1712,6 +1712,7 @@ impl JupiterForecastSwapExecutor {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn submit_prepared_and_wait(
         &self,
         prepared: PreparedJupiterSubmission,
@@ -1725,12 +1726,32 @@ impl JupiterForecastSwapExecutor {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("Forecast Swap build is missing requestId"))?;
 
-        // Concurrently dispatch the signed transaction directly to Solana RPC to minimize block-landing latency.
+        // Concurrently dispatch the signed transaction directly to Solana RPC(s) to minimize block-landing latency.
         let _rpc_dispatch = {
             let rpc = self.rpc.clone();
             let tx_b64 = prepared.signed_transaction.clone();
             tokio::spawn(async move {
-                let _ = rpc.send_transaction_with_options(&tx_b64, true, 0).await;
+                let mut tasks = Vec::new();
+                let rpc_clone = rpc.clone();
+                let tx_clone = tx_b64.clone();
+                tasks.push(tokio::spawn(async move {
+                    let _ = rpc_clone
+                        .send_transaction_with_options(&tx_clone, true, 0)
+                        .await;
+                }));
+                if let Ok(backup_client) = std::env::var("SOLANA_BACKUP_RPC_URL").and_then(|url| {
+                    SolanaRpc::new(&url).map_err(|_err| std::env::VarError::NotPresent)
+                }) {
+                    let tx_clone = tx_b64.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let _ = backup_client
+                            .send_transaction_with_options(&tx_clone, true, 0)
+                            .await;
+                    }));
+                }
+                for t in tasks {
+                    let _ = t.await;
+                }
             })
         };
 
