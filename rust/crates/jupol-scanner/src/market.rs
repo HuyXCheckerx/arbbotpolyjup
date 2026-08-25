@@ -6,7 +6,6 @@ use jupol_polymarket::PolymarketGammaClient;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DurationKind {
     FiveMinutes,
-    FifteenMinutes,
 }
 
 impl DurationKind {
@@ -14,7 +13,6 @@ impl DurationKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::FiveMinutes => "5m",
-            Self::FifteenMinutes => "15m",
         }
     }
 
@@ -22,7 +20,6 @@ impl DurationKind {
     pub const fn milliseconds(self) -> i64 {
         match self {
             Self::FiveMinutes => 300_000,
-            Self::FifteenMinutes => 900_000,
         }
     }
 }

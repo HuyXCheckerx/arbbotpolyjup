@@ -266,6 +266,28 @@ impl StatusStore {
         status.strategy.updated_at = now_iso();
     }
 
+    pub async fn update_feed_health(
+        &self,
+        polymarket_received_at_ms: i64,
+        jupiter_received_at_ms: i64,
+    ) {
+        let mut status = self.inner.write().await;
+        let now = now_iso();
+        status.feeds.polymarket_twap.status = "connected".to_owned();
+        status.feeds.polymarket_twap.message =
+            Some("Polymarket CLOB WebSocket/REST fallback".to_owned());
+        status.feeds.polymarket_twap.last_observation_received_at =
+            Some(iso_ms(polymarket_received_at_ms));
+        status.feeds.polymarket_twap.last_observed_at = Some(iso_ms(polymarket_received_at_ms));
+        status.feeds.polymarket_twap.updated_at.clone_from(&now);
+        status.feeds.jupiter_spot.status = "connected".to_owned();
+        status.feeds.jupiter_spot.message = Some("Executable Swap V2 /order responses".to_owned());
+        status.feeds.jupiter_spot.last_observation_received_at =
+            Some(iso_ms(jupiter_received_at_ms));
+        status.feeds.jupiter_spot.last_observed_at = Some(iso_ms(jupiter_received_at_ms));
+        status.feeds.jupiter_spot.updated_at = now;
+    }
+
     pub async fn event(&self, mut event: StatusEvent) {
         let mut status = self.inner.write().await;
         event.id = format!("evt-{}", status.events.len().saturating_add(1));

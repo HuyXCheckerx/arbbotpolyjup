@@ -1,8 +1,8 @@
 # BTC Polymarket / Jupiter short-window monitor
 
 The Rust monitor compares Polymarket BTC Up/Down with native Jupiter Forecast
-for the current 5-minute and 15-minute intervals. Daily verified
-Bitcoin-above-strike mirrors are enabled by default.
+for the current 5-minute interval only. The 15-minute and daily loops are
+disabled.
 
 It is read-only:
 
@@ -10,10 +10,10 @@ It is read-only:
 pnpm monitor:short-window
 ```
 
-Disable daily markets or stop after one synchronized sample:
+Stop after one synchronized executable sample:
 
 ```bash
-pnpm monitor:short-window --no-daily-threshold --once
+pnpm monitor:short-window --once
 ```
 
 ## Qualification
@@ -28,27 +28,22 @@ route is selected. This intentionally permits basis trades and therefore is not
 guaranteed arbitrage: Polymarket observes a Chainlink 60-second TWAP while
 Jupiter Forecast observes Chainlink spot.
 
-Daily markets require an exact `POLY-*` Jupiter market ID mirrored to the same
-Polymarket market ID, close time, outcomes and rules. Independently sourced
-lookalikes are rejected.
-
 ## Data and executable checks
 
 - Polymarket short-window depth is event-driven through its market WebSocket.
   REST refresh runs only when the book is absent/stale, every five seconds by
   default.
-- Jupiter's public Degen WebSocket supplies indicative top prices and consumes
-  no authenticated Prediction quota.
-- A live candidate must request a new exact Jupiter Prediction or Swap V2 build.
-  The public price cannot arm an order by itself.
+- Jupiter's public price WebSocket and indicative REST prices are not used.
+- Wallet-specific Swap V2 `/order` builds are continuously pipelined for UP and
+  DOWN and are themselves the Jupiter price source.
 - Swap V2 builds must explicitly be `ExactIn`, with a positive
   `otherAmountThreshold` no larger than quoted `outAmount`. Confirmed execution
   amounts are authoritative and any profitable extra output is retained.
-- Prediction and Swap `/order` builds share one 100 ms Developer-key main-bucket
-  scheduler (10 RPS), with entry/recovery priority. Authenticated Swap
-  `/execute` uses Jupiter's separate paid-plan execution bucket.
-- A Jupiter build must fit inside the 500 ms build-to-handoff ceiling, including
-  a conservative 250 ms allowance for the critical 10 RPS slot.
+- The two outcomes alternate every 125 ms globally by default (8 RPS), leaving
+  headroom in the Developer 10-RPS main bucket. Authenticated Swap `/execute`
+  uses Jupiter's separate paid-plan execution bucket.
+- Out-of-order responses are discarded. A selected response must reach handoff
+  within 250 ms of local receipt by default.
 - Polymarket displayed depth is reduced by 20% by default and then re-read before
   an exact-share protected FOK is prepared.
 - The final 30 seconds are a mandatory no-entry window.
@@ -66,8 +61,8 @@ Default JSONL:
 logs/btc-poly-jup-short-window-rust.jsonl
 ```
 
-Records include `session_start`, `candidate`, `daily_threshold_candidate`,
-`execution_error`, live entry results, and `session_stop`. Repetitive unchanged
+Records include `session_start`, `candidate`, `execution_error`, live entry
+results, and `session_stop`. Repetitive unchanged
 top books are not continuously logged.
 
 The local status API is:
@@ -89,9 +84,10 @@ pnpm monitor:short-window --help
 
 Important monitor controls are `--sample-interval-ms`,
 `--polymarket-poll-ms`, `--max-polymarket-age-ms`,
-`--max-jupiter-age-ms`, `--max-samples`, `--once`, `--no-web`,
-`--no-daily-threshold`, `--output`, and `--web-port`. Risk/sizing flags are also
-accepted so read-only screening matches live eligibility.
+`--max-jupiter-age-ms`, `--jupiter-order-input-usd`,
+`--jupiter-order-request-interval-ms`, `--max-samples`, `--once`, `--no-web`,
+`--output`, and `--web-port`. Risk/sizing flags are also accepted so read-only
+screening matches live eligibility.
 
 The Jupiter key is required for Prediction market discovery and must have
 Prediction product access. A Developer plan's 10 RPS allowance does not itself

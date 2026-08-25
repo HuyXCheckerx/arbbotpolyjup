@@ -1405,6 +1405,63 @@ pub struct JupiterForecastSwapExecutor {
     keypair: Keypair,
 }
 
+/// Builds wallet-specific executable Forecast orders without holding signing
+/// authority. This is suitable for continuously using Swap V2 `/order` as an
+/// executable price feed: only the selected build is later signed by the live
+/// executor.
+#[derive(Clone)]
+pub struct JupiterForecastSwapQuoter {
+    client: JupiterSwapClient,
+    owner_pubkey: String,
+}
+
+impl JupiterForecastSwapQuoter {
+    pub fn new(
+        client: JupiterSwapClient,
+        owner_pubkey: impl Into<String>,
+    ) -> Result<Self, JupiterError> {
+        let owner_pubkey = owner_pubkey.into();
+        owner_pubkey
+            .parse::<solana_sdk::pubkey::Pubkey>()
+            .map_err(|error| invalid(format!("invalid Jupiter taker public key: {error}")))?;
+        Ok(Self {
+            client,
+            owner_pubkey,
+        })
+    }
+
+    pub fn from_private_key(
+        client: JupiterSwapClient,
+        private_key: &str,
+    ) -> Result<Self, JupiterError> {
+        Self::new(client, parse_keypair(private_key)?.pubkey().to_string())
+    }
+
+    #[must_use]
+    pub fn owner_pubkey(&self) -> &str {
+        &self.owner_pubkey
+    }
+
+    pub async fn prepare_buy(
+        &self,
+        market_id: &str,
+        outcome_mint: &str,
+        deposit_amount_micro_usd: Micro,
+    ) -> Result<PredictionOrderBuild, JupiterError> {
+        let order = self
+            .client
+            .create_order(
+                USDC_MINT,
+                outcome_mint,
+                deposit_amount_micro_usd,
+                Some(&self.owner_pubkey),
+                None,
+            )
+            .await?;
+        forecast_swap_build(order, market_id, outcome_mint, true, &self.owner_pubkey)
+    }
+}
+
 impl JupiterForecastSwapExecutor {
     pub fn new(
         client: JupiterSwapClient,

@@ -10,41 +10,39 @@ Jupiter Forecast's Chainlink spot observation.
 
 ## Entry pipeline
 
-For current BTC 5-minute and 15-minute rounds, and optionally verified daily
-Bitcoin-above-strike mirrors, the trader:
+For the current BTC 5-minute round, the trader:
 
 1. verifies exact market identity, interval and outcome mapping;
 2. evaluates both `Poly UP + Jup DOWN` and `Poly DOWN + Jup UP`;
-3. screens through the public Jupiter Degen price WebSocket and Polymarket CLOB
-   WebSocket without spending Jupiter's authenticated request budget;
+3. continuously pipelines wallet-specific executable Swap V2 `/order` builds
+   for Jupiter UP and DOWN while consuming Polymarket CLOB updates;
 4. requires fresh data, at least 30 seconds to close, real wallet capacity,
    conservative depth after a 20% default haircut, fees, and both profit floors;
-5. requests a new exact Jupiter build through the 10 RPS Developer main-bucket
-   scheduler, then re-reads Polymarket depth;
-6. prepares a protected exact-share Polymarket FOK and signs the Jupiter
-   transaction before either is released;
+5. refreshes balances and Polymarket depth, then takes the newest in-sequence
+   executable Jupiter build produced while those checks ran;
+6. prepares a protected exact-share Polymarket FOK and signs that existing
+   Jupiter transaction before either is released;
 7. persists the complete entry intent, then submits both venue operations
    concurrently;
 8. reads back conditional tokens, Polymarket collateral, Jupiter USDC, the
    Prediction position and/or Solana token deltas before it books fill quantity
    or cost.
 
-Jupiter Prediction `/orders` then `/execute` is used for native Forecast orders
-of at least `$5` and for standard `POLY-*` markets. Native Forecast orders below
-`$5` can use Swap V2 down to the configured `$0.10` strategy floor when an
-outcome mint and viable route exist. Swap uses Jupiter-managed RTSE rather than
-a manually forced zero-slippage value. Swap sizing and the paired Polymarket
+All new 5-minute entries use direct Swap V2. The exact USDC discovery/entry
+amount defaults to `$5` and is controlled by `--jupiter-order-input-usd`. Swap
+uses Jupiter-managed RTSE rather than a manually forced zero-slippage value.
+Swap sizing and the paired Polymarket
 quantity use `otherAmountThreshold`, Jupiter's guaranteed minimum output, rather
 than the optimistic quoted `outAmount`. Swap builds must explicitly report
 `swapMode=ExactIn`, and `otherAmountThreshold` must be a positive minimum no
 larger than `outAmount`. The confirmed `/execute` totals are authoritative;
 extra output is retained.
 
-The executable Jupiter build must fit inside a 500 ms build-to-handoff ceiling.
-Prediction handoff retains priority in the shared main bucket. Authenticated Swap
-V2 `/execute` uses Jupiter's separate paid-plan execution bucket and therefore
-does not wait behind `/order` builds. Network time used to obtain the build is
-not counted as its local age. An old build is discarded, never sent stale.
+The executable Jupiter response must fit inside a 250 ms receipt-to-handoff
+ceiling by default. Authenticated Swap V2 `/execute` uses Jupiter's separate
+paid-plan execution bucket and therefore does not wait behind `/order` builds.
+Network time used to obtain the response is logged separately as build RTT and
+is not counted as its local age. An old or out-of-sequence build is discarded.
 
 ## Why concurrent execution
 

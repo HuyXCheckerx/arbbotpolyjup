@@ -12,9 +12,9 @@ path.
 - `jupol-runtime`: bounded/coalescing queues and the shared priority Jupiter
   request scheduler.
 - `jupol-http`: pooled HTTP transport, timeouts and bounded rate-limit retries.
-- `jupol-jupiter`: Prediction API, Swap V2, public Degen price WebSocket,
-  transaction signing, confirmation, fill reconciliation, claim and rent
-  reclaim.
+- `jupol-jupiter`: Prediction market metadata, executable Swap V2 order
+  construction, transaction signing, confirmation, fill reconciliation, claim
+  and rent reclaim.
 - `jupol-polymarket`: Gamma discovery, CLOB market WebSocket with REST fallback,
   authenticated exact-share FOK orders, balance reconciliation, approvals and
   gasless redemption.
@@ -24,8 +24,8 @@ path.
   sibling temporary-file replacement.
 - `jupol-live`: durable concurrent two-venue execution, four-state exposure
   accounting, bounded recovery and settlement.
-- `jupol-scanner`: market discovery, 5m/15m and daily threshold loops, status API,
-  structured JSONL diagnostics and the CLI.
+- `jupol-scanner`: 5-minute market discovery, continuously pipelined executable
+  Jupiter prices, status API, structured JSONL diagnostics and the CLI.
 
 ## Build and verify
 
@@ -65,11 +65,11 @@ wallet/API initialization and acts as the local single-instance lock.
 
 ## Jupiter Developer plan
 
-Prediction discovery/builds and Swap V2 `/order` requests share one scheduler at
-100 ms spacing, matching a 10 RPS Developer main bucket. Prediction handoff has
-critical priority; authenticated Swap V2 `/execute` uses Jupiter's separate
-paid-plan execution bucket. The public Degen WebSocket and Polymarket WebSocket
-consume no Jupiter API budget.
+Prediction market-metadata discovery and Swap V2 `/order` requests share one
+scheduler at 100 ms minimum spacing, matching a 10 RPS Developer main bucket.
+The scanner alternates executable 5m UP/DOWN builds every 125 ms globally by
+default (8 RPS). Authenticated Swap V2 `/execute` uses Jupiter's separate
+paid-plan execution bucket. Jupiter's public price WebSocket is not used.
 
 A plan/key existing is not enough by itself: the key must have both Prediction
 and Swap product access. A Prediction `401 Unauthorized` is terminal and the CLI
