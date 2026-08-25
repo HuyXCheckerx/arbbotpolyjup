@@ -112,7 +112,7 @@ struct RunArgs {
     jupiter_order_input_usd: String,
     #[arg(long, default_value_t = DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS)]
     jupiter_order_request_interval_ms: u64,
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 400)]
     maximum_jupiter_submit_quote_age_ms: i64,
     #[arg(long, default_value_t = 30)]
     entry_cutoff_seconds: i64,
