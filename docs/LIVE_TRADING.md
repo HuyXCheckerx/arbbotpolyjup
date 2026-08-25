@@ -35,7 +35,10 @@ of at least `$5` and for standard `POLY-*` markets. Native Forecast orders below
 outcome mint and viable route exist. Swap uses Jupiter-managed RTSE rather than
 a manually forced zero-slippage value. Swap sizing and the paired Polymarket
 quantity use `otherAmountThreshold`, Jupiter's guaranteed minimum output, rather
-than the optimistic quoted `outAmount`.
+than the optimistic quoted `outAmount`. Swap builds must explicitly report
+`swapMode=ExactIn`, and `otherAmountThreshold` must be a positive minimum no
+larger than `outAmount`. The confirmed `/execute` totals are authoritative;
+extra output is retained.
 
 The executable Jupiter build must fit inside a 500 ms build-to-handoff ceiling.
 Prediction handoff retains priority in the shared main bucket. Authenticated Swap
@@ -53,15 +56,17 @@ execution states that must all be handled:
 | Observed execution | Action |
 | --- | --- |
 | Neither filled and both terminal | Remove the intent as zero exposure |
-| Both filled and quantities/costs are known | Hold if matched; otherwise evaluate bounded repair |
+| Both filled and quantities/costs are known | Hold whenever both intended single-winner P&Ls meet the post-fill floor; retain unequal extra contracts |
 | Only one filled, quantities/costs known | Attempt only a bounded Polymarket repair; otherwise isolate for recovery/settlement |
 | Any identity, quantity, debit or submission remains unknown | Preserve durable recovery state; never guess or report profit |
 
-A known problem is position-local. After observation/repair, the bot recomputes
-the actual single-winner floor and contract mismatch. A negative floor, mismatch
-over 0.01 contracts, one-sided exposure, or unresolved recovery quarantines all
-new entries while existing settlement and recovery continue. The startup
-recovery command re-reads both venues before acting.
+A known problem is position-local. Before any repair, the bot recomputes both
+actual single-winner P&Ls from authoritative quantities and debits. Quantity
+mismatch is diagnostic only. Repair is attempted only when at least one intended
+single-winner P&L is below `--minimum-post-fill-profit-usd`; a one-sided,
+below-floor, or unresolved recovery quarantines new entries while existing
+settlement and recovery continue. The startup recovery command re-reads both
+venues before acting.
 
 ## Four resolution outcomes
 
@@ -75,8 +80,9 @@ Let `P` be confirmed Polymarket contracts, `J` confirmed Jupiter contracts, and
 | Both win | `P + J` | `P + J - C` |
 | Both lose | `0` | `-C` |
 
-The entry edge checks the two intended single-winner cases. The both-win and
-both-lose cases remain possible because the resolution observations differ.
+The entry and post-fill gates check the two intended single-winner cases. The
+both-win and both-lose cases remain displayed as oracle/rules basis risk but do
+not trigger quantity repair.
 
 ## Balance and P&L accounting
 
@@ -105,7 +111,8 @@ be considered with wallet cash.
 incomplete position. A Polymarket top-up or trim may be submitted only when:
 
 - both venue identities and quantities are known;
-- the exact 0.01-contract step is valid;
+- at least one intended single-winner P&L is below the configured post-fill floor;
+- the resulting order size is valid for Polymarket's amount precision;
 - a fresh bid/ask exists;
 - configured slippage is respected; and
 - modeled loss is below `--maximum-repair-loss-usd` (default `$1`).

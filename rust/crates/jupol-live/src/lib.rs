@@ -2,9 +2,10 @@
 //!
 //! Submission is persisted before either venue is called. Results are then
 //! classified from authoritative fills/balances into the four possible states:
-//! neither leg, both legs, Polymarket only, or Jupiter only. Quantity mismatch
-//! is repaired on Polymarket because submitting a second Jupiter request could
-//! double-fill an ambiguous first request.
+//! neither leg, both legs, Polymarket only, or Jupiter only. Unequal quantities
+//! are retained when both intended single-winner P&Ls meet the configured
+//! floor. Otherwise bounded repair uses Polymarket because submitting a second
+//! Jupiter request could double-fill an ambiguous first request.
 
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -84,7 +85,6 @@ pub struct LiveEntryRequest {
     pub maximum_repair_loss_micro_usd: Micro,
     pub maximum_repair_slippage_bps: u32,
     pub minimum_post_fill_profit_micro_usd: Micro,
-    pub maximum_post_fill_mismatch_micro: Micro,
     pub fill_timeout: Duration,
     pub diagnostic_test_entry: bool,
 }
@@ -241,13 +241,19 @@ impl LiveCoordinator {
         let observed_polymarket =
             positive_delta(before.polymarket_contracts, after.polymarket_contracts);
         let observed_jupiter = positive_delta(before.jupiter_contracts, after.jupiter_contracts);
+        let swap_v2_execution = jupiter_build.execution_endpoint == "/swap/v2/execute";
         let polymarket_contracts = authoritative_quantity(
             observed_polymarket,
             reported_polymarket,
             polymarket_result.is_ok(),
+            false,
         );
-        let jupiter_contracts =
-            authoritative_quantity(observed_jupiter, reported_jupiter, jupiter_result.is_ok());
+        let jupiter_contracts = authoritative_quantity(
+            observed_jupiter,
+            reported_jupiter,
+            jupiter_result.is_ok(),
+            swap_v2_execution,
+        );
 
         if polymarket_contracts == 0 && jupiter_contracts == 0 {
             if submission_is_ambiguous(&polymarket_result, &jupiter_result) {
@@ -283,12 +289,15 @@ impl LiveCoordinator {
         };
         let observed_jupiter_cost =
             positive_delta(after.jupiter_usdc_micro, before.jupiter_usdc_micro);
-        let jupiter_cost = if observed_jupiter_cost > 0 {
+        let reported_jupiter_cost = jupiter_result
+            .as_ref()
+            .map_or(0, |fill| fill.status.size_micro_usd);
+        let jupiter_cost = if swap_v2_execution && jupiter_result.is_ok() {
+            reported_jupiter_cost
+        } else if observed_jupiter_cost > 0 {
             observed_jupiter_cost
         } else {
-            jupiter_result
-                .as_ref()
-                .map_or(0, |fill| fill.status.size_micro_usd)
+            reported_jupiter_cost
         };
         if final_polymarket > 0 && polymarket_cost <= 0 {
             let reason = format!(
@@ -352,6 +361,41 @@ impl LiveCoordinator {
                 reason,
             });
         }
+
+        // A quantity difference is not itself exposure that needs repair. The
+        // held outcomes are complementary for the intended strategy, so keep
+        // any extra contracts whenever either single-winner payout covers the
+        // complete actual cost plus the configured post-fill floor.
+        let initial_total_cost = polymarket_cost
+            .checked_add(jupiter_cost)
+            .ok_or_else(|| LiveError::Recovery("post-fill cost overflow".to_owned()))?;
+        let initial_risk_plan = build_risk_plan_with_minimum(
+            final_polymarket,
+            final_jupiter,
+            initial_total_cost,
+            request.minimum_post_fill_profit_micro_usd,
+        );
+        if post_fill_is_acceptable(
+            &initial_risk_plan,
+            request.minimum_post_fill_profit_micro_usd,
+        ) {
+            self.finalize_observed_position(
+                &request.position_id,
+                final_polymarket,
+                final_jupiter,
+                polymarket_cost,
+                jupiter_cost,
+                polymarket_result.as_ref().ok(),
+                jupiter_result.as_ref().ok(),
+                LivePositionPhase::Open,
+                None,
+            )?;
+            return Ok(EntryDisposition::Opened {
+                position_id: request.position_id,
+                repaired: false,
+            });
+        }
+
         let mut repaired = false;
         let target = final_jupiter;
         if final_polymarket != target {
@@ -459,12 +503,14 @@ impl LiveCoordinator {
         let total_cost = polymarket_cost
             .checked_add(jupiter_cost)
             .ok_or_else(|| LiveError::Recovery("post-fill cost overflow".to_owned()))?;
-        let risk_plan = build_risk_plan(final_polymarket, final_jupiter, total_cost);
-        let acceptable = post_fill_is_acceptable(
-            &risk_plan,
+        let risk_plan = build_risk_plan_with_minimum(
+            final_polymarket,
+            final_jupiter,
+            total_cost,
             request.minimum_post_fill_profit_micro_usd,
-            request.maximum_post_fill_mismatch_micro,
         );
+        let acceptable =
+            post_fill_is_acceptable(&risk_plan, request.minimum_post_fill_profit_micro_usd);
         let phase = if acceptable {
             LivePositionPhase::Open
         } else {
@@ -472,11 +518,10 @@ impl LiveCoordinator {
         };
         let reason = (!acceptable).then(|| {
             format!(
-                "post-fill safety gate rejected entry: Poly={final_polymarket} Jup={final_jupiter} mismatch={} floor={} requiredFloor={} maxMismatch={} action={:?}",
+                "post-fill safety gate rejected entry: Poly={final_polymarket} Jup={final_jupiter} mismatch={} floor={} requiredFloor={} action={:?}",
                 risk_plan.venue_size_mismatch_micro,
                 risk_plan.intended_single_winner_floor_micro_usd,
                 request.minimum_post_fill_profit_micro_usd,
-                request.maximum_post_fill_mismatch_micro,
                 risk_plan.action,
             )
         });
@@ -678,15 +723,48 @@ impl LiveCoordinator {
                         reason,
                     });
                 }
+                (Ok(poly), Ok(jup))
+                    if poly > 0
+                        && jup > 0
+                        && post_fill_is_acceptable(
+                            &build_risk_plan_with_minimum(
+                                poly,
+                                jup,
+                                position
+                                    .polymarket_entry_cost_micro_usd
+                                    .saturating_add(position.jupiter_entry_cost_micro_usd),
+                                position.minimum_post_fill_profit_micro_usd,
+                            ),
+                            position.minimum_post_fill_profit_micro_usd,
+                        ) =>
+                {
+                    self.finalize_observed_position(
+                        &id,
+                        poly,
+                        jup,
+                        position.polymarket_entry_cost_micro_usd,
+                        position.jupiter_entry_cost_micro_usd,
+                        None,
+                        None,
+                        LivePositionPhase::Open,
+                        None,
+                    )?;
+                    dispositions.push(EntryDisposition::Opened {
+                        position_id: id,
+                        repaired: false,
+                    });
+                }
                 (Ok(poly), Ok(jup)) if poly == jup && poly > 0 => {
-                    let plan = build_risk_plan(
+                    let plan = build_risk_plan_with_minimum(
                         poly,
                         jup,
                         position
                             .polymarket_entry_cost_micro_usd
                             .saturating_add(position.jupiter_entry_cost_micro_usd),
+                        position.minimum_post_fill_profit_micro_usd,
                     );
-                    let acceptable = post_fill_is_acceptable(&plan, 0, 10_000);
+                    let acceptable =
+                        post_fill_is_acceptable(&plan, position.minimum_post_fill_profit_micro_usd);
                     self.finalize_observed_position(
                         &id,
                         poly,
@@ -745,12 +823,16 @@ impl LiveCoordinator {
                                 .polymarket_entry_cost_micro_usd
                                 .saturating_add(repair.additional_cost_micro_usd)
                                 .saturating_sub(repair.proceeds_micro_usd);
-                            let plan = build_risk_plan(
+                            let plan = build_risk_plan_with_minimum(
                                 recaptured_poly,
                                 jup,
                                 repaired_cost.saturating_add(position.jupiter_entry_cost_micro_usd),
+                                position.minimum_post_fill_profit_micro_usd,
                             );
-                            let acceptable = post_fill_is_acceptable(&plan, 0, 10_000);
+                            let acceptable = post_fill_is_acceptable(
+                                &plan,
+                                position.minimum_post_fill_profit_micro_usd,
+                            );
                             let reason = (!acceptable).then(|| {
                                 format!(
                                     "startup post-repair safety gate rejected position: Poly={recaptured_poly} Jup={jup} floor={} mismatch={}",
@@ -1092,13 +1174,20 @@ impl LiveCoordinator {
             .and_then(|fill| fill.status.order_pubkey.clone())
             .or_else(|| position.jupiter_order_pubkey.clone());
         position.jupiter_execution_reconciliation_source = jupiter_fill
-            .map(|_| "onchain_token_deltas".to_owned())
+            .map(|fill| {
+                if fill.status.order_pubkey.is_none() {
+                    "swap_v2_execute_totals".to_owned()
+                } else {
+                    "venue_status_and_balance_deltas".to_owned()
+                }
+            })
             .or_else(|| position.jupiter_execution_reconciliation_source.clone());
         position.last_error = error;
-        position.post_fill_risk_plan = Some(build_risk_plan(
+        position.post_fill_risk_plan = Some(build_risk_plan_with_minimum(
             polymarket_contracts_micro,
             jupiter_contracts_micro,
             position.remaining_entry_cost_micro_usd,
+            position.minimum_post_fill_profit_micro_usd,
         ));
         position.entry_submission_skew_ms = polymarket_fill
             .zip(jupiter_fill)
@@ -1210,6 +1299,37 @@ fn migrate_live_state(state: &mut LiveTraderState) -> bool {
                 forecast_swap_position_id(&position.pair.jupiter_market_id, outcome_mint);
             position.jupiter_rent_reclaimed = false;
             changed = true;
+        }
+
+        // Migrate plans created by the exact-quantity policy. A residual is
+        // now informational when both intended single-winner payouts cover the
+        // complete recorded cost, so old QuoteRepair plans must not keep the
+        // portfolio quarantined after an upgrade.
+        if position.post_fill_risk_plan.is_some() {
+            let updated = build_risk_plan_with_minimum(
+                position.polymarket_contracts_micro,
+                position.jupiter_contracts_micro,
+                position.remaining_entry_cost_micro_usd,
+                position.minimum_post_fill_profit_micro_usd,
+            );
+            let obsolete_quantity_repair = position
+                .post_fill_risk_plan
+                .as_ref()
+                .is_some_and(|plan| plan.action == PostFillAction::QuoteRepair)
+                && updated.action == PostFillAction::HoldOrExitNormally;
+            if position.post_fill_risk_plan.as_ref() != Some(&updated) {
+                position.post_fill_risk_plan = Some(updated);
+                changed = true;
+            }
+            if obsolete_quantity_repair
+                && position
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("repair") || error.contains("safety gate"))
+            {
+                position.last_error = None;
+                changed = true;
+            }
         }
     }
     changed
@@ -1358,6 +1478,7 @@ fn placeholder_position(
         jupiter_entry_cost_micro_usd: 0,
         polymarket_entry_cost_micro_usd: 0,
         remaining_entry_cost_micro_usd: 0,
+        minimum_post_fill_profit_micro_usd: request.minimum_post_fill_profit_micro_usd,
         original_contracts_micro: 0,
         realized_profit_micro_usd: 0,
         polymarket_settled: false,
@@ -1389,6 +1510,20 @@ pub fn build_risk_plan(
     polymarket_contracts_micro: Micro,
     jupiter_contracts_micro: Micro,
     total_cost_micro_usd: Micro,
+) -> PostFillRiskPlan {
+    build_risk_plan_with_minimum(
+        polymarket_contracts_micro,
+        jupiter_contracts_micro,
+        total_cost_micro_usd,
+        0,
+    )
+}
+
+fn build_risk_plan_with_minimum(
+    polymarket_contracts_micro: Micro,
+    jupiter_contracts_micro: Micro,
+    total_cost_micro_usd: Micro,
+    minimum_profit_micro_usd: Micro,
 ) -> PostFillRiskPlan {
     let scenarios = vec![
         scenario(
@@ -1435,20 +1570,25 @@ pub fn build_risk_plan(
         .saturating_neg();
     let intended_floor = min(polymarket_contracts_micro, jupiter_contracts_micro)
         .saturating_sub(total_cost_micro_usd);
+    let required_floor = minimum_profit_micro_usd.max(1);
     let (action, reason) = if polymarket_contracts_micro == 0 || jupiter_contracts_micro == 0 {
         (
             PostFillAction::ManualReconciliation,
             "One venue has no observed fill; preserve identities and continue recovery.".to_owned(),
         )
-    } else if mismatch > 10_000 {
+    } else if intended_floor < required_floor {
         (
             PostFillAction::QuoteRepair,
-            "Venue quantities differ by more than the 0.01-contract execution step.".to_owned(),
+            format!(
+                "At least one intended single-winner payout misses the required profit floor {minimum_profit_micro_usd}."
+            ),
         )
     } else {
         (
             PostFillAction::HoldOrExitNormally,
-            "Both venue fills are observed and quantity-matched.".to_owned(),
+            format!(
+                "Both intended single-winner payouts meet the required profit floor {minimum_profit_micro_usd}; any quantity residual is retained as outcome-specific upside."
+            ),
         )
     };
     PostFillRiskPlan {
@@ -1622,23 +1762,16 @@ fn validate_entry_request(request: &LiveEntryRequest) -> Result<(), LiveError> {
             "repair slippage cannot exceed 5000 bps".to_owned(),
         ));
     }
-    if request.minimum_post_fill_profit_micro_usd < 0
-        || request.maximum_post_fill_mismatch_micro < 0
-    {
+    if request.minimum_post_fill_profit_micro_usd < 0 {
         return Err(LiveError::InvalidRequest(
-            "post-fill profit and mismatch bounds cannot be negative".to_owned(),
+            "post-fill profit floor cannot be negative".to_owned(),
         ));
     }
     Ok(())
 }
 
-fn post_fill_is_acceptable(
-    plan: &PostFillRiskPlan,
-    minimum_profit_micro_usd: Micro,
-    maximum_mismatch_micro: Micro,
-) -> bool {
+fn post_fill_is_acceptable(plan: &PostFillRiskPlan, minimum_profit_micro_usd: Micro) -> bool {
     plan.action == PostFillAction::HoldOrExitNormally
-        && plan.venue_size_mismatch_micro <= maximum_mismatch_micro
         && plan.intended_single_winner_floor_micro_usd >= minimum_profit_micro_usd
 }
 
@@ -1677,11 +1810,10 @@ fn portfolio_entry_blocker(state: &LiveTraderState) -> Option<String> {
             ));
         }
         if plan.action != PostFillAction::HoldOrExitNormally
-            || plan.intended_single_winner_floor_micro_usd < 0
-            || plan.venue_size_mismatch_micro > 10_000
+            || plan.intended_single_winner_floor_micro_usd <= 0
         {
             return Some(format!(
-                "position {} is not a safe matched arb: action={:?} floor={} mismatch={}",
+                "position {} does not have two positive intended single-winner outcomes: action={:?} floor={} mismatch={}",
                 position.id,
                 plan.action,
                 plan.intended_single_winner_floor_micro_usd,
@@ -1756,8 +1888,15 @@ fn result_value<E: fmt::Display>(result: Result<Micro, E>) -> String {
     result.map_or_else(|error| format!("error({error})"), |value| value.to_string())
 }
 
-fn authoritative_quantity(observed: Micro, reported: Micro, submission_succeeded: bool) -> Micro {
-    if observed > 0 {
+fn authoritative_quantity(
+    observed: Micro,
+    reported: Micro,
+    submission_succeeded: bool,
+    prefer_reported: bool,
+) -> Micro {
+    if prefer_reported && submission_succeeded {
+        reported.max(0)
+    } else if observed > 0 {
         observed
     } else if submission_succeeded {
         reported.max(0)
@@ -1891,6 +2030,7 @@ mod tests {
             jupiter_entry_cost_micro_usd: 4_000_000,
             polymarket_entry_cost_micro_usd: 0,
             remaining_entry_cost_micro_usd: 4_000_000,
+            minimum_post_fill_profit_micro_usd: 0,
             original_contracts_micro: 0,
             realized_profit_micro_usd: 0,
             polymarket_settled: false,
@@ -1921,7 +2061,7 @@ mod tests {
     fn risk_plan_models_all_four_resolution_states() {
         let plan = build_risk_plan(10_000_000, 9_500_000, 8_000_000);
         assert_eq!(plan.scenarios.len(), 4);
-        assert_eq!(plan.action, PostFillAction::QuoteRepair);
+        assert_eq!(plan.action, PostFillAction::HoldOrExitNormally);
         assert_eq!(plan.intended_single_winner_floor_micro_usd, 1_500_000);
         assert!(
             plan.scenarios
@@ -1938,15 +2078,19 @@ mod tests {
     }
 
     #[test]
-    fn post_fill_gate_requires_matched_size_and_minimum_profit() {
+    fn post_fill_gate_uses_both_single_winner_pnls_not_exact_size() {
         let safe = build_risk_plan(10_000_000, 10_005_000, 9_800_000);
-        assert!(post_fill_is_acceptable(&safe, 100_000, 10_000));
+        assert!(post_fill_is_acceptable(&safe, 100_000));
 
         let negative = build_risk_plan(10_000_000, 10_000_000, 10_100_000);
-        assert!(!post_fill_is_acceptable(&negative, 0, 10_000));
+        assert!(!post_fill_is_acceptable(&negative, 0));
 
         let mismatched = build_risk_plan(10_000_000, 10_020_000, 9_000_000);
-        assert!(!post_fill_is_acceptable(&mismatched, 100_000, 10_000));
+        assert!(post_fill_is_acceptable(&mismatched, 100_000));
+
+        let below_configured_floor = build_risk_plan(14_150_000, 14_101_204, 14_061_324);
+        assert!(post_fill_is_acceptable(&below_configured_floor, 0));
+        assert!(!post_fill_is_acceptable(&below_configured_floor, 100_000));
     }
 
     #[test]
@@ -1963,6 +2107,11 @@ mod tests {
         state.positions.push(position.clone());
         assert_eq!(portfolio_entry_blocker(&state), None);
 
+        position.jupiter_contracts_micro = 10_500_000;
+        position.post_fill_risk_plan = Some(build_risk_plan(10_000_000, 10_500_000, 9_800_000));
+        state.positions[0] = position.clone();
+        assert_eq!(portfolio_entry_blocker(&state), None);
+
         position.jupiter_contracts_micro = 0;
         position.post_fill_risk_plan = Some(build_risk_plan(10_000_000, 0, 5_000_000));
         state.positions[0] = position;
@@ -1977,6 +2126,18 @@ mod tests {
     fn repair_prices_are_aligned_to_a_safe_common_tick() {
         assert_eq!(align_price_up(523_001), 530_000);
         assert_eq!(align_price_down(523_001), 520_000);
+    }
+
+    #[test]
+    fn swap_v2_execute_totals_override_lagging_balance_observations() {
+        assert_eq!(
+            authoritative_quantity(4_900_000, 5_250_000, true, true),
+            5_250_000
+        );
+        assert_eq!(
+            authoritative_quantity(4_900_000, 5_250_000, true, false),
+            4_900_000
+        );
     }
 
     #[test]
@@ -2035,6 +2196,32 @@ mod tests {
         assert_eq!(position.polymarket_settlement_transaction_signature, None);
         assert!(!position.jupiter_rent_reclaimed);
         assert!(!migrate_live_state(&mut state));
+    }
+
+    #[test]
+    fn migrates_profitable_residual_out_of_quote_repair() {
+        let mut position = test_position();
+        position.polymarket_contracts_micro = 14_150_000;
+        position.jupiter_contracts_micro = 14_101_204;
+        position.polymarket_entry_cost_micro_usd = 1_200_410;
+        position.jupiter_entry_cost_micro_usd = 12_860_914;
+        position.remaining_entry_cost_micro_usd = 14_061_324;
+        let mut legacy_plan = build_risk_plan(14_150_000, 14_101_204, 14_061_324);
+        legacy_plan.action = PostFillAction::QuoteRepair;
+        legacy_plan.reason = "legacy exact-quantity policy".to_owned();
+        position.post_fill_risk_plan = Some(legacy_plan);
+        position.last_error = Some("bounded repair failed: precision residual".to_owned());
+        let mut state = LiveTraderState::default();
+        state.positions.push(position);
+
+        assert!(migrate_live_state(&mut state));
+        let plan = state.positions[0]
+            .post_fill_risk_plan
+            .as_ref()
+            .expect("migrated plan");
+        assert_eq!(plan.action, PostFillAction::HoldOrExitNormally);
+        assert_eq!(plan.intended_single_winner_floor_micro_usd, 39_880);
+        assert_eq!(state.positions[0].last_error, None);
     }
 
     #[test]

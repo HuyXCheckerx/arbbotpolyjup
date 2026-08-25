@@ -61,21 +61,22 @@ Failure branches lead to `ABORTING`, `UNWINDING`, `MANUAL_REVIEW`, or `HALTED`.
 7. Persist the complete two-leg intent and prepared identities.
 8. Release both submission functions through the same in-process barrier and record their submission-start timestamps.
 9. Reconcile the Jupiter transaction's actual token deltas and Polymarket order/balance independently.
-10. Recompute the four joint resolution payoffs from final quantities and costs: Polymarket-only win, Jupiter-only win, both win, and both lose. Mark the position open only when the residual is bounded and both intended single-winner cases still meet the entry floors. Otherwise isolate that known position for fresh quote-based repair without pretending the quote was earned or disabling unrelated pairs. Globally halt only when a fill quantity, identity, or pending status remains unknown.
+10. Recompute the four joint resolution payoffs from final quantities and costs: Polymarket-only win, Jupiter-only win, both win, and both lose. Mark the position open whenever both intended single-winner cases meet the post-fill floor, retaining any extra contracts. Both-win/both-lose remain basis-risk diagnostics and quantity mismatch alone never triggers repair. Otherwise isolate that known position for fresh quote-based repair without pretending the quote was earned or disabling unrelated pairs. Globally halt only when a fill quantity, identity, or pending status remains unknown.
 
 Concurrent release reduces systematic leg delay but does not make two chains atomic. Network scheduling, venue acceptance, and settlement can still leave one-sided or ambiguous exposure.
 
 ## Compensation and emergency behavior
 
-If the concurrent results are not equal and final:
+If the concurrent results are final but at least one intended single-winner P&L
+is below the post-fill floor:
 
 1. Reconcile both venues using order IDs, transaction signatures, and token/position balances.
 2. Persist the exact or conservatively observed residual exposure.
 3. Isolate the position; globally halt only if identity, quantity or submission
    status is unknown.
-4. A known mismatch may use a fresh Polymarket top-up/trim only after proving the
-   configured slippage and maximum-loss bounds before signing. Otherwise retain
-   it for manual reconciliation/settlement; never blindly chase the missing leg.
+4. A fresh Polymarket top-up/trim may be used only after proving the configured
+   slippage and maximum-loss bounds before signing. A profitable mismatch is
+   retained for settlement; never blindly chase equal quantities.
 
 A BTC perpetual is not an exact hedge for a binary contract. It may be considered only as a separately approved disaster hedge with a documented delta model; it is not part of MVP recovery.
 

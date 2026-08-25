@@ -183,12 +183,14 @@ The live path:
    reclaims empty Forecast token-account rent.
 
 Unknown quantity, identity, or cash debit is kept in recovery state and is not
-reported as realized profit. Known mismatches can use only the configured
-bounded repair. An unresolved, one-sided, mismatched, or negative-floor position
-quarantines new entries while settlement and recovery keep running; it does not
-globally halt the process. Live mode re-runs recovery every 15 seconds, waits out
-ambiguous Swap handoffs, and never races a pending Jupiter keeper order.
-Cross-chain execution is still non-atomic.
+reported as realized profit. A known quantity mismatch is retained when both
+intended single-winner payouts exceed actual combined cost by the configured
+post-fill floor. Repair is considered only when at least one of those two P&Ls
+misses that floor. An unresolved, one-sided, negative-floor, or ambiguous
+position quarantines new entries while settlement and recovery keep running; it
+does not globally halt the process. Live mode re-runs recovery every 15 seconds,
+waits out ambiguous Swap handoffs, and never races a pending Jupiter keeper
+order. Cross-chain execution is still non-atomic.
 
 Jupiter Prediction is used for `$5+` native Forecast orders and all standard
 `POLY-*` markets. Native Forecast orders below `$5` may use direct Swap V2 down
@@ -212,6 +214,7 @@ Common options:
 | `--maximum-open-positions` | `5` | Portfolio-wide unsettled-position limit |
 | `--minimum-entry-edge-usd` | `$0.001` | Minimum edge per contract |
 | `--minimum-entry-profit-usd` | `$0.10` | Minimum total modeled edge |
+| `--minimum-post-fill-profit-usd` | `$0` | Actual single-winner P&L floor; positive residuals are retained by default |
 | `--jupiter-minimum-order-usd` | `$0.10` | Native Forecast Swap floor; Prediction remains `$5` |
 | `--polymarket-minimum-order-usd` | `$1` | Marketable BUY minimum |
 | `--maximum-slippage-bps` | `100` | Entry/repair protection, allowed range 1–500 |

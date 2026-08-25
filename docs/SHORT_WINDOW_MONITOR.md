@@ -41,6 +41,9 @@ lookalikes are rejected.
   no authenticated Prediction quota.
 - A live candidate must request a new exact Jupiter Prediction or Swap V2 build.
   The public price cannot arm an order by itself.
+- Swap V2 builds must explicitly be `ExactIn`, with a positive
+  `otherAmountThreshold` no larger than quoted `outAmount`. Confirmed execution
+  amounts are authoritative and any profitable extra output is retained.
 - Prediction and Swap `/order` builds share one 100 ms Developer-key main-bucket
   scheduler (10 RPS), with entry/recovery priority. Authenticated Swap
   `/execute` uses Jupiter's separate paid-plan execution bucket.
@@ -52,7 +55,8 @@ lookalikes are rejected.
 
 Both fees and actual executable prices are included. Swap V2's returned amounts
 already include its platform fee/price impact and are not charged a second
-prediction fee locally.
+prediction fee locally. Unequal final quantities do not trigger repair when both
+intended single-winner P&Ls meet the post-fill floor.
 
 ## Output and dashboard
 

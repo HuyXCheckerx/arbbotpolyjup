@@ -127,6 +127,8 @@ struct RunArgs {
     minimum_entry_edge_usd: String,
     #[arg(long, default_value = "0.10")]
     minimum_entry_profit_usd: String,
+    #[arg(long, default_value = "0")]
+    minimum_post_fill_profit_usd: String,
     #[arg(long, default_value_t = 100)]
     maximum_slippage_bps: u32,
     #[arg(long, default_value_t = 2_000)]
@@ -164,6 +166,7 @@ impl Default for RunArgs {
             polymarket_minimum_order_usd: "1".to_owned(),
             minimum_entry_edge_usd: "0.001".to_owned(),
             minimum_entry_profit_usd: "0.10".to_owned(),
+            minimum_post_fill_profit_usd: "0".to_owned(),
             maximum_slippage_bps: 100,
             polymarket_depth_haircut_bps: 2_000,
             maximum_emergency_hedge_loss_usd: "1".to_owned(),
@@ -265,6 +268,7 @@ struct EngineConfig {
     maximum_slippage_bps: u32,
     polymarket_depth_haircut_bps: u32,
     maximum_emergency_hedge_loss_micro_usd: Micro,
+    minimum_post_fill_profit_micro_usd: Micro,
     jupiter_fill_timeout: Duration,
     maximum_open_positions: usize,
 }
@@ -393,6 +397,8 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
         "jupiterPlan": if api_key.is_some() { "developer_10_rps_shared" } else { "unauthenticated" },
         "jupiterSharedRequestIntervalMs": if api_key.is_some() { Some(DEVELOPER_REQUEST_INTERVAL_MS) } else { None },
         "entryCutoffSeconds": args.entry_cutoff_seconds,
+        "minimumEntryProfitUsd": format_usd(config.strategy.minimum_entry_edge_total_micro_usd),
+        "minimumPostFillProfitUsd": format_usd(config.minimum_post_fill_profit_micro_usd),
         "maximumReferenceDifferenceUsd": null,
     })).await?;
 
@@ -1008,8 +1014,7 @@ async fn try_live_entry(
         before,
         maximum_repair_loss_micro_usd: config.maximum_emergency_hedge_loss_micro_usd,
         maximum_repair_slippage_bps: config.maximum_slippage_bps,
-        minimum_post_fill_profit_micro_usd: config.strategy.minimum_entry_edge_total_micro_usd,
-        maximum_post_fill_mismatch_micro: 10_000,
+        minimum_post_fill_profit_micro_usd: config.minimum_post_fill_profit_micro_usd,
         fill_timeout: config.jupiter_fill_timeout,
         diagnostic_test_entry: false,
     };
@@ -1134,8 +1139,7 @@ async fn try_daily_live_entry(
         before,
         maximum_repair_loss_micro_usd: config.maximum_emergency_hedge_loss_micro_usd,
         maximum_repair_slippage_bps: config.maximum_slippage_bps,
-        minimum_post_fill_profit_micro_usd: config.strategy.minimum_entry_edge_total_micro_usd,
-        maximum_post_fill_mismatch_micro: 10_000,
+        minimum_post_fill_profit_micro_usd: config.minimum_post_fill_profit_micro_usd,
         fill_timeout: config.jupiter_fill_timeout,
         diagnostic_test_entry: false,
     };
@@ -1425,6 +1429,10 @@ fn engine_config(args: &RunArgs) -> Result<EngineConfig> {
     if jupiter_minimum < PREDICTION_MINIMUM_BUY_MICRO_USD && args.disable_sub_five_jupiter_swap {
         bail!("sub-$5 orders require native Forecast Swap V2");
     }
+    let minimum_post_fill_profit = parse_usd(&args.minimum_post_fill_profit_usd)?;
+    if minimum_post_fill_profit < 0 {
+        bail!("minimum post-fill profit cannot be negative");
+    }
     Ok(EngineConfig {
         strategy: ShortWindowStrategyConfig {
             polymarket_maximum_allocation_micro_usd: allocation,
@@ -1446,6 +1454,7 @@ fn engine_config(args: &RunArgs) -> Result<EngineConfig> {
         maximum_slippage_bps: args.maximum_slippage_bps,
         polymarket_depth_haircut_bps: args.polymarket_depth_haircut_bps,
         maximum_emergency_hedge_loss_micro_usd: parse_usd(&args.maximum_emergency_hedge_loss_usd)?,
+        minimum_post_fill_profit_micro_usd: minimum_post_fill_profit,
         jupiter_fill_timeout: Duration::from_millis(args.jupiter_fill_timeout_ms),
         maximum_open_positions: args.maximum_open_positions,
     })

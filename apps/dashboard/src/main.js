@@ -236,9 +236,9 @@ function renderPositions(positions = [], awaitingCount = 0) {
           <div>Single-winner Floor: <b style="color:${minimumAlignedPnlColor}">${minimumAlignedPnlLabel}</b></div>
           <div>Poly-only Win PnL: <b>$${escapeHtml(pos.polymarketWinPnlUsd || "0")}</b></div>
           <div>Jup-only Win PnL: <b>$${escapeHtml(pos.jupiterWinPnlUsd || "0")}</b></div>
-          <div>Both Win PnL: <b>$${escapeHtml(pos.bothWinPnlUsd || "0")}</b></div>
-          <div>Both Lose PnL: <b style="color:var(--red)">$${escapeHtml(pos.bothLosePnlUsd || "0")}</b></div>
-          <div>Max Modeled Loss: <b style="color:var(--red)">$${escapeHtml(pos.maximumModeledLossUsd || "0")}</b></div>
+          <div>Both Win Basis PnL: <b>$${escapeHtml(pos.bothWinPnlUsd || "0")}</b></div>
+          <div>Both Lose Basis PnL (informational): <b style="color:var(--red)">$${escapeHtml(pos.bothLosePnlUsd || "0")}</b></div>
+          <div>Max Basis Loss (informational): <b style="color:var(--red)">$${escapeHtml(pos.maximumModeledLossUsd || "0")}</b></div>
           <div>Post-fill Action: <b>${postFillAction}</b></div>
           <div>Jup Rent Reclaimed: <b>${pos.jupiterRentReclaimed ? `✔ ${escapeHtml(pos.jupiterRentReclaimedSol || "0")} SOL` : "⏳ PENDING"}</b></div>
           <div>Realized PnL: <b>$${realizedProfitUsd}</b></div>
@@ -247,7 +247,7 @@ function renderPositions(positions = [], awaitingCount = 0) {
 
         ${errorLine}
         ${entrySubmissionLine}
-        <div class="${postFillRiskClass}">FOUR-STATE RISK: ${postFillReason}</div>
+        <div class="${postFillRiskClass}">SINGLE-WINNER HEDGE POLICY: ${postFillReason}</div>
         ${settlementErrorLine}
       </div>
     `;

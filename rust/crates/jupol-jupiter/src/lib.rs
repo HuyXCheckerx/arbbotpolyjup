@@ -408,7 +408,8 @@ pub struct SwapOrder {
     pub output_mint: String,
     pub in_amount: Micro,
     pub out_amount: Micro,
-    pub other_amount_threshold: Option<Micro>,
+    pub other_amount_threshold: Micro,
+    pub swap_mode: String,
     pub slippage_bps: Option<u64>,
     pub price_impact: Option<String>,
     pub fee_bps: Option<u64>,
@@ -542,29 +543,7 @@ impl JupiterSwapClient {
                 }),
             )
             .await?;
-        let value = object(&payload, "Swap V2 execution")?;
-        let status = parse_execution_status(text(value, "status"))?;
-        Ok(SwapExecution {
-            status,
-            signature: optional_text(value, "signature"),
-            code: value
-                .get("code")
-                .and_then(Value::as_i64)
-                .unwrap_or_else(|| {
-                    if status == ExecutionStatus::Success {
-                        0
-                    } else {
-                        -1
-                    }
-                }),
-            // Failed executions are allowed to omit amount fields. Preserve
-            // their code/error instead of replacing the useful failure with a
-            // secondary "missing amount" parser error.
-            total_input_amount: optional_unsigned_micro(value.get("totalInputAmount")).unwrap_or(0),
-            total_output_amount: optional_unsigned_micro(value.get("totalOutputAmount"))
-                .unwrap_or(0),
-            error: optional_text(value, "error"),
-        })
+        parse_swap_execution(&payload)
     }
 
     async fn reserve_execute(&self) {
@@ -1916,8 +1895,22 @@ fn parse_swap_order(
     }
     let in_amount = required_unsigned_micro(value.get("inAmount"), "inAmount")?;
     let out_amount = required_unsigned_micro(value.get("outAmount"), "outAmount")?;
+    let other_amount_threshold =
+        required_unsigned_micro(value.get("otherAmountThreshold"), "otherAmountThreshold")?;
+    let swap_mode = optional_text(value, "swapMode")
+        .ok_or_else(|| invalid("Swap V2 order is missing swapMode"))?;
     if request_id.is_empty() || in_amount <= 0 || out_amount <= 0 {
         return Err(invalid("Swap V2 order is missing executable quote fields"));
+    }
+    if swap_mode != "ExactIn" {
+        return Err(invalid(format!(
+            "Swap V2 order must explicitly use ExactIn, received {swap_mode}"
+        )));
+    }
+    if other_amount_threshold <= 0 || other_amount_threshold > out_amount {
+        return Err(invalid(format!(
+            "Swap V2 ExactIn order returned invalid minimum output {other_amount_threshold} for expected output {out_amount}"
+        )));
     }
     Ok(SwapOrder {
         transaction,
@@ -1928,7 +1921,8 @@ fn parse_swap_order(
             .unwrap_or_else(|| fallback_output_mint.to_owned()),
         in_amount,
         out_amount,
-        other_amount_threshold: optional_unsigned_micro(value.get("otherAmountThreshold")),
+        other_amount_threshold,
+        swap_mode,
         slippage_bps: optional_u64(value.get("slippageBps")),
         price_impact: value
             .get("priceImpact")
@@ -1942,6 +1936,56 @@ fn parse_swap_order(
         router,
         mode: optional_text(value, "mode").unwrap_or_else(|| "unknown".to_owned()),
     })
+}
+
+fn parse_swap_execution(payload: &Value) -> Result<SwapExecution, JupiterError> {
+    let value = object(payload, "Swap V2 execution")?;
+    let status = parse_execution_status(text(value, "status"))?;
+    Ok(SwapExecution {
+        status,
+        signature: optional_text(value, "signature"),
+        code: value
+            .get("code")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| {
+                if status == ExecutionStatus::Success {
+                    0
+                } else {
+                    -1
+                }
+            }),
+        // V2 has exposed both total*Amount and *AmountResult spellings. They
+        // are authoritative execution totals, not quote fields. Accept either
+        // shape, but reject a response that reports conflicting real amounts.
+        total_input_amount: consistent_swap_execution_amount(
+            value,
+            "totalInputAmount",
+            "inputAmountResult",
+        )?,
+        total_output_amount: consistent_swap_execution_amount(
+            value,
+            "totalOutputAmount",
+            "outputAmountResult",
+        )?,
+        error: optional_text(value, "error"),
+    })
+}
+
+fn consistent_swap_execution_amount(
+    value: &Map<String, Value>,
+    primary_field: &str,
+    alternate_field: &str,
+) -> Result<Micro, JupiterError> {
+    let primary = optional_unsigned_micro(value.get(primary_field));
+    let alternate = optional_unsigned_micro(value.get(alternate_field));
+    if let (Some(primary), Some(alternate)) = (primary, alternate)
+        && primary != alternate
+    {
+        return Err(invalid(format!(
+            "Swap V2 execution returned conflicting {primary_field}={primary} and {alternate_field}={alternate}"
+        )));
+    }
+    Ok(primary.or(alternate).unwrap_or(0))
 }
 
 fn parse_jupiter_event(value: &Value) -> Result<Vec<VenueMarket>, JupiterError> {
@@ -2038,8 +2082,14 @@ fn forecast_swap_build(
     } else {
         order.in_amount
     };
+    if order.swap_mode != "ExactIn" {
+        return Err(invalid(format!(
+            "Forecast Swap V2 build requires ExactIn, received {}",
+            order.swap_mode
+        )));
+    }
     let guaranteed_quantity_micro = if is_buy {
-        order.other_amount_threshold.unwrap_or(order.out_amount)
+        order.other_amount_threshold
     } else {
         order.in_amount
     };
@@ -2134,12 +2184,11 @@ fn forecast_swap_execution_context(order: &SwapOrder) -> Map<String, Value> {
         ),
         (
             "otherAmountThreshold".to_owned(),
-            Value::String(
-                order
-                    .other_amount_threshold
-                    .unwrap_or(order.out_amount)
-                    .to_string(),
-            ),
+            Value::String(order.other_amount_threshold.to_string()),
+        ),
+        (
+            "swapMode".to_owned(),
+            Value::String(order.swap_mode.clone()),
         ),
         (
             "slippageBps".to_owned(),
@@ -2782,7 +2831,8 @@ mod tests {
                 output_mint: "outcome".to_owned(),
                 in_amount: 5_000_000,
                 out_amount: 10_000_000,
-                other_amount_threshold: Some(8_500_000),
+                other_amount_threshold: 8_500_000,
+                swap_mode: "ExactIn".to_owned(),
                 slippage_bps: Some(1_500),
                 price_impact: None,
                 fee_bps: None,
@@ -2846,6 +2896,75 @@ mod tests {
 
         build.order.new_contracts_micro = 9_000_000;
         assert!(reconcile_swap_execution(&build, &execution).is_err());
+    }
+
+    #[test]
+    fn swap_order_requires_consistent_exact_in_price_protection() {
+        let exact_in = json!({
+            "transaction": "base64",
+            "requestId": "swap-1",
+            "inputMint": USDC_MINT,
+            "outputMint": "outcome",
+            "inAmount": "5000000",
+            "outAmount": "5236055",
+            "otherAmountThreshold": "4995221",
+            "swapMode": "ExactIn",
+            "router": "iris",
+            "mode": "ultra"
+        });
+        let order =
+            parse_swap_order(&exact_in, USDC_MINT, "outcome").expect("consistent ExactIn order");
+        assert_eq!(order.swap_mode, "ExactIn");
+        assert_eq!(order.other_amount_threshold, 4_995_221);
+
+        let mut exact_out = exact_in.clone();
+        exact_out["swapMode"] = Value::String("ExactOut".to_owned());
+        assert!(
+            parse_swap_order(&exact_out, USDC_MINT, "outcome")
+                .expect_err("ExactOut must be rejected")
+                .to_string()
+                .contains("explicitly use ExactIn")
+        );
+
+        let mut inconsistent = exact_in;
+        inconsistent["otherAmountThreshold"] = Value::String("5236055".to_owned());
+        inconsistent["outAmount"] = Value::String("4995221".to_owned());
+        assert!(
+            parse_swap_order(&inconsistent, USDC_MINT, "outcome")
+                .expect_err("minimum output above expected output must be rejected")
+                .to_string()
+                .contains("invalid minimum output")
+        );
+    }
+
+    #[test]
+    fn swap_execution_uses_actual_result_amounts_and_rejects_conflicts() {
+        let result_shape = json!({
+            "status": "Success",
+            "signature": "signature",
+            "code": 0,
+            "inputAmountResult": "5000000",
+            "outputAmountResult": "5250000"
+        });
+        let execution = parse_swap_execution(&result_shape).expect("result amount shape");
+        assert_eq!(execution.total_input_amount, 5_000_000);
+        assert_eq!(execution.total_output_amount, 5_250_000);
+
+        let conflicting = json!({
+            "status": "Success",
+            "signature": "signature",
+            "code": 0,
+            "totalInputAmount": "5000000",
+            "inputAmountResult": "4999999",
+            "totalOutputAmount": "5250000",
+            "outputAmountResult": "5250000"
+        });
+        assert!(
+            parse_swap_execution(&conflicting)
+                .expect_err("conflicting execution totals must be rejected")
+                .to_string()
+                .contains("conflicting totalInputAmount")
+        );
     }
 
     #[test]

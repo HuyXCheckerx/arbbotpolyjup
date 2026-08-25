@@ -122,6 +122,8 @@ pub struct LivePosition {
     pub polymarket_entry_cost_micro_usd: Micro,
     #[serde(with = "micro_n")]
     pub remaining_entry_cost_micro_usd: Micro,
+    #[serde(default, with = "micro_n")]
+    pub minimum_post_fill_profit_micro_usd: Micro,
     #[serde(with = "micro_n")]
     pub original_contracts_micro: Micro,
     #[serde(with = "micro_n")]
