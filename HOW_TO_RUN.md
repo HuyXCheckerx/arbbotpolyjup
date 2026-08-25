@@ -321,6 +321,13 @@ not the API's pre-transaction payout estimate. Fully settled positions are moved
 to the state's immutable `settled_positions` audit ledger instead of being
 discarded.
 
+Polymarket redemption also refreshes the exact held conditional-token balance
+before submitting. If it differs from durable state by more than 0.01 contracts,
+redemption is blocked and the position remains reconciliation work. This catches
+old states that retained an initial fill after the contracts had already been
+sold or repaired; a confirmed zero-value relay transaction is not accepted as a
+payout.
+
 ## Common failures
 
 - `401 Unauthorized`: the key lacks Prediction product access or is invalid;

@@ -1250,6 +1250,7 @@ async fn redeem(args: RedeemArgs) -> Result<()> {
             (
                 position.pair.key.clone(),
                 position.pair.polymarket_market_id.clone(),
+                position.pair.polymarket_token_id.clone(),
                 position.pair.polymarket_outcome.clone(),
                 position.polymarket_contracts_micro,
                 position.polymarket_settled,
@@ -1269,8 +1270,16 @@ async fn redeem(args: RedeemArgs) -> Result<()> {
         return Ok(());
     }
     let timeout = Duration::from_millis(args.timeout_ms.max(1_000));
-    for (pair_key, market_id, held_outcome, contracts, settled, pending_hash, pending_before) in
-        positions
+    for (
+        pair_key,
+        market_id,
+        token_id,
+        held_outcome,
+        contracts,
+        settled,
+        pending_hash,
+        pending_before,
+    ) in positions
     {
         if settled {
             println!("market {market_id} is already settled in durable state");
@@ -1289,10 +1298,14 @@ async fn redeem(args: RedeemArgs) -> Result<()> {
             println!("market {market_id} resolved against the held outcome; recorded $0 payout");
             continue;
         }
-        let (hash, collateral_before) =
+        let (hash, collateral_before, expected_payout) =
             if let (Some(hash), Some(before)) = (pending_hash, pending_before) {
-                (hash, before)
+                (hash, before, contracts)
             } else {
+                let expected_payout =
+                    refresh_redeemable_polymarket_contracts(&polymarket, &token_id, contracts)
+                        .await
+                        .map_err(|reason| anyhow!(reason))?;
                 let collateral_before = polymarket.collateral_balance_micro_usd().await?;
                 let metadata = gamma.settlement_metadata(&market_id).await?;
                 let hash = relayer.redeem(&metadata).await?;
@@ -1302,16 +1315,24 @@ async fn redeem(args: RedeemArgs) -> Result<()> {
                     collateral_before,
                 )?;
                 println!("market {market_id} redemption confirmed: {hash}");
-                (hash, collateral_before)
+                (hash, collateral_before, expected_payout)
             };
-        let payout = observe_polymarket_redemption_credit(
+        let payout = verify_polymarket_redemption_credit(
             &polymarket,
+            Some(&relayer),
+            &hash,
             collateral_before,
-            contracts,
+            expected_payout,
             timeout,
         )
         .await
-        .map_err(|reason| anyhow!(reason))?;
+        .map_err(|error| {
+            if error.zero_payout {
+                let _ = coordinator
+                    .invalidate_polymarket_redemption_submission(&pair_key, &error.message);
+            }
+            anyhow!(error.message)
+        })?;
         coordinator.record_polymarket_settlement(&pair_key, true, Some(hash), payout)?;
         println!(
             "market {market_id} wallet credit verified: ${}",
@@ -1821,6 +1842,7 @@ async fn attempt_settlements(
                 position.pair.key.clone(),
                 position.pair.polymarket_market_id.clone(),
                 position.pair.polymarket_slug.clone(),
+                position.pair.polymarket_token_id.clone(),
                 position.pair.polymarket_outcome.clone(),
                 position.polymarket_contracts_micro,
                 position.polymarket_settlement_transaction_signature.clone(),
@@ -1832,6 +1854,7 @@ async fn attempt_settlements(
         pair_key,
         market_id,
         _slug,
+        token_id,
         held_outcome,
         contracts,
         pending_hash,
@@ -1866,8 +1889,10 @@ async fn attempt_settlements(
             continue;
         };
         if let (Some(hash), Some(collateral_before)) = (pending_hash, pending_collateral_before) {
-            match observe_polymarket_redemption_credit(
+            match verify_polymarket_redemption_credit(
                 polymarket,
+                relayer,
+                &hash,
                 collateral_before,
                 contracts,
                 claim_timeout,
@@ -1884,9 +1909,14 @@ async fn attempt_settlements(
                         warn!(market_id, "could not persist verified redemption: {error}");
                     }
                 }
-                Err(reason) => {
-                    let _ = coordinator.record_settlement_error(&pair_key, &reason);
-                    warn!(market_id, "{reason}");
+                Err(error) => {
+                    if error.zero_payout {
+                        let _ = coordinator
+                            .invalidate_polymarket_redemption_submission(&pair_key, &error.message);
+                    } else {
+                        let _ = coordinator.record_settlement_error(&pair_key, &error.message);
+                    }
+                    warn!(market_id, "{}", error.message);
                 }
             }
             continue;
@@ -1897,6 +1927,15 @@ async fn attempt_settlements(
             let _ = coordinator.record_settlement_error(&pair_key, reason);
             continue;
         };
+        let redeemable_contracts =
+            match refresh_redeemable_polymarket_contracts(polymarket, &token_id, contracts).await {
+                Ok(contracts) => contracts,
+                Err(reason) => {
+                    let _ = coordinator.record_settlement_error(&pair_key, &reason);
+                    warn!(market_id, "{reason}");
+                    continue;
+                }
+            };
         let collateral_before = match polymarket.collateral_balance_micro_usd().await {
             Ok(balance) => balance,
             Err(error) => {
@@ -1924,10 +1963,12 @@ async fn attempt_settlements(
                             "redemption confirmed but pending state persistence failed: {error}"
                         );
                     }
-                    match observe_polymarket_redemption_credit(
+                    match verify_polymarket_redemption_credit(
                         polymarket,
+                        Some(relayer),
+                        &hash,
                         collateral_before,
-                        contracts,
+                        redeemable_contracts,
                         claim_timeout,
                     )
                     .await
@@ -1945,9 +1986,17 @@ async fn attempt_settlements(
                                 );
                             }
                         }
-                        Err(reason) => {
-                            let _ = coordinator.record_settlement_error(&pair_key, &reason);
-                            warn!(market_id, "{reason}");
+                        Err(error) => {
+                            if error.zero_payout {
+                                let _ = coordinator.invalidate_polymarket_redemption_submission(
+                                    &pair_key,
+                                    &error.message,
+                                );
+                            } else {
+                                let _ =
+                                    coordinator.record_settlement_error(&pair_key, &error.message);
+                            }
+                            warn!(market_id, "{}", error.message);
                         }
                     }
                 }
@@ -2079,6 +2128,36 @@ async fn attempt_settlements(
     }
 }
 
+async fn refresh_redeemable_polymarket_contracts(
+    polymarket: &PolymarketExecutor,
+    token_id: &str,
+    recorded_contracts: Micro,
+) -> std::result::Result<Micro, String> {
+    let observed = polymarket
+        .refresh_conditional_balance_micro(token_id)
+        .await
+        .map_err(|error| format!("pre-redemption token balance retry: {error}"))?;
+    validate_redeemable_polymarket_contracts(recorded_contracts, observed)
+}
+
+fn validate_redeemable_polymarket_contracts(
+    recorded_contracts: Micro,
+    observed_contracts: Micro,
+) -> std::result::Result<Micro, String> {
+    const CONTRACT_TOLERANCE_MICRO: Micro = 10_000;
+    if observed_contracts <= CONTRACT_TOLERANCE_MICRO {
+        return Err(format!(
+            "redemption blocked: durable state records {recorded_contracts} Polymarket contracts but the wallet owns only {observed_contracts}; the position was likely sold/repaired without complete state reconciliation, so a zero-value redemption and unverifiable P&L are refused"
+        ));
+    }
+    if (observed_contracts - recorded_contracts).abs() > CONTRACT_TOLERANCE_MICRO {
+        return Err(format!(
+            "redemption blocked: durable state records {recorded_contracts} Polymarket contracts but the wallet owns {observed_contracts}; reconcile the missing repair/sale before settlement"
+        ));
+    }
+    Ok(observed_contracts)
+}
+
 async fn observe_polymarket_redemption_credit(
     polymarket: &PolymarketExecutor,
     collateral_before: Micro,
@@ -2106,6 +2185,74 @@ async fn observe_polymarket_redemption_credit(
             ));
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+struct PolymarketRedemptionObservationError {
+    zero_payout: bool,
+    message: String,
+}
+
+async fn verify_polymarket_redemption_credit(
+    polymarket: &PolymarketExecutor,
+    relayer: Option<&PolymarketRelayer>,
+    transaction_hash: &str,
+    collateral_before: Micro,
+    expected_payout: Micro,
+    timeout: Duration,
+) -> std::result::Result<Micro, PolymarketRedemptionObservationError> {
+    let balance_error = match observe_polymarket_redemption_credit(
+        polymarket,
+        collateral_before,
+        expected_payout,
+        timeout,
+    )
+    .await
+    {
+        Ok(payout) => return Ok(payout),
+        Err(error) => error,
+    };
+    let Some(relayer) = relayer else {
+        return Err(PolymarketRedemptionObservationError {
+            zero_payout: false,
+            message: balance_error,
+        });
+    };
+    match relayer
+        .verified_redemption_receipt_credit(transaction_hash)
+        .await
+    {
+        Ok(Some(0)) => Err(PolymarketRedemptionObservationError {
+            zero_payout: true,
+            message: format!(
+                "redemption {transaction_hash} confirmed on Polygon with a zero CTF payout; the durable position was stale or already unwound, so the pending redemption was invalidated: {balance_error}"
+            ),
+        }),
+        Ok(Some(payout)) => {
+            let tolerance = 10_000.max(expected_payout / 1_000);
+            if (payout - expected_payout).abs() <= tolerance {
+                Ok(payout)
+            } else {
+                Err(PolymarketRedemptionObservationError {
+                    zero_payout: false,
+                    message: format!(
+                        "redemption {transaction_hash} credited {payout} pUSD on-chain, outside expected {expected_payout} ± {tolerance}: {balance_error}"
+                    ),
+                })
+            }
+        }
+        Ok(None) => Err(PolymarketRedemptionObservationError {
+            zero_payout: false,
+            message: format!(
+                "redemption receipt {transaction_hash} is not available yet: {balance_error}"
+            ),
+        }),
+        Err(error) => Err(PolymarketRedemptionObservationError {
+            zero_payout: false,
+            message: format!(
+                "could not verify redemption receipt {transaction_hash}: {error}; {balance_error}"
+            ),
+        }),
     }
 }
 
@@ -2223,5 +2370,16 @@ mod execution_tests {
         )
         .unwrap();
         assert_eq!(selection, None);
+    }
+
+    #[test]
+    fn redemption_refuses_stale_or_mismatched_contract_state() {
+        assert!(validate_redeemable_polymarket_contracts(5_000_000, 0).is_err());
+        assert!(validate_redeemable_polymarket_contracts(5_000_000, 4_000_000).is_err());
+        assert_eq!(
+            validate_redeemable_polymarket_contracts(5_000_000, 5_005_000)
+                .expect("one contract-step tolerance"),
+            5_005_000
+        );
     }
 }

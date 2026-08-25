@@ -46,6 +46,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 const DEFAULT_CLOB_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_GAMMA_URL: &str = "https://gamma-api.polymarket.com";
+const DEFAULT_POLYGON_RPC_URL: &str = "https://polygon-bor-rpc.publicnode.com";
 const DEFAULT_MARKET_WEBSOCKET_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,6 +341,8 @@ impl PolymarketRelayerOptions {
 #[derive(Clone)]
 pub struct PolymarketRelayer {
     client: RelayClient,
+    http: HttpClient,
+    polygon_rpc_url: String,
     signature: WalletSignature,
     wallet_address: EthersAddress,
     signer_address: EthersAddress,
@@ -358,9 +361,10 @@ impl PolymarketRelayer {
         let mut client = RelayClient::new(137, wallet, auth, tx_type)
             .await
             .map_err(sdk_error)?;
-        if let Some(rpc) = options.polygon_rpc_url {
-            client.set_rpc_url(rpc);
-        }
+        let polygon_rpc_url = options
+            .polygon_rpc_url
+            .unwrap_or_else(|| DEFAULT_POLYGON_RPC_URL.to_owned());
+        client.set_rpc_url(polygon_rpc_url.clone());
         let wallet_address: EthersAddress = options.wallet_address.parse().map_err(sdk_error)?;
         let derived = if options.signature == WalletSignature::Poly1271 {
             client.derive_deposit_wallet_address().map_err(sdk_error)?
@@ -374,6 +378,8 @@ impl PolymarketRelayer {
         }
         Ok(Self {
             client,
+            http: HttpClient::new(&HttpClientOptions::default()).map_err(sdk_error)?,
+            polygon_rpc_url,
             signature: options.signature,
             wallet_address,
             signer_address,
@@ -440,21 +446,61 @@ impl PolymarketRelayer {
             // rs-builder-relayer-client 0.2.0 fixes a one-call Proxy envelope
             // at 200k gas. Real adapter redemptions in the incident exhausted
             // that inner limit. Its public API only scales gas by batch length,
-            // so add two harmless zero-value calls to the signer EOA: the SDK
-            // then signs a 360k envelope while the padding itself is cheap.
+            // so add three harmless zero-value calls to the signer EOA: the SDK
+            // then signs its maximum 400k envelope while the padding itself is
+            // cheap. A 360k envelope still produced relay-hub inner failures on
+            // real redemption paths.
             self.execute_legacy(
                 vec![
                     call,
                     relay_gas_padding_call(self.signer_address),
                     relay_gas_padding_call(self.signer_address),
+                    relay_gas_padding_call(self.signer_address),
                 ],
-                "Jupol automatic redemption (360k proxy gas)",
+                "Jupol automatic redemption (400k proxy gas)",
             )
             .await
         } else {
             self.execute_legacy(vec![call], "Jupol automatic redemption")
                 .await
         }
+    }
+
+    /// Returns `None` while the transaction is unavailable, `Some(0)` for a
+    /// confirmed no-op redemption, and a positive wallet credit only when the
+    /// receipt contains both a CTF payout and a matching pUSD transfer to the
+    /// configured wallet.
+    pub async fn verified_redemption_receipt_credit(
+        &self,
+        transaction_hash: &str,
+    ) -> Result<Option<Micro>, PolymarketError> {
+        let payload: serde_json::Value = self
+            .http
+            .post_json(
+                &self.polygon_rpc_url,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_getTransactionReceipt",
+                    "params": [transaction_hash],
+                }),
+            )
+            .await
+            .map_err(sdk_error)?;
+        if let Some(error) = payload.get("error") {
+            return Err(PolymarketError::Sdk(format!(
+                "Polygon receipt RPC rejected {transaction_hash}: {error}"
+            )));
+        }
+        let Some(receipt) = payload.get("result").and_then(serde_json::Value::as_object) else {
+            return Ok(None);
+        };
+        if receipt.get("status").and_then(serde_json::Value::as_str) != Some("0x1") {
+            return Err(PolymarketError::Sdk(format!(
+                "redemption transaction {transaction_hash} did not succeed on Polygon"
+            )));
+        }
+        parse_verified_redemption_credit(receipt, self.wallet_address).map(Some)
     }
 
     async fn execute_deposit_wallet(
@@ -529,6 +575,94 @@ fn relay_gas_padding_call(signer: EthersAddress) -> Transaction {
         data: "0x".to_owned(),
         value: "0".to_owned(),
     }
+}
+
+fn parse_verified_redemption_credit(
+    receipt: &serde_json::Map<String, serde_json::Value>,
+    wallet: EthersAddress,
+) -> Result<Micro, PolymarketError> {
+    let payout_topic = format!(
+        "0x{}",
+        hex::encode(keccak256(
+            b"PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)"
+        ))
+    );
+    let transfer_topic = format!(
+        "0x{}",
+        hex::encode(keccak256(b"Transfer(address,address,uint256)"))
+    );
+    let wallet_topic = format!("0x{:0>64}", hex::encode(wallet.as_bytes()));
+    let pusd = polymarket_relayer::contracts::PUSD.to_ascii_lowercase();
+    let logs = receipt
+        .get("logs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| PolymarketError::Sdk("Polygon receipt omitted logs".to_owned()))?;
+    let payout = logs
+        .iter()
+        .filter(|log| receipt_log_topic(log, 0) == Some(payout_topic.as_str()))
+        .filter_map(|log| log.get("data").and_then(serde_json::Value::as_str))
+        .map(redemption_payout_from_event_data)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<Micro>();
+    if payout == 0 {
+        return Ok(0);
+    }
+    let wallet_credit = logs
+        .iter()
+        .filter(|log| {
+            log.get("address")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|address| address.eq_ignore_ascii_case(&pusd))
+                && receipt_log_topic(log, 0) == Some(transfer_topic.as_str())
+                && receipt_log_topic(log, 2)
+                    .is_some_and(|topic| topic.eq_ignore_ascii_case(&wallet_topic))
+        })
+        .filter_map(|log| log.get("data").and_then(serde_json::Value::as_str))
+        .map(parse_event_word)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<Micro>();
+    if wallet_credit < payout {
+        return Err(PolymarketError::Sdk(format!(
+            "CTF receipt reports payout {payout}, but only {wallet_credit} pUSD reached the configured wallet"
+        )));
+    }
+    Ok(wallet_credit)
+}
+
+fn receipt_log_topic(log: &serde_json::Value, index: usize) -> Option<&str> {
+    log.get("topics")?.as_array()?.get(index)?.as_str()
+}
+
+fn redemption_payout_from_event_data(data: &str) -> Result<Micro, PolymarketError> {
+    let data = data.strip_prefix("0x").unwrap_or(data);
+    if data.len() < 192 {
+        return Err(PolymarketError::Sdk(
+            "PayoutRedemption event data is truncated".to_owned(),
+        ));
+    }
+    parse_hex_micro(&data[128..192])
+}
+
+fn parse_event_word(data: &str) -> Result<Micro, PolymarketError> {
+    let data = data.strip_prefix("0x").unwrap_or(data);
+    if data.len() < 64 {
+        return Err(PolymarketError::Sdk(
+            "receipt event word is truncated".to_owned(),
+        ));
+    }
+    parse_hex_micro(&data[..64])
+}
+
+fn parse_hex_micro(value: &str) -> Result<Micro, PolymarketError> {
+    let value = EthersU256::from_str_radix(value, 16).map_err(sdk_error)?;
+    if value > EthersU256::from(u64::MAX) {
+        return Err(PolymarketError::Sdk(
+            "receipt amount exceeds the accounting range".to_owned(),
+        ));
+    }
+    Ok(Micro::from(value.as_u64()))
 }
 
 fn relay_result(result: TxResult) -> Result<String, PolymarketError> {
@@ -1703,6 +1837,57 @@ mod tests {
         assert_eq!(call.to, format!("{signer:?}"));
         assert_eq!(call.data, "0x");
         assert_eq!(call.value, "0");
+    }
+
+    #[test]
+    fn redemption_receipt_requires_positive_payout_and_wallet_credit() {
+        let wallet = EthersAddress::from_low_u64_be(7);
+        let payout_topic = format!(
+            "0x{}",
+            hex::encode(keccak256(
+                b"PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)"
+            ))
+        );
+        let transfer_topic = format!(
+            "0x{}",
+            hex::encode(keccak256(b"Transfer(address,address,uint256)"))
+        );
+        let wallet_topic = format!("0x{:0>64}", hex::encode(wallet.as_bytes()));
+        let receipt = serde_json::json!({
+            "logs": [
+                {
+                    "topics": [payout_topic],
+                    "data": format!("0x{:064x}{:064x}{:064x}", 0, 96, 5_000_000),
+                },
+                {
+                    "address": polymarket_relayer::contracts::PUSD,
+                    "topics": [transfer_topic, format!("0x{:064x}", 0), wallet_topic],
+                    "data": format!("0x{:064x}", 5_000_000),
+                }
+            ]
+        });
+        assert_eq!(
+            parse_verified_redemption_credit(receipt.as_object().unwrap(), wallet)
+                .expect("matching on-chain credit"),
+            5_000_000
+        );
+
+        let zero_receipt = serde_json::json!({
+            "logs": [{
+                "topics": [format!(
+                    "0x{}",
+                    hex::encode(keccak256(
+                        b"PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)"
+                    ))
+                )],
+                "data": format!("0x{:064x}{:064x}{:064x}", 0, 96, 0),
+            }]
+        });
+        assert_eq!(
+            parse_verified_redemption_credit(zero_receipt.as_object().unwrap(), wallet)
+                .expect("confirmed no-op"),
+            0
+        );
     }
 
     #[test]

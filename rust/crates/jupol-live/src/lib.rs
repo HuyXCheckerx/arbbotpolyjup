@@ -921,6 +921,26 @@ impl LiveCoordinator {
         self.bump_and_save()
     }
 
+    pub fn invalidate_polymarket_redemption_submission(
+        &mut self,
+        pair_key: &str,
+        reason: &str,
+    ) -> Result<(), LiveError> {
+        let position = self
+            .state
+            .positions
+            .iter_mut()
+            .find(|position| position.pair.key == pair_key)
+            .ok_or_else(|| LiveError::InvalidRequest(format!("pair {pair_key} disappeared")))?;
+        if position.polymarket_settled {
+            return Ok(());
+        }
+        position.polymarket_settlement_transaction_signature = None;
+        position.polymarket_redemption_collateral_before_micro_usd = None;
+        position.settlement_error = Some(reason.to_owned());
+        self.bump_and_save()
+    }
+
     pub fn record_jupiter_settlement(
         &mut self,
         pair_key: &str,

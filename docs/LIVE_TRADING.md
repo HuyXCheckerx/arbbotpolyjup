@@ -141,10 +141,13 @@ The live process checks expired positions every 15 seconds:
 `pnpm redeem:polymarket` manually retries Polymarket redemption. It sends a real
 relayer transaction.
 
-Legacy Proxy-wallet redemption uses a three-call relayer batch so the current
-relayer SDK supplies 360k rather than its insufficient 200k single-call gas
-limit. The two padding calls are zero-value/no-data calls to the signer; they do
-not transfer funds. `poly1271` and Safe execution are unchanged.
+Legacy Proxy-wallet redemption uses a four-call relayer batch so the current
+relayer SDK supplies its maximum 400k rather than its insufficient 200k
+single-call gas limit. The three padding calls are zero-value/no-data calls to
+the signer; they do not transfer funds. Before submission, the bot requires the
+wallet's current conditional-token balance to match durable state within 0.01
+contracts, preventing stale repaired/unwound positions from producing
+zero-value redemption transactions. `poly1271` and Safe execution are unchanged.
 
 ## Required configuration
 
