@@ -19,8 +19,12 @@ use jupol_domain::Micro;
 use jupol_domain::fixed::ONE_USD_MICRO;
 use jupol_jupiter::{
     JupiterError, JupiterHybridExecutor, PreparedJupiterSubmission, SubmittedJupiterOrder,
+    forecast_swap_position_id,
 };
-use jupol_polymarket::{PolymarketError, PolymarketExecutor, PolymarketFill, PreparedFokOrder};
+use jupol_polymarket::{
+    PolymarketError, PolymarketExecutor, PolymarketFill, PreparedFokOrder,
+    normalize_fok_contracts_for_price,
+};
 use jupol_state::{
     LivePairIdentity, LivePosition, LivePositionPhase, LiveTraderState, PostFillAction,
     PostFillRiskPlan, ResolutionScenario, ResolutionScenarioCode, StateError, load_live_state,
@@ -123,7 +127,11 @@ impl LiveCoordinator {
                 state_path.display()
             ))
         })?;
-        let state = load_live_state(&state_path)?;
+        let mut state = load_live_state(&state_path)?;
+        if migrate_live_state(&mut state) {
+            state.sequence = state.sequence.saturating_add(1);
+            save_live_state(&state_path, &state)?;
+        }
         Ok(Self {
             state_path,
             state,
@@ -448,6 +456,24 @@ impl LiveCoordinator {
             else {
                 continue;
             };
+            if position.pair.end_ms <= unix_timestamp_ms() && has_recorded_exposure(&position) {
+                let reason = "pair has ended with durable recorded exposure; repair and zero-exposure deletion are disabled while settlement is reconciled";
+                let current = self
+                    .state
+                    .positions
+                    .iter_mut()
+                    .find(|candidate| candidate.id == id)
+                    .ok_or_else(|| {
+                        LiveError::Recovery(format!("position {id} disappeared during recovery"))
+                    })?;
+                current.phase = LivePositionPhase::AwaitingResolution;
+                self.bump_and_save()?;
+                dispositions.push(EntryDisposition::RecoveryPending {
+                    position_id: id,
+                    reason: reason.to_owned(),
+                });
+                continue;
+            }
             if let Some(order_pubkey) = position.jupiter_order_pubkey.as_deref() {
                 match jupiter.get_order_status(order_pubkey).await {
                     Ok(status) if status.status == "pending" => {
@@ -653,7 +679,11 @@ impl LiveCoordinator {
     ) -> Result<usize, LiveError> {
         let mut changed = 0_usize;
         for position in &mut self.state.positions {
-            if position.pair.end_ms <= now_ms && matches!(position.phase, LivePositionPhase::Open) {
+            if position.pair.end_ms <= now_ms
+                && (matches!(position.phase, LivePositionPhase::Open)
+                    || has_recorded_exposure(position))
+                && !matches!(position.phase, LivePositionPhase::AwaitingResolution)
+            {
                 position.phase = LivePositionPhase::AwaitingResolution;
                 changed = changed.saturating_add(1);
             }
@@ -883,10 +913,17 @@ impl LiveCoordinator {
         position.entry_submission_skew_ms = polymarket_fill
             .zip(jupiter_fill)
             .map(|(poly, jup)| (poly.submitted_at_ms - jup.submission_started_at_ms).abs());
-        if let Some(fill) = polymarket_fill
-            && let Some(hash) = fill.transaction_hashes.first()
-        {
-            position.polymarket_settlement_transaction_signature = Some(hash.clone());
+        if let Some(fill) = polymarket_fill {
+            for hash in &fill.transaction_hashes {
+                if !position.polymarket_entry_transaction_hashes.contains(hash) {
+                    position
+                        .polymarket_entry_transaction_hashes
+                        .push(hash.clone());
+                }
+            }
+        }
+        if let Some(fill) = jupiter_fill {
+            position.jupiter_entry_transaction_signature = Some(fill.transaction_signature.clone());
         }
         self.bump_and_save()
     }
@@ -926,6 +963,59 @@ impl LiveCoordinator {
     }
 }
 
+fn migrate_live_state(state: &mut LiveTraderState) -> bool {
+    let mut changed = false;
+    for position in &mut state.positions {
+        // Older Rust builds accidentally stored a Polymarket entry transaction
+        // in the redemption field. A real pending redemption always also has
+        // its pre-redemption collateral snapshot.
+        if !position.polymarket_settled
+            && position
+                .polymarket_settlement_transaction_signature
+                .is_some()
+            && position
+                .polymarket_redemption_collateral_before_micro_usd
+                .is_none()
+        {
+            if let Some(hash) = position.polymarket_settlement_transaction_signature.take()
+                && !position.polymarket_entry_transaction_hashes.contains(&hash)
+            {
+                position.polymarket_entry_transaction_hashes.push(hash);
+            }
+            changed = true;
+        }
+
+        // Prediction's atomic BISON execution returns a build-time position
+        // identity, but custody and settlement are the owned outcome token.
+        // Persist the synthetic token identity used by the hybrid executor and
+        // retain the raw build identity only as entry audit metadata.
+        if position.jupiter_order_pubkey.is_none()
+            && position.jupiter_execution_reconciliation_source.as_deref()
+                == Some("onchain_token_deltas")
+            && !position.jupiter_position_pubkey.starts_with("swap-v2:")
+            && let Some(outcome_mint) = position.pair.jupiter_outcome_mint.as_deref()
+        {
+            if position.jupiter_entry_position_pubkey.is_none() {
+                position.jupiter_entry_position_pubkey =
+                    Some(position.jupiter_position_pubkey.clone());
+            }
+            position.jupiter_position_pubkey =
+                forecast_swap_position_id(&position.pair.jupiter_market_id, outcome_mint);
+            position.jupiter_rent_reclaimed = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn has_recorded_exposure(position: &LivePosition) -> bool {
+    position.post_fill_risk_plan.is_some()
+        && (position.polymarket_contracts_micro > 0
+            || position.jupiter_contracts_micro > 0
+            || position.polymarket_entry_cost_micro_usd > 0
+            || position.jupiter_entry_cost_micro_usd > 0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RepairResult {
     final_contracts_micro: Micro,
@@ -946,8 +1036,8 @@ async fn repair_polymarket_to_target(
     let (best_bid, best_ask) = polymarket.best_bid_ask_micro_usd(token_id).await?;
     let effective_maximum_loss = max(configured_maximum_loss, polymarket_cost.max(jupiter_cost));
     if current < target {
-        let missing = floor_contract_step(target - current);
-        if missing <= 0 {
+        let requested_missing = floor_contract_step(target - current);
+        if requested_missing <= 0 {
             return Ok(RepairResult {
                 final_contracts_micro: current,
                 additional_cost_micro_usd: 0,
@@ -957,6 +1047,12 @@ async fn repair_polymarket_to_target(
         let ask =
             best_ask.ok_or_else(|| LiveError::Recovery("repair BUY has no ask".to_owned()))?;
         let limit = align_price_up(apply_buy_slippage(ask, slippage_bps)?);
+        let missing = normalize_fok_contracts_for_price(limit, requested_missing);
+        if missing <= 0 {
+            return Err(LiveError::Recovery(format!(
+                "repair BUY quantity {requested_missing} has no precision-valid size at limit {limit}"
+            )));
+        }
         let estimated_cost = multiply_price_quantity(limit, missing)?;
         let modeled_loss = polymarket_cost
             .checked_add(jupiter_cost)
@@ -978,8 +1074,8 @@ async fn repair_polymarket_to_target(
             proceeds_micro_usd: 0,
         })
     } else {
-        let excess = floor_contract_step(current - target);
-        if excess <= 0 {
+        let requested_excess = floor_contract_step(current - target);
+        if requested_excess <= 0 {
             return Ok(RepairResult {
                 final_contracts_micro: current,
                 additional_cost_micro_usd: 0,
@@ -989,6 +1085,12 @@ async fn repair_polymarket_to_target(
         let bid =
             best_bid.ok_or_else(|| LiveError::Recovery("repair SELL has no bid".to_owned()))?;
         let limit = align_price_down(apply_sell_slippage(bid, slippage_bps)?);
+        let excess = normalize_fok_contracts_for_price(limit, requested_excess);
+        if excess <= 0 {
+            return Err(LiveError::Recovery(format!(
+                "repair SELL quantity {requested_excess} has no precision-valid size at limit {limit}"
+            )));
+        }
         let unwind_loss = multiply_price_quantity(ONE_USD_MICRO - limit, excess)?;
         if unwind_loss > effective_maximum_loss {
             return Err(LiveError::Recovery(format!(
@@ -1012,13 +1114,25 @@ fn placeholder_position(
     request: &LiveEntryRequest,
     build: &jupol_jupiter::PredictionOrderBuild,
 ) -> LivePosition {
+    let jupiter_position_pubkey = if build.execution_model.as_deref() == Some("atomic_swap") {
+        build
+            .outcome_mint
+            .as_deref()
+            .or(request.jupiter_outcome_mint.as_deref())
+            .map_or_else(
+                || build.order.position_pubkey.clone(),
+                |mint| forecast_swap_position_id(&build.order.market_id, mint),
+            )
+    } else {
+        build.order.position_pubkey.clone()
+    };
     LivePosition {
         id: request.position_id.clone(),
         pair: request.pair.clone(),
         phase: LivePositionPhase::LegsSubmitting,
         entered_at_ms: unix_timestamp_ms(),
         jupiter_order_pubkey: build.order.order_pubkey.clone(),
-        jupiter_position_pubkey: build.order.position_pubkey.clone(),
+        jupiter_position_pubkey,
         jupiter_entry_position_pubkey: Some(build.order.position_pubkey.clone()),
         jupiter_quoted_contracts_micro: Some(build.order.new_contracts_micro),
         jupiter_execution_reconciliation_source: None,
@@ -1033,6 +1147,8 @@ fn placeholder_position(
         jupiter_settled: false,
         polymarket_settlement_payout_micro_usd: 0,
         jupiter_settlement_payout_micro_usd: 0,
+        polymarket_entry_transaction_hashes: Vec::new(),
+        jupiter_entry_transaction_signature: None,
         polymarket_settlement_transaction_signature: None,
         polymarket_redemption_collateral_before_micro_usd: None,
         jupiter_settlement_transaction_signature: None,
@@ -1334,6 +1450,58 @@ fn unix_timestamp_ms() -> i64 {
 mod tests {
     use super::*;
 
+    fn test_position() -> LivePosition {
+        LivePosition {
+            id: "live-test".to_owned(),
+            pair: LivePairIdentity {
+                key: "5m:test".to_owned(),
+                duration: "5m".to_owned(),
+                start_ms: 1_000,
+                end_ms: 2_000,
+                polymarket_market_id: "poly-market".to_owned(),
+                polymarket_slug: "poly-slug".to_owned(),
+                polymarket_token_id: "poly-token".to_owned(),
+                polymarket_outcome: jupol_state::Outcome::Down,
+                jupiter_market_id: "BISON-market".to_owned(),
+                jupiter_outcome_mint: Some("outcome-mint".to_owned()),
+                jupiter_outcome: jupol_state::Outcome::Up,
+            },
+            phase: LivePositionPhase::RecoveryPlanning,
+            entered_at_ms: 1_500,
+            jupiter_order_pubkey: None,
+            jupiter_position_pubkey: "raw-build-position".to_owned(),
+            jupiter_entry_position_pubkey: Some("raw-build-position".to_owned()),
+            jupiter_quoted_contracts_micro: Some(10_000_000),
+            jupiter_execution_reconciliation_source: Some("onchain_token_deltas".to_owned()),
+            jupiter_contracts_micro: 10_000_000,
+            polymarket_contracts_micro: 0,
+            jupiter_entry_cost_micro_usd: 4_000_000,
+            polymarket_entry_cost_micro_usd: 0,
+            remaining_entry_cost_micro_usd: 4_000_000,
+            original_contracts_micro: 0,
+            realized_profit_micro_usd: 0,
+            polymarket_settled: false,
+            jupiter_settled: false,
+            polymarket_settlement_payout_micro_usd: 0,
+            jupiter_settlement_payout_micro_usd: 0,
+            polymarket_entry_transaction_hashes: Vec::new(),
+            jupiter_entry_transaction_signature: None,
+            polymarket_settlement_transaction_signature: Some("entry-hash".to_owned()),
+            polymarket_redemption_collateral_before_micro_usd: None,
+            jupiter_settlement_transaction_signature: None,
+            jupiter_rent_reclaimed: true,
+            jupiter_rent_reclaimed_lamports: 0,
+            jupiter_rent_reclaim_transaction_signatures: Vec::new(),
+            entry_submission_skew_ms: None,
+            exit_submission_skew_ms: None,
+            diagnostic_test_entry: false,
+            entry_zero_exposure_proof: None,
+            post_fill_risk_plan: Some(build_risk_plan(0, 10_000_000, 4_000_000)),
+            last_error: None,
+            settlement_error: None,
+        }
+    }
+
     #[test]
     fn risk_plan_models_all_four_resolution_states() {
         let plan = build_risk_plan(10_000_000, 9_500_000, 8_000_000);
@@ -1397,5 +1565,30 @@ mod tests {
             0,
             90_000,
         ));
+    }
+
+    #[test]
+    fn migrates_atomic_execution_identity_and_misfiled_entry_hash() {
+        let mut state = LiveTraderState::default();
+        state.positions.push(test_position());
+        assert!(migrate_live_state(&mut state));
+        let position = &state.positions[0];
+        assert_eq!(
+            position.jupiter_position_pubkey,
+            "swap-v2:BISON-market:outcome-mint"
+        );
+        assert_eq!(
+            position.polymarket_entry_transaction_hashes,
+            vec!["entry-hash"]
+        );
+        assert_eq!(position.polymarket_settlement_transaction_signature, None);
+        assert!(!position.jupiter_rent_reclaimed);
+        assert!(!migrate_live_state(&mut state));
+    }
+
+    #[test]
+    fn known_exposure_cannot_be_treated_as_zero_after_expiry() {
+        let position = test_position();
+        assert!(has_recorded_exposure(&position));
     }
 }

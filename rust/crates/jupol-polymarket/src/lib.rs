@@ -34,7 +34,7 @@ use polymarket_client_sdk_v2::clob::types::request::{
     BalanceAllowanceRequest, OrderBookSummaryRequest,
 };
 use polymarket_client_sdk_v2::clob::types::{
-    AssetType, OrderStatusType, OrderType, Side, SignatureType, SignedOrder,
+    AssetType, OrderPayload, OrderStatusType, OrderType, Side, SignatureType, SignedOrder,
 };
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
@@ -44,7 +44,7 @@ use polymarket_relayer::{
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-const DEFAULT_CLOB_URL: &str = "https://clob-v2.polymarket.com";
+const DEFAULT_CLOB_URL: &str = "https://clob.polymarket.com";
 const DEFAULT_GAMMA_URL: &str = "https://gamma-api.polymarket.com";
 const DEFAULT_MARKET_WEBSOCKET_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
@@ -1249,10 +1249,11 @@ impl PolymarketExecutor {
     }
 
     pub async fn prime_token(&self, token_id: &str) -> Result<(), PolymarketError> {
-        self.client
-            .tick_size(parse_token(token_id)?)
-            .await
-            .map_err(sdk_error)?;
+        let token_id = parse_token(token_id)?;
+        let (version, tick_size) =
+            tokio::join!(self.client.version(), self.client.tick_size(token_id));
+        version.map_err(sdk_error)?;
+        tick_size.map_err(sdk_error)?;
         Ok(())
     }
 
@@ -1294,9 +1295,18 @@ impl PolymarketExecutor {
                 "FOK size must be at least 0.01 contracts and have at most two decimals".to_owned(),
             ));
         }
-        // The CLOB limit-order format permits exactly two size decimals. Flooring here
-        // prevents the precision rejection that previously created half-position halts.
-        let normalized_contracts = contracts_micro - contracts_micro.rem_euclid(10_000);
+        // A marketable order has two independent precision constraints: the share
+        // amount has at most four decimals and its USDC leg has at most two. A
+        // two-decimal size alone is insufficient (for example 14.11 * $0.34).
+        let normalized_contracts =
+            normalize_fok_contracts_for_price(limit_price_micro_usd, contracts_micro);
+        if normalized_contracts < 10_000 {
+            return Err(PolymarketError::InvalidValue(format!(
+                "FOK size {} has no positive quantity satisfying the CLOB amount precision at price {}",
+                format_contracts(contracts_micro),
+                format_usd(limit_price_micro_usd),
+            )));
+        }
         let signable = self
             .client
             .limit_order()
@@ -1313,6 +1323,7 @@ impl PolymarketExecutor {
             .sign(&self.signer, signable)
             .await
             .map_err(sdk_error)?;
+        validate_fok_amount_precision(&signed, side)?;
         Ok(PreparedFokOrder {
             signed,
             side,
@@ -1383,6 +1394,62 @@ impl PolymarketExecutor {
             trade_ids: response.trade_ids,
         })
     }
+}
+
+/// Floors a requested FOK quantity to the greatest value for which the signed
+/// share amount has at most four decimals and the USDC amount has at most two.
+#[must_use]
+pub fn normalize_fok_contracts_for_price(
+    limit_price_micro_usd: Micro,
+    contracts_micro: Micro,
+) -> Micro {
+    if limit_price_micro_usd <= 0 || contracts_micro <= 0 {
+        return 0;
+    }
+    let requested_share_cents = contracts_micro / 10_000;
+    let divisor = gcd_micro(limit_price_micro_usd, ONE_USD_MICRO);
+    let share_cent_step = ONE_USD_MICRO / divisor;
+    (requested_share_cents / share_cent_step) * share_cent_step * 10_000
+}
+
+fn gcd_micro(mut left: Micro, mut right: Micro) -> Micro {
+    left = left.abs();
+    right = right.abs();
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn validate_fok_amount_precision(signed: &SignedOrder, side: Side) -> Result<(), PolymarketError> {
+    let (maker_amount, taker_amount) = match &signed.payload {
+        OrderPayload::V1(payload) => (&payload.order.makerAmount, &payload.order.takerAmount),
+        OrderPayload::V2(payload) => (&payload.order.makerAmount, &payload.order.takerAmount),
+        _ => {
+            return Err(PolymarketError::InvalidValue(
+                "unsupported signed CLOB order version".to_owned(),
+            ));
+        }
+    };
+    let cents = U256::from(10_000_u64);
+    let four_decimals = U256::from(100_u64);
+    let (usdc_amount, share_amount) = match side {
+        Side::Buy => (maker_amount, taker_amount),
+        Side::Sell => (taker_amount, maker_amount),
+        _ => {
+            return Err(PolymarketError::InvalidValue(
+                "unsupported signed CLOB order side".to_owned(),
+            ));
+        }
+    };
+    if *usdc_amount % cents != U256::ZERO || *share_amount % four_decimals != U256::ZERO {
+        return Err(PolymarketError::InvalidValue(format!(
+            "signed FOK amounts violate CLOB precision: USDC={usdc_amount}, shares={share_amount}"
+        )));
+    }
+    Ok(())
 }
 
 fn convert_side_book(
@@ -1548,6 +1615,26 @@ mod tests {
         assert_eq!(
             decimal_contracts(decimal_from_contracts(12_340_000).unwrap()).unwrap(),
             12_340_000
+        );
+    }
+
+    #[test]
+    fn fok_quantity_satisfies_both_market_order_precision_limits() {
+        assert_eq!(
+            normalize_fok_contracts_for_price(340_000, 14_110_000),
+            14_000_000
+        );
+        assert_eq!(
+            normalize_fok_contracts_for_price(200_000, 6_480_000),
+            6_450_000
+        );
+        assert_eq!(
+            normalize_fok_contracts_for_price(180_000, 8_000_000),
+            8_000_000
+        );
+        assert_eq!(
+            normalize_fok_contracts_for_price(500_000, 11_084_672),
+            11_080_000
         );
     }
 

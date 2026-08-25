@@ -133,6 +133,10 @@ pub struct LivePosition {
     #[serde(with = "micro_n")]
     pub jupiter_settlement_payout_micro_usd: Micro,
     #[serde(default)]
+    pub polymarket_entry_transaction_hashes: Vec<String>,
+    #[serde(default)]
+    pub jupiter_entry_transaction_signature: Option<String>,
+    #[serde(default)]
     pub polymarket_settlement_transaction_signature: Option<String>,
     #[serde(default, with = "optional_micro_n")]
     pub polymarket_redemption_collateral_before_micro_usd: Option<Micro>,

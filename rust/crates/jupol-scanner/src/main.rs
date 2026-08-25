@@ -24,13 +24,13 @@ use jupol_domain::fixed::{
 };
 use jupol_domain::short_window::{
     CrossVenueShortWindowRoute, EvaluatedCrossVenueRoute, all_complementary_cross_venue_routes,
-    evaluate_cross_venue_routes,
+    evaluate_cross_venue_routes, polymarket_crypto_taker_fee_per_contract_micro_usd,
 };
 use jupol_domain::strategy::{
     EntryEvaluation, ShortWindowStrategyConfig, evaluate_short_window_entry,
     quote_buy_across_levels,
 };
-use jupol_domain::types::{BinaryOrderBook, ShortWindowOutcome};
+use jupol_domain::types::{BinaryOrderBook, BookLevel, ShortWindowOutcome};
 use jupol_jupiter::{
     JupiterClient, JupiterClientOptions, JupiterForecastSwapExecutor, JupiterHybridExecutor,
     JupiterPredictionExecutor, JupiterPriceBookState, JupiterSwapClient,
@@ -39,7 +39,8 @@ use jupol_jupiter::{
 use jupol_live::{EntryDisposition, LiveCoordinator, LiveEntryRequest, capture_entry_balances};
 use jupol_polymarket::{
     PolymarketExecutor, PolymarketGammaClient, PolymarketMarketData, PolymarketOptions,
-    PolymarketRelayer, PolymarketRelayerOptions, PolymarketStreamMarket, spawn_market_stream,
+    PolymarketRelayer, PolymarketRelayerOptions, PolymarketStreamMarket,
+    normalize_fok_contracts_for_price, spawn_market_stream,
 };
 use jupol_runtime::request_scheduler::{JupiterRequestScheduler, RequestPriority};
 use jupol_state::{
@@ -62,7 +63,8 @@ const LIVE_CONFIRMATION: &str = "I_ACCEPT_REAL_MONEY_RISK";
 const DEFAULT_OUTPUT: &str = "logs/btc-poly-jup-short-window-rust.jsonl";
 const DEFAULT_STATE: &str = "logs/btc-poly-jup-short-window-live-state.json";
 const DEVELOPER_REQUEST_INTERVAL_MS: u64 = 100;
-const JUPITER_CRITICAL_SLOT_BUDGET_MS: i64 = 250;
+const JUPITER_CRITICAL_SLOT_BUDGET_MS: i64 = 100;
+const MAXIMUM_PRECISION_SIZE_MISMATCH_BPS: Micro = 500;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -918,18 +920,30 @@ async fn try_live_entry(
     } else {
         None
     };
-    let build = jupiter
-        .prepare_buy(
-            &jupiter_market.market_id,
-            true,
-            proposal.jupiter.gross_micro_usd,
-            jupiter_market.outcome_mint.as_deref(),
-        )
-        .await
-        .context("fresh Jupiter build failed")?;
-    // Freshness starts when the executable build is received. Network time
-    // spent obtaining it does not make the returned blockhash/quote older.
-    let build_received_at_ms = unix_ms();
+    // Obtain both authoritative inputs in parallel. Fetching the CLOB book
+    // after Jupiter's executable build previously consumed most of its 500 ms
+    // freshness window before either leg reached submission.
+    let (build, fresh_poly) = tokio::join!(
+        async {
+            let build = jupiter
+                .prepare_buy(
+                    &jupiter_market.market_id,
+                    true,
+                    proposal.jupiter.gross_micro_usd,
+                    jupiter_market.outcome_mint.as_deref(),
+                )
+                .await
+                .context("fresh Jupiter build failed")?;
+            Ok::<_, anyhow::Error>((build, unix_ms()))
+        },
+        polymarket_data.binary_order_book(
+            &runtime.pair.polymarket.market_id,
+            runtime.pair.polymarket_up_token(),
+            runtime.pair.polymarket_down_token(),
+        ),
+    );
+    let (build, build_received_at_ms) = build?;
+    let fresh_poly = fresh_poly?;
     let before = match native_before {
         Some(snapshot) => snapshot,
         None => {
@@ -944,52 +958,33 @@ async fn try_live_entry(
             .await?
         }
     };
-    let exact_contracts = floor_polymarket_contracts(build.order.new_contracts_micro);
-    if exact_contracts < config.strategy.polymarket_minimum_contracts_micro {
-        return Ok(None);
-    }
-    let fresh_poly = polymarket_data
-        .binary_order_book(
-            &runtime.pair.polymarket.market_id,
-            runtime.pair.polymarket_up_token(),
-            runtime.pair.polymarket_down_token(),
-        )
-        .await?;
     let poly_levels = match proposal.route.polymarket_outcome {
         ShortWindowOutcome::Up => &fresh_poly.yes.asks,
         ShortWindowOutcome::Down => &fresh_poly.no.asks,
-    };
-    let Some(poly_quote) = quote_buy_across_levels(poly_levels, exact_contracts, false)? else {
-        return Ok(None);
     };
     let jupiter_all_in = build
         .order
         .order_cost_micro_usd
         .checked_add(build.order.estimated_total_fee_micro_usd)
         .ok_or_else(|| anyhow!("Jupiter exact cost overflow"))?;
-    let all_in = poly_quote
-        .all_in_micro_usd
-        .checked_add(jupiter_all_in)
-        .ok_or_else(|| anyhow!("exact entry cost overflow"))?;
-    let edge = exact_contracts
-        .checked_sub(all_in)
-        .ok_or_else(|| anyhow!("exact entry edge overflow"))?;
-    let edge_per_contract = edge
-        .checked_mul(ONE_CONTRACT_MICRO)
-        .and_then(|value| value.checked_div(exact_contracts))
-        .ok_or_else(|| anyhow!("exact entry edge-per-contract overflow"))?;
-    if edge < config.strategy.minimum_entry_edge_total_micro_usd
-        || edge_per_contract < config.strategy.minimum_entry_edge_micro_usd_per_contract
-    {
-        return Ok(None);
-    }
-    let limit = buy_limit(
-        poly_quote.limit_price_micro_usd,
+    let Some(selection) = select_precision_safe_polymarket_buy(
+        poly_levels,
+        build.order.new_contracts_micro,
+        jupiter_all_in,
+        poly_cash,
+        &config.strategy,
         config.maximum_slippage_bps,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     let (jupiter_submission, polymarket_order) = tokio::join!(
         jupiter.prepare_submission(build),
-        polymarket.prepare_buy_fok(token_id, limit, exact_contracts),
+        polymarket.prepare_buy_fok(
+            token_id,
+            selection.limit_price_micro_usd,
+            selection.contracts_micro,
+        ),
     );
     let jupiter_submission = jupiter_submission?;
     let polymarket_order = polymarket_order?;
@@ -1036,41 +1031,43 @@ async fn try_daily_live_entry(
         polymarket.collateral_balance_micro_usd(),
         jupiter.wallet_balances(),
     );
+    let poly_cash = poly_cash?;
+    let jup_ready = jup_ready?;
     let mut strategy = config.strategy;
     strategy.jupiter_minimum_gross_order_micro_usd = strategy
         .jupiter_minimum_gross_order_micro_usd
         .max(PREDICTION_MINIMUM_BUY_MICRO_USD);
     let proposal = match evaluate_short_window_entry(
         Some(screened_best),
-        poly_cash?,
-        jup_ready?.usdc_micro,
+        poly_cash,
+        jup_ready.usdc_micro,
         &strategy,
     )? {
         EntryEvaluation::Eligible(proposal) => proposal,
         EntryEvaluation::Rejected(_) => return Ok(None),
     };
     let is_yes = proposal.route.jupiter_outcome == ShortWindowOutcome::Up;
-    let build = jupiter
-        .prepare_buy(
-            &runtime.pair.jupiter.market_id,
-            is_yes,
-            proposal.jupiter.gross_micro_usd,
-            None,
-        )
-        .await
-        .context("fresh daily Jupiter build failed")?;
-    let build_received_at_ms = unix_ms();
-    let exact_contracts = floor_polymarket_contracts(build.order.new_contracts_micro);
-    if exact_contracts < strategy.polymarket_minimum_contracts_micro {
-        return Ok(None);
-    }
-    let fresh_poly = polymarket_data
-        .binary_order_book(
+    let (build, fresh_poly) = tokio::join!(
+        async {
+            let build = jupiter
+                .prepare_buy(
+                    &runtime.pair.jupiter.market_id,
+                    is_yes,
+                    proposal.jupiter.gross_micro_usd,
+                    None,
+                )
+                .await
+                .context("fresh daily Jupiter build failed")?;
+            Ok::<_, anyhow::Error>((build, unix_ms()))
+        },
+        polymarket_data.binary_order_book(
             &runtime.pair.polymarket.market_id,
             runtime.pair.yes_token(),
             runtime.pair.no_token(),
-        )
-        .await?;
+        ),
+    );
+    let (build, build_received_at_ms) = build?;
+    let fresh_poly = fresh_poly?;
     let (token_id, levels) = match proposal.route.polymarket_outcome {
         ShortWindowOutcome::Up => (runtime.pair.yes_token(), &fresh_poly.yes.asks),
         ShortWindowOutcome::Down => (runtime.pair.no_token(), &fresh_poly.no.asks),
@@ -1084,37 +1081,29 @@ async fn try_daily_live_entry(
         true,
     )
     .await?;
-    let Some(poly_quote) = quote_buy_across_levels(levels, exact_contracts, false)? else {
-        return Ok(None);
-    };
     let jupiter_all_in = build
         .order
         .order_cost_micro_usd
         .checked_add(build.order.estimated_total_fee_micro_usd)
         .ok_or_else(|| anyhow!("daily Jupiter exact cost overflow"))?;
-    let all_in = poly_quote
-        .all_in_micro_usd
-        .checked_add(jupiter_all_in)
-        .ok_or_else(|| anyhow!("daily exact entry cost overflow"))?;
-    let edge = exact_contracts
-        .checked_sub(all_in)
-        .ok_or_else(|| anyhow!("daily exact edge overflow"))?;
-    let edge_per_contract = edge
-        .checked_mul(ONE_CONTRACT_MICRO)
-        .and_then(|value| value.checked_div(exact_contracts))
-        .ok_or_else(|| anyhow!("daily exact edge-per-contract overflow"))?;
-    if edge < strategy.minimum_entry_edge_total_micro_usd
-        || edge_per_contract < strategy.minimum_entry_edge_micro_usd_per_contract
-    {
-        return Ok(None);
-    }
-    let limit = buy_limit(
-        poly_quote.limit_price_micro_usd,
+    let Some(selection) = select_precision_safe_polymarket_buy(
+        levels,
+        build.order.new_contracts_micro,
+        jupiter_all_in,
+        poly_cash,
+        &strategy,
         config.maximum_slippage_bps,
-    )?;
+    )?
+    else {
+        return Ok(None);
+    };
     let (jupiter_submission, polymarket_order) = tokio::join!(
         jupiter.prepare_submission(build),
-        polymarket.prepare_buy_fok(token_id, limit, exact_contracts),
+        polymarket.prepare_buy_fok(
+            token_id,
+            selection.limit_price_micro_usd,
+            selection.contracts_micro,
+        ),
     );
     let jupiter_submission = jupiter_submission?;
     let polymarket_order = polymarket_order?;
@@ -1452,8 +1441,89 @@ fn haircut_polymarket_book(book: &BinaryOrderBook, haircut_bps: u32) -> BinaryOr
     result
 }
 
-fn floor_polymarket_contracts(value: Micro) -> Micro {
-    value - value.rem_euclid(10_000)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrecisionSafePolymarketBuy {
+    contracts_micro: Micro,
+    limit_price_micro_usd: Micro,
+}
+
+fn select_precision_safe_polymarket_buy(
+    levels: &[BookLevel],
+    requested_contracts_micro: Micro,
+    jupiter_all_in_micro_usd: Micro,
+    polymarket_cash_micro_usd: Micro,
+    strategy: &ShortWindowStrategyConfig,
+    slippage_bps: u32,
+) -> Result<Option<PrecisionSafePolymarketBuy>> {
+    let requested = requested_contracts_micro - requested_contracts_micro.rem_euclid(10_000);
+    if requested < strategy.polymarket_minimum_contracts_micro {
+        return Ok(None);
+    }
+    let Some(requested_quote) = quote_buy_across_levels(levels, requested, false)? else {
+        return Ok(None);
+    };
+    let minimum_limit = ((requested_quote.limit_price_micro_usd + 9_999) / 10_000) * 10_000;
+    let maximum_limit = buy_limit(requested_quote.limit_price_micro_usd, slippage_bps)?;
+    let budget = polymarket_cash_micro_usd.min(strategy.polymarket_maximum_allocation_micro_usd);
+    let mut best: Option<(PrecisionSafePolymarketBuy, Micro)> = None;
+    let mut limit = minimum_limit;
+    while limit <= maximum_limit {
+        let contracts = normalize_fok_contracts_for_price(limit, requested);
+        if contracts >= strategy.polymarket_minimum_contracts_micro {
+            let mismatch = requested.saturating_sub(contracts);
+            let mismatch_bps = mismatch
+                .checked_mul(10_000)
+                .and_then(|value| value.checked_div(requested))
+                .ok_or_else(|| anyhow!("Polymarket precision mismatch overflow"))?;
+            if mismatch_bps <= MAXIMUM_PRECISION_SIZE_MISMATCH_BPS
+                && quote_buy_across_levels(levels, contracts, false)?
+                    .is_some_and(|quote| quote.limit_price_micro_usd <= limit)
+            {
+                let gross = limit
+                    .checked_mul(contracts)
+                    .and_then(|value| value.checked_div(ONE_CONTRACT_MICRO))
+                    .ok_or_else(|| anyhow!("Polymarket precision-safe gross overflow"))?;
+                let fee = polymarket_crypto_taker_fee_per_contract_micro_usd(limit)?
+                    .checked_mul(contracts)
+                    .and_then(|value| value.checked_add(ONE_CONTRACT_MICRO / 2))
+                    .and_then(|value| value.checked_div(ONE_CONTRACT_MICRO))
+                    .ok_or_else(|| anyhow!("Polymarket precision-safe fee overflow"))?;
+                let polymarket_all_in = gross
+                    .checked_add(fee)
+                    .ok_or_else(|| anyhow!("Polymarket precision-safe cost overflow"))?;
+                let total_all_in = polymarket_all_in
+                    .checked_add(jupiter_all_in_micro_usd)
+                    .ok_or_else(|| anyhow!("precision-safe entry cost overflow"))?;
+                let edge = contracts
+                    .checked_sub(total_all_in)
+                    .ok_or_else(|| anyhow!("precision-safe entry edge overflow"))?;
+                let edge_per_contract = edge
+                    .checked_mul(ONE_CONTRACT_MICRO)
+                    .and_then(|value| value.checked_div(contracts))
+                    .ok_or_else(|| anyhow!("precision-safe edge-per-contract overflow"))?;
+                if gross >= strategy.polymarket_minimum_gross_order_micro_usd
+                    && polymarket_all_in <= budget
+                    && edge >= strategy.minimum_entry_edge_total_micro_usd
+                    && edge_per_contract >= strategy.minimum_entry_edge_micro_usd_per_contract
+                    && best.as_ref().is_none_or(|(current, current_cost)| {
+                        contracts > current.contracts_micro
+                            || (contracts == current.contracts_micro
+                                && polymarket_all_in < *current_cost)
+                    })
+                {
+                    best = Some((
+                        PrecisionSafePolymarketBuy {
+                            contracts_micro: contracts,
+                            limit_price_micro_usd: limit,
+                        },
+                        polymarket_all_in,
+                    ));
+                }
+            }
+        }
+        limit = limit.saturating_add(10_000);
+    }
+    Ok(best.map(|(selection, _)| selection))
 }
 
 fn buy_limit(price: Micro, slippage_bps: u32) -> Result<Micro> {
@@ -2104,4 +2174,52 @@ fn env_required(name: &str) -> Result<String> {
 
 fn unix_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+
+    fn strategy() -> ShortWindowStrategyConfig {
+        ShortWindowStrategyConfig {
+            polymarket_maximum_allocation_micro_usd: 100_000_000,
+            jupiter_maximum_allocation_micro_usd: 100_000_000,
+            jupiter_minimum_gross_order_micro_usd: 1,
+            polymarket_minimum_gross_order_micro_usd: 100_000,
+            polymarket_minimum_contracts_micro: 10_000,
+            minimum_entry_edge_micro_usd_per_contract: 1,
+            minimum_entry_edge_total_micro_usd: 1,
+            minimum_exit_profit_micro_usd: 1,
+        }
+    }
+
+    #[test]
+    fn preflight_selects_a_cent_compatible_polymarket_quantity() {
+        let selection = select_precision_safe_polymarket_buy(
+            &[BookLevel::new(340_000, 100_000_000)],
+            14_110_000,
+            6_000_000,
+            100_000_000,
+            &strategy(),
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selection.contracts_micro, 14_000_000);
+        assert_eq!(selection.limit_price_micro_usd, 340_000);
+    }
+
+    #[test]
+    fn preflight_rejects_precision_truncation_over_five_percent() {
+        let selection = select_precision_safe_polymarket_buy(
+            &[BookLevel::new(330_000, 100_000_000)],
+            1_500_000,
+            100_000,
+            100_000_000,
+            &strategy(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(selection, None);
+    }
 }
