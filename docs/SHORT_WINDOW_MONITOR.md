@@ -39,11 +39,19 @@ Jupiter Forecast observes Chainlink spot.
 - Swap V2 builds must explicitly be `ExactIn`, with a positive
   `otherAmountThreshold` no larger than quoted `outAmount`. Confirmed execution
   amounts are authoritative and any profitable extra output is retained.
-- The two outcomes alternate every 125 ms globally by default (8 RPS), leaving
-  headroom in the Developer 10-RPS main bucket. Authenticated Swap `/execute`
-  uses Jupiter's separate paid-plan execution bucket.
+- The two outcomes alternate every 100 ms globally by default (10 RPS), giving
+  each outcome a 200 ms launch cadence without bursting both requests at once.
+  Authenticated Swap `/execute` uses Jupiter's separate paid-plan execution
+  bucket.
 - Out-of-order responses are discarded. A selected response must reach handoff
-  within 250 ms of local receipt by default.
+  within a 400 ms end-to-end budget measured from the `/order` request start,
+  so remote build RTT is included rather than hidden. A newer build arriving
+  during FOK preparation invalidates the old build.
+- Fast adverse Jupiter price movement is a separate entry blocker. By default,
+  an increase above 300 bps versus the preceding build inside one second is
+  rejected rather than delegated to wider fixed slippage.
+- Fixed Jupiter slippage is disabled by default. The omitted `slippageBps`
+  parameter selects Ultra mode and Jupiter RTSE.
 - Polymarket displayed depth is reduced by 20% by default and then re-read before
   an exact-share protected FOK is prepared.
 - The final 30 seconds are a mandatory no-entry window.
@@ -85,7 +93,10 @@ pnpm monitor:short-window --help
 Important monitor controls are `--sample-interval-ms`,
 `--polymarket-poll-ms`, `--max-polymarket-age-ms`,
 `--max-jupiter-age-ms`, `--jupiter-order-input-usd`,
-`--jupiter-order-request-interval-ms`, `--max-samples`, `--once`, `--no-web`,
+`--jupiter-order-request-interval-ms`,
+`--maximum-jupiter-submit-quote-age-ms`,
+`--maximum-jupiter-adverse-move-bps`, `--jupiter-velocity-window-ms`,
+`--jupiter-fixed-slippage-bps`, `--max-samples`, `--once`, `--no-web`,
 `--output`, and `--web-port`. Risk/sizing flags are also accepted so read-only
 screening matches live eligibility.
 

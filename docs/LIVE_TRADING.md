@@ -38,11 +38,20 @@ than the optimistic quoted `outAmount`. Swap builds must explicitly report
 larger than `outAmount`. The confirmed `/execute` totals are authoritative;
 extra output is retained.
 
-The executable Jupiter response must fit inside a 250 ms receipt-to-handoff
-ceiling by default. Authenticated Swap V2 `/execute` uses Jupiter's separate
-paid-plan execution bucket and therefore does not wait behind `/order` builds.
-Network time used to obtain the response is logged separately as build RTT and
-is not counted as its local age. An old or out-of-sequence build is discarded.
+The executable Jupiter response must fit inside a 400 ms request-start-to-handoff
+budget by default. Remote build RTT is part of that budget, not a separate age
+that gets reset on receipt. Authenticated Swap V2 `/execute` uses Jupiter's
+separate paid-plan execution bucket and therefore does not wait behind `/order`
+builds. Discovery and live execution reuse the same warmed HTTP pool. An old,
+out-of-sequence, superseded, or high-velocity build is discarded.
+
+UP and DOWN `/order` requests alternate globally every 100 ms by default, so
+each outcome launches every 200 ms without a two-request burst. A price increase
+above 300 bps versus the preceding build inside one second blocks entry by
+default. This is independent from Polymarket/repair slippage. Jupiter
+`slippageBps` is omitted unless `--jupiter-fixed-slippage-bps` is explicitly
+supplied. With the flag absent, the response must report Ultra mode and Jupiter
+RTSE or the build is rejected.
 
 ## Why concurrent execution
 
@@ -53,7 +62,7 @@ execution states that must all be handled:
 
 | Observed execution | Action |
 | --- | --- |
-| Neither filled and both terminal | Remove the intent as zero exposure |
+| Neither filled and both terminal | Archive attempt diagnostics, remove the intent, and permit another attempt while the entry window remains open |
 | Both filled and quantities/costs are known | Hold whenever both intended single-winner P&Ls meet the post-fill floor; retain unequal extra contracts |
 | Only one filled, quantities/costs known | Attempt only a bounded Polymarket repair; otherwise isolate for recovery/settlement |
 | Any identity, quantity, debit or submission remains unknown | Preserve durable recovery state; never guess or report profit |
@@ -125,7 +134,9 @@ failures. A pending Jupiter keeper order blocks repair, and an ambiguous Swap V2
 handoff gets a 90-second latent-fill window before any zero-balance repair is
 considered. Zero exposure requires two separated observations; contracts with
 unknown actual cash debit are never repaired or settled as though their cost
-were zero.
+were zero. Definitive zero exposure does not add the pair to `completedPairs`;
+the archived `entryAttempts` record retains both submission results plus any
+Polymarket transaction hashes or failed Jupiter transaction signature.
 
 ## Settlement
 
@@ -165,9 +176,10 @@ zero-value redemption transactions. `poly1271` and Safe execution are unchanged.
 - `LIVE_TRADING_CONFIRMATION=I_ACCEPT_REAL_MONEY_RISK`.
 
 The Jupiter key's 10 RPS main allowance is enforced by a single 100 ms scheduler
-for Prediction and Swap `/order`; Swap `/execute` uses Jupiter's distinct
-paid-plan execution bucket. A `401 Unauthorized` means product access/key
-configuration is wrong; retrying cannot repair it.
+for Prediction and Swap `/order`; alternating outcomes therefore refresh each
+side every 200 ms. Swap `/execute` uses Jupiter's distinct paid-plan execution
+bucket. A `401 Unauthorized` means product access/key configuration is wrong;
+retrying cannot repair it.
 
 See [HOW_TO_RUN.md](../HOW_TO_RUN.md) for commands, flags, setup and
 troubleshooting.

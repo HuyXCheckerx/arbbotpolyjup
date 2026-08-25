@@ -491,6 +491,14 @@ impl JupiterSwapClient {
         })
     }
 
+    /// Returns a client that shares the same pooled HTTP connections and rate
+    /// limit state while using a different scheduler priority for `/order`.
+    #[must_use]
+    pub fn with_request_priority(mut self, priority: RequestPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
     pub async fn create_order(
         &self,
         input_mint: &str,
@@ -602,7 +610,25 @@ pub enum JupiterError {
     InvalidResponse(String),
     Solana(SolanaError),
     ExecutionFailed(String),
+    SwapExecutionFailed {
+        message: String,
+        code: i64,
+        signature: Option<String>,
+    },
     AmbiguousExecution(String),
+}
+
+impl JupiterError {
+    /// Returns a transaction identity even when Swap V2 confirmed a failed
+    /// on-chain execution. Keeping this identity makes zero-exposure attempts
+    /// independently auditable.
+    #[must_use]
+    pub fn transaction_signature(&self) -> Option<&str> {
+        match self {
+            Self::SwapExecutionFailed { signature, .. } => signature.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for JupiterError {
@@ -614,6 +640,15 @@ impl fmt::Display for JupiterError {
             Self::InvalidResponse(error) => write!(formatter, "Invalid Jupiter response: {error}"),
             Self::Solana(error) => error.fmt(formatter),
             Self::ExecutionFailed(error) => write!(formatter, "Jupiter execution failed: {error}"),
+            Self::SwapExecutionFailed {
+                message,
+                code,
+                signature,
+            } => write!(
+                formatter,
+                "Jupiter execution failed: {message} code={code} signature={}",
+                signature.as_deref().unwrap_or("none")
+            ),
             Self::AmbiguousExecution(error) => {
                 write!(formatter, "Ambiguous Jupiter execution: {error}")
             }
@@ -1495,6 +1530,7 @@ impl JupiterForecastSwapQuoter {
                 self.slippage_bps,
             )
             .await?;
+        validate_requested_swap_mode(&order, self.slippage_bps)?;
         forecast_swap_build(order, market_id, outcome_mint, true, &self.owner_pubkey)
     }
 }
@@ -1562,6 +1598,7 @@ impl JupiterForecastSwapExecutor {
                 self.slippage_bps,
             )
             .await?;
+        validate_requested_swap_mode(&order, self.slippage_bps)?;
         forecast_swap_build(order, market_id, outcome_mint, true, &self.owner_pubkey())
     }
 
@@ -1581,6 +1618,7 @@ impl JupiterForecastSwapExecutor {
                 self.slippage_bps,
             )
             .await?;
+        validate_requested_swap_mode(&order, self.slippage_bps)?;
         forecast_swap_build(
             order,
             &market_id,
@@ -1817,11 +1855,14 @@ impl JupiterForecastSwapExecutor {
                 .get("mode")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            return Err(JupiterError::ExecutionFailed(format!(
-                "Swap V2 request {request_id} router={router} mode={mode} code={} error={}",
-                execution.code,
-                execution.error.as_deref().unwrap_or("missing signature")
-            )));
+            return Err(JupiterError::SwapExecutionFailed {
+                message: format!(
+                    "Swap V2 request {request_id} router={router} mode={mode} error={}",
+                    execution.error.as_deref().unwrap_or("missing signature")
+                ),
+                code: execution.code,
+                signature: execution.signature,
+            });
         }
         let Some(signature) = execution.signature.clone() else {
             return Err(JupiterError::ExecutionFailed(
@@ -2332,6 +2373,19 @@ fn forecast_swap_execution_context(order: &SwapOrder) -> Map<String, Value> {
             order.slippage_bps.map_or(Value::Null, Value::from),
         ),
     ])
+}
+
+fn validate_requested_swap_mode(
+    order: &SwapOrder,
+    fixed_slippage_bps: Option<u64>,
+) -> Result<(), JupiterError> {
+    if fixed_slippage_bps.is_none() && !order.mode.eq_ignore_ascii_case("ultra") {
+        return Err(JupiterError::InvalidResponse(format!(
+            "Swap V2 omitted slippageBps but returned mode={}, expected ultra/RTSE",
+            order.mode
+        )));
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -2956,6 +3010,44 @@ mod tests {
             body.get("signedTransaction").and_then(Value::as_str),
             Some("signed")
         );
+    }
+
+    #[test]
+    fn failed_swap_execution_preserves_transaction_signature() {
+        let error = JupiterError::SwapExecutionFailed {
+            message: "Swap V2 request request-1 router=metis mode=ultra error=6001".to_owned(),
+            code: 6_001,
+            signature: Some("failed-signature".to_owned()),
+        };
+        assert_eq!(error.transaction_signature(), Some("failed-signature"));
+        assert!(error.to_string().contains("signature=failed-signature"));
+    }
+
+    #[test]
+    fn omitted_fixed_slippage_requires_ultra_rtse_mode() {
+        let mut order = SwapOrder {
+            transaction: "base64".to_owned(),
+            request_id: "request-1".to_owned(),
+            input_mint: USDC_MINT.to_owned(),
+            output_mint: "outcome".to_owned(),
+            in_amount: 5_000_000,
+            out_amount: 10_000_000,
+            other_amount_threshold: 9_000_000,
+            swap_mode: "ExactIn".to_owned(),
+            slippage_bps: None,
+            price_impact: None,
+            fee_bps: None,
+            signature_fee_lamports: None,
+            prioritization_fee_lamports: None,
+            rent_fee_lamports: None,
+            last_valid_block_height: 1,
+            router: "metis".to_owned(),
+            mode: "ultra".to_owned(),
+        };
+        validate_requested_swap_mode(&order, None).expect("RTSE mode");
+        order.mode = "manual".to_owned();
+        assert!(validate_requested_swap_mode(&order, None).is_err());
+        validate_requested_swap_mode(&order, Some(300)).expect("explicit fixed override");
     }
 
     #[test]

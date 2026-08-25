@@ -67,9 +67,11 @@ wallet/API initialization and acts as the local single-instance lock.
 
 Prediction market-metadata discovery and Swap V2 `/order` requests share one
 scheduler at 100 ms minimum spacing, matching a 10 RPS Developer main bucket.
-The scanner alternates executable 5m UP/DOWN builds every 125 ms globally by
-default (8 RPS). Authenticated Swap V2 `/execute` uses Jupiter's separate
-paid-plan execution bucket. Jupiter's public price WebSocket is not used.
+The scanner alternates executable 5m UP/DOWN builds every 100 ms globally by
+default, refreshing each side every 200 ms. Fixed Jupiter slippage is omitted by
+default so `/order` selects RTSE. Authenticated Swap V2 `/execute` uses Jupiter's
+separate paid-plan execution bucket. Jupiter's public price WebSocket is not
+used.
 
 A plan/key existing is not enough by itself: the key must have both Prediction
 and Swap product access. A Prediction `401 Unauthorized` is terminal and the CLI

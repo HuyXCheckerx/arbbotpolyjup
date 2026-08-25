@@ -28,9 +28,9 @@ use jupol_polymarket::{
     normalize_fok_contracts_for_price,
 };
 use jupol_state::{
-    LivePairIdentity, LivePosition, LivePositionPhase, LiveTraderState, PostFillAction,
-    PostFillRiskPlan, ResolutionScenario, ResolutionScenarioCode, StateError, load_live_state,
-    save_live_state,
+    LiveEntryAttemptAudit, LivePairIdentity, LivePosition, LivePositionPhase, LiveTraderState,
+    PostFillAction, PostFillRiskPlan, ResolutionScenario, ResolutionScenarioCode, StateError,
+    load_live_state, save_live_state,
 };
 
 #[derive(Debug)]
@@ -92,9 +92,21 @@ pub struct LiveEntryRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EntryDisposition {
-    Opened { position_id: String, repaired: bool },
-    ZeroExposure { position_id: String },
-    RecoveryPending { position_id: String, reason: String },
+    Opened {
+        position_id: String,
+        repaired: bool,
+    },
+    ZeroExposure {
+        position_id: String,
+        polymarket_submission_result: String,
+        jupiter_submission_result: String,
+        polymarket_transaction_hashes: Vec<String>,
+        jupiter_transaction_signature: Option<String>,
+    },
+    RecoveryPending {
+        position_id: String,
+        reason: String,
+    },
 }
 
 pub struct LiveCoordinator {
@@ -203,8 +215,8 @@ impl LiveCoordinator {
         );
         self.record_entry_submission_results(
             &request.position_id,
-            &polymarket_result_label(&polymarket_result),
-            &jupiter_result_label(&jupiter_result),
+            &polymarket_result,
+            &jupiter_result,
         )?;
 
         let observation = capture_entry_balances_with_retry(
@@ -265,13 +277,28 @@ impl LiveCoordinator {
                     reason,
                 });
             }
+            let audit = self.zero_exposure_audit(&request.position_id)?;
+            let polymarket_submission_result = audit
+                .polymarket_entry_submission_result
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            let jupiter_submission_result = audit
+                .jupiter_entry_submission_result
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            let polymarket_transaction_hashes = audit.polymarket_entry_transaction_hashes.clone();
+            let jupiter_transaction_signature = audit.jupiter_entry_transaction_signature.clone();
+            self.state.entry_attempts.push(audit);
             self.state
                 .positions
                 .retain(|position| position.id != request.position_id);
-            self.state.completed_pairs.push(request.pair.key);
             self.bump_and_save()?;
             return Ok(EntryDisposition::ZeroExposure {
                 position_id: request.position_id,
+                polymarket_submission_result,
+                jupiter_submission_result,
+                polymarket_transaction_hashes,
+                jupiter_transaction_signature,
             });
         }
 
@@ -697,10 +724,29 @@ impl LiveCoordinator {
                             },
                         ) =>
                 {
+                    let audit = self.zero_exposure_audit(&id)?;
+                    let polymarket_submission_result = audit
+                        .polymarket_entry_submission_result
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let jupiter_submission_result = audit
+                        .jupiter_entry_submission_result
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let polymarket_transaction_hashes =
+                        audit.polymarket_entry_transaction_hashes.clone();
+                    let jupiter_transaction_signature =
+                        audit.jupiter_entry_transaction_signature.clone();
+                    self.state.entry_attempts.push(audit);
                     self.state.positions.retain(|candidate| candidate.id != id);
-                    self.state.completed_pairs.push(position.pair.key);
                     self.bump_and_save()?;
-                    dispositions.push(EntryDisposition::ZeroExposure { position_id: id });
+                    dispositions.push(EntryDisposition::ZeroExposure {
+                        position_id: id,
+                        polymarket_submission_result,
+                        jupiter_submission_result,
+                        polymarket_transaction_hashes,
+                        jupiter_transaction_signature,
+                    });
                 }
                 (Ok(0), Ok(0)) => {
                     let reason = if has_recorded_exposure(&position) {
@@ -1247,8 +1293,8 @@ impl LiveCoordinator {
     fn record_entry_submission_results(
         &mut self,
         id: &str,
-        polymarket_result: &str,
-        jupiter_result: &str,
+        polymarket_result: &Result<PolymarketFill, PolymarketError>,
+        jupiter_result: &Result<SubmittedJupiterOrder, JupiterError>,
     ) -> Result<(), LiveError> {
         let position = self
             .state
@@ -1256,9 +1302,53 @@ impl LiveCoordinator {
             .iter_mut()
             .find(|position| position.id == id)
             .ok_or_else(|| LiveError::InvalidRequest(format!("position {id} disappeared")))?;
-        position.polymarket_entry_submission_result = Some(polymarket_result.to_owned());
-        position.jupiter_entry_submission_result = Some(jupiter_result.to_owned());
+        position.polymarket_entry_submission_result =
+            Some(polymarket_result_label(polymarket_result));
+        position.jupiter_entry_submission_result = Some(jupiter_result_label(jupiter_result));
+        if let Ok(fill) = polymarket_result {
+            for hash in &fill.transaction_hashes {
+                if !position.polymarket_entry_transaction_hashes.contains(hash) {
+                    position
+                        .polymarket_entry_transaction_hashes
+                        .push(hash.clone());
+                }
+            }
+        }
+        position.jupiter_entry_transaction_signature = jupiter_result
+            .as_ref()
+            .map(|fill| fill.transaction_signature.clone())
+            .ok()
+            .or_else(|| {
+                jupiter_result
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.transaction_signature().map(str::to_owned))
+            });
         self.bump_and_save()
+    }
+
+    fn zero_exposure_audit(&self, id: &str) -> Result<LiveEntryAttemptAudit, LiveError> {
+        let position = self
+            .state
+            .positions
+            .iter()
+            .find(|position| position.id == id)
+            .ok_or_else(|| LiveError::InvalidRequest(format!("position {id} disappeared")))?;
+        Ok(LiveEntryAttemptAudit {
+            position_id: position.id.clone(),
+            pair_key: position.pair.key.clone(),
+            entered_at_ms: position.entered_at_ms,
+            completed_at_ms: unix_timestamp_ms(),
+            disposition: "zero_exposure".to_owned(),
+            polymarket_entry_submission_result: position.polymarket_entry_submission_result.clone(),
+            jupiter_entry_submission_result: position.jupiter_entry_submission_result.clone(),
+            polymarket_entry_transaction_hashes: position
+                .polymarket_entry_transaction_hashes
+                .clone(),
+            jupiter_entry_transaction_signature: position
+                .jupiter_entry_transaction_signature
+                .clone(),
+        })
     }
 
     fn mark_zero_observation_pending(&mut self, id: &str, reason: &str) -> Result<(), LiveError> {

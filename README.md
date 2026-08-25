@@ -99,7 +99,7 @@ Open `http://localhost:3000`. The local dashboard reads the running short-window
 
 Every Rust live command evaluates `Poly UP + Jup DOWN` and `Poly DOWN + Jup UP` and submits whichever has the best qualifying fee-adjusted edge. `pnpm bot:short-window:any-route` is retained as an output-file alias. The aliases share the same live state and status-port lock, so they cannot safely run together. Both legs can lose if settlement lands inside the venues' reference gap.
 
-Candidates and errors are appended as JSONL through `--output`. `JUPITER_API_KEY` is required for market discovery and Swap. By default, UP and DOWN `/order` builds alternate every `125ms` globally (8 RPS, or one executable refresh per side every `250ms`) within the Developer 10-RPS main bucket. Authenticated Swap V2 `/execute` uses Jupiter's separate paid-plan execution bucket. Continuous discovery builds use normal scheduler priority and yield to critical recovery work.
+Candidates and errors are appended as JSONL through `--output`. `JUPITER_API_KEY` is required for market discovery and Swap. By default, UP and DOWN `/order` builds alternate every `100ms` globally (10 RPS, or one executable refresh per side every `200ms`) within the Developer main bucket. Omitting `--jupiter-fixed-slippage-bps` leaves `slippageBps` out of `/order`, selecting Ultra mode with Jupiter RTSE. Authenticated Swap V2 `/execute` uses Jupiter's separate paid-plan execution bucket. Discovery and execution share a warmed HTTP connection pool, while critical work receives scheduler priority.
 
 ## Live execution boundary
 

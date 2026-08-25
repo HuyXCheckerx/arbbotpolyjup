@@ -62,7 +62,7 @@ const LIVE_CONFIRMATION: &str = "I_ACCEPT_REAL_MONEY_RISK";
 const DEFAULT_OUTPUT: &str = "logs/btc-poly-jup-short-window-rust.jsonl";
 const DEFAULT_STATE: &str = "logs/btc-poly-jup-short-window-live-state.json";
 const DEVELOPER_REQUEST_INTERVAL_MS: u64 = 100;
-const DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS: u64 = 125;
+const DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS: u64 = 100;
 const MAXIMUM_PRECISION_SIZE_MISMATCH_BPS: Micro = 500;
 const MAXIMUM_ORDER_DISCOVERY_IN_FLIGHT: usize = 16;
 
@@ -117,6 +117,10 @@ struct RunArgs {
     jupiter_order_request_interval_ms: u64,
     #[arg(long, default_value_t = 400)]
     maximum_jupiter_submit_quote_age_ms: i64,
+    #[arg(long, default_value_t = 300)]
+    maximum_jupiter_adverse_move_bps: u32,
+    #[arg(long, default_value_t = 1_000)]
+    jupiter_velocity_window_ms: i64,
     #[arg(long, default_value_t = 30)]
     entry_cutoff_seconds: i64,
     #[arg(long, default_value = "50")]
@@ -133,8 +137,12 @@ struct RunArgs {
     minimum_entry_profit_usd: String,
     #[arg(long, default_value = "0")]
     minimum_post_fill_profit_usd: String,
+    /// Polymarket entry and explicit repair protection. Jupiter uses RTSE by default.
     #[arg(long, default_value_t = 300)]
     maximum_slippage_bps: u32,
+    /// Optional fixed Jupiter Swap V2 slippage override. Omission uses RTSE.
+    #[arg(long)]
+    jupiter_fixed_slippage_bps: Option<u64>,
     #[arg(long, default_value_t = 2_000)]
     polymarket_depth_haircut_bps: u32,
     #[arg(long, default_value = "1")]
@@ -165,6 +173,8 @@ impl Default for RunArgs {
             jupiter_order_input_usd: "5".to_owned(),
             jupiter_order_request_interval_ms: DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS,
             maximum_jupiter_submit_quote_age_ms: 400,
+            maximum_jupiter_adverse_move_bps: 300,
+            jupiter_velocity_window_ms: 1_000,
             entry_cutoff_seconds: 30,
             minimum_venue_balance_usd: "50".to_owned(),
             max_venue_allocation_usd: "50".to_owned(),
@@ -174,6 +184,7 @@ impl Default for RunArgs {
             minimum_entry_profit_usd: "0.10".to_owned(),
             minimum_post_fill_profit_usd: "0".to_owned(),
             maximum_slippage_bps: 300,
+            jupiter_fixed_slippage_bps: None,
             polymarket_depth_haircut_bps: 2_000,
             maximum_emergency_hedge_loss_usd: "1".to_owned(),
             jupiter_fill_timeout_ms: 20_000,
@@ -251,8 +262,41 @@ struct TimedExecutableOrder {
     sequence: u64,
     requested_at_ms: i64,
     received_at_ms: i64,
+    previous_price_micro_usd: Option<Micro>,
+    previous_received_at_ms: Option<i64>,
     build: PredictionOrderBuild,
     prepared: Option<PreparedJupiterSubmission>,
+}
+
+impl TimedExecutableOrder {
+    fn request_age_ms(&self, now_ms: i64) -> i64 {
+        now_ms.saturating_sub(self.requested_at_ms)
+    }
+
+    fn receipt_age_ms(&self, now_ms: i64) -> i64 {
+        now_ms.saturating_sub(self.received_at_ms)
+    }
+
+    fn adverse_move_bps(&self, window_ms: i64) -> Option<Micro> {
+        let current = self.build.order.max_buy_price_micro_usd?;
+        let previous = self.previous_price_micro_usd?;
+        let previous_at = self.previous_received_at_ms?;
+        if previous <= 0
+            || current <= previous
+            || self.received_at_ms.saturating_sub(previous_at) > window_ms
+        {
+            return Some(0);
+        }
+        current
+            .saturating_sub(previous)
+            .checked_mul(10_000)
+            .and_then(|change| change.checked_div(previous))
+    }
+
+    fn exceeds_adverse_velocity(&self, maximum_bps: u32, window_ms: i64) -> bool {
+        self.adverse_move_bps(window_ms)
+            .is_some_and(|move_bps| move_bps > Micro::from(maximum_bps))
+    }
 }
 
 #[derive(Default)]
@@ -267,7 +311,7 @@ struct ExecutableOrderStore {
 }
 
 impl ExecutableOrderStore {
-    fn update(&self, outcome: ShortWindowOutcome, order: TimedExecutableOrder) {
+    fn update(&self, outcome: ShortWindowOutcome, mut order: TimedExecutableOrder) {
         let mut state = self
             .inner
             .write()
@@ -280,6 +324,12 @@ impl ExecutableOrderStore {
             .as_ref()
             .is_none_or(|existing| order.sequence > existing.sequence)
         {
+            if let Some(existing) = current.as_ref()
+                && existing.build.order.market_id == order.build.order.market_id
+            {
+                order.previous_price_micro_usd = existing.build.order.max_buy_price_micro_usd;
+                order.previous_received_at_ms = Some(existing.received_at_ms);
+            }
             *current = Some(order);
         }
     }
@@ -307,7 +357,7 @@ impl ExecutableOrderStore {
                 && order.build.execution_endpoint == "/swap/v2/execute"
                 && order.build.order.is_buy
                 && order.build.order.is_yes
-                && now_ms.saturating_sub(order.received_at_ms) <= maximum_age_ms
+                && order.request_age_ms(now_ms) <= maximum_age_ms
         });
         let down = self.latest(ShortWindowOutcome::Down).filter(|order| {
             order.build.order.market_id == pair.jupiter_down.market_id
@@ -315,7 +365,7 @@ impl ExecutableOrderStore {
                 && order.build.execution_endpoint == "/swap/v2/execute"
                 && order.build.order.is_buy
                 && order.build.order.is_yes
-                && now_ms.saturating_sub(order.received_at_ms) <= maximum_age_ms
+                && order.request_age_ms(now_ms) <= maximum_age_ms
         });
         if up.is_none() && down.is_none() {
             return Ok(None);
@@ -373,6 +423,7 @@ fn executable_order_level(order: &TimedExecutableOrder) -> Result<BookLevel> {
 struct OrderDiscoveryHandle {
     store: ExecutableOrderStore,
     task: tokio::task::JoinHandle<()>,
+    updates: tokio::sync::watch::Receiver<u64>,
 }
 
 impl Drop for OrderDiscoveryHandle {
@@ -417,6 +468,8 @@ struct EngineConfig {
     strategy: ShortWindowStrategyConfig,
     minimum_venue_balance_micro_usd: Micro,
     maximum_jupiter_submit_quote_age_ms: i64,
+    maximum_jupiter_adverse_move_bps: u32,
+    jupiter_velocity_window_ms: i64,
     entry_cutoff_ms: i64,
     max_polymarket_age_ms: i64,
     max_jupiter_age_ms: i64,
@@ -490,10 +543,15 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
         request_scheduler: scheduler.clone(),
         request_priority: RequestPriority::Normal,
     })?;
-    let jupiter_slippage_bps = env_optional("JUPITER_SLIPPAGE_BPS")
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(Some(u64::from(config.maximum_slippage_bps)));
-    let order_quoter = executable_order_quoter(&api_key, scheduler.clone(), jupiter_slippage_bps)?;
+    if env_optional("JUPITER_SLIPPAGE_BPS").is_some() {
+        warn!(
+            "legacy JUPITER_SLIPPAGE_BPS is ignored; omit --jupiter-fixed-slippage-bps to use Jupiter RTSE"
+        );
+    }
+    let jupiter_slippage_bps = args.jupiter_fixed_slippage_bps;
+    let shared_swap_client =
+        authenticated_swap_client(&api_key, scheduler.clone(), RequestPriority::Normal)?;
+    let order_quoter = executable_order_quoter(shared_swap_client.clone(), jupiter_slippage_bps)?;
     let gamma_url = env_optional("POLYMARKET_GAMMA_URL");
     let clob_url = env_optional("POLYMARKET_CLOB_URL");
     let gamma = PolymarketGammaClient::new(gamma_url.as_deref())?;
@@ -504,6 +562,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
             scheduler.clone(),
             !args.disable_sub_five_jupiter_swap,
             jupiter_slippage_bps,
+            Some(shared_swap_client.with_request_priority(RequestPriority::Critical)),
         )
         .await?;
         let poly_ready = polymarket
@@ -564,6 +623,13 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
             "jupiterPriceSource": "swap_v2_executable_order",
             "jupiterOrderInputUsd": format_usd(config.jupiter_order_input_micro_usd),
             "jupiterOrderRequestIntervalMs": args.jupiter_order_request_interval_ms,
+            "jupiterOutcomeRefreshIntervalMs": args.jupiter_order_request_interval_ms.saturating_mul(2),
+            "jupiterSlippageMode": if jupiter_slippage_bps.is_some() { "fixed" } else { "rtse" },
+            "jupiterFixedSlippageBps": jupiter_slippage_bps,
+            "jupiterQuoteAgeBasis": "request_start_to_submission_handoff",
+            "maximumJupiterSubmitQuoteAgeMs": config.maximum_jupiter_submit_quote_age_ms,
+            "maximumJupiterAdverseMoveBps": config.maximum_jupiter_adverse_move_bps,
+            "jupiterVelocityWindowMs": config.jupiter_velocity_window_ms,
             "enabledDurations": ["5m"],
             "entryCutoffSeconds": args.entry_cutoff_seconds,
             "minimumEntryProfitUsd": format_usd(config.strategy.minimum_entry_edge_total_micro_usd),
@@ -613,6 +679,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
         config.jupiter_order_input_micro_usd,
         config.jupiter_order_request_interval,
     )?;
+    let mut order_updates = order_discovery.updates.clone();
     let mut polymarket_stream = new_polymarket_stream(&pairs);
     let mut sample_tick = tokio::time::interval(Duration::from_millis(args.sample_interval_ms));
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -626,6 +693,13 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            changed = order_updates.changed() => {
+                if changed.is_ok() {
+                    // Evaluate the new executable transaction immediately
+                    // instead of paying up to one polling interval of latency.
+                    sample_tick.reset_immediately();
+                }
+            }
             update = polymarket_stream.recv() => {
                 if let Some(update) = update {
                     match update {
@@ -635,6 +709,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                     runtime.polymarket_book = Some(update.book.clone());
                                 }
                             }
+                            sample_tick.reset_immediately();
                         }
                         Err(error) => warn!("Polymarket discovery stream: {error}"),
                     }
@@ -695,6 +770,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                         config.jupiter_order_input_micro_usd,
                         config.jupiter_order_request_interval,
                     )?;
+                    order_updates = order_discovery.updates.clone();
                     polymarket_stream = new_polymarket_stream(&pairs);
                     continue;
                 }
@@ -727,14 +803,27 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                     });
                     let jup_age = selected_order.as_ref().map_or_else(
                         || now.saturating_sub(jup_book.received_at_ms),
-                        |order| now.saturating_sub(order.received_at_ms),
+                        |order| order.receipt_age_ms(now),
                     );
+                    let jup_request_age = selected_order
+                        .as_ref()
+                        .map_or(jup_age, |order| order.request_age_ms(now));
+                    let jup_adverse_move_bps = selected_order
+                        .as_ref()
+                        .and_then(|order| order.adverse_move_bps(config.jupiter_velocity_window_ms));
+                    let jup_high_velocity = selected_order.as_ref().is_some_and(|order| {
+                        order.exceeds_adverse_velocity(
+                            config.maximum_jupiter_adverse_move_bps,
+                            config.jupiter_velocity_window_ms,
+                        )
+                    });
                     let stale = poly_age > config.max_polymarket_age_ms
-                        || jup_age > config.max_jupiter_age_ms;
+                        || jup_request_age > config.max_jupiter_age_ms;
+                    let unsafe_quote = stale || jup_high_velocity;
                     status
                         .update_feed_health(poly_book.received_at_ms, jup_book.received_at_ms)
                         .await;
-                    update_duration_status(&status, runtime, best, stale, poly_age, jup_age).await;
+                    update_duration_status(&status, runtime, best, unsafe_quote, poly_age, jup_request_age).await;
                     let signature = best.map(candidate_signature);
                     if signature != runtime.last_candidate_signature {
                         runtime.last_candidate_signature = signature;
@@ -744,9 +833,14 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                 &runtime.pair,
                                 best,
                                 poly_age,
-                                jup_age,
-                                stale,
-                                selected_order.as_ref(),
+                                unsafe_quote,
+                                JupiterCandidateDiagnostics {
+                                    receipt_age_ms: jup_age,
+                                    request_age_ms: jup_request_age,
+                                    high_velocity: jup_high_velocity,
+                                    adverse_move_bps: jup_adverse_move_bps,
+                                    executable_order: selected_order.as_ref(),
+                                },
                             )).await?;
                             if best.is_fee_adjusted_candidate {
                                 info!(
@@ -755,14 +849,17 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                     edge_per_contract = %format_usd(best.effective_edge_micro_usd_per_contract),
                                     common_contracts = %format_contracts(best.common_depth_contracts_micro),
                                     poly_age_ms = poly_age,
-                                    jup_age_ms = jup_age,
+                                    jup_request_age_ms = jup_request_age,
+                                    jup_receipt_age_ms = jup_age,
+                                    jup_adverse_move_bps,
+                                    jup_high_velocity,
                                     "candidate"
                                 );
                             }
                         }
                     }
                     if live
-                        && !stale
+                        && !unsafe_quote
                         && now >= runtime.entry_preflight_after_ms
                         && runtime.pair.end_ms - now > config.entry_cutoff_ms
                     {
@@ -790,27 +887,25 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                 ).await {
                                     Ok(Some(disposition)) => {
                                         runtime.last_preflight_error = None;
-                                        let (poly_cash, jup_cash) = tokio::join!(
-                                            polymarket.collateral_balance_micro_usd(),
-                                            jupiter.usdc_balance(),
-                                        );
-                                        if let (Ok(poly_cash), Ok(jup_cash)) = (poly_cash, jup_cash) {
-                                            coordinator.update_cash_snapshots(poly_cash, jup_cash)?;
-                                            balance_cache.update(EntryBalanceSnapshot {
-                                                polymarket_contracts: 0,
-                                                polymarket_collateral_micro_usd: poly_cash,
-                                                jupiter_contracts: 0,
-                                                jupiter_usdc_micro: jup_cash,
-                                            });
+                                        // The coordinator already proved zero exposure. Avoid two
+                                        // redundant RPCs before this pair becomes retryable again.
+                                        if !matches!(&disposition, EntryDisposition::ZeroExposure { .. }) {
+                                            let (poly_cash, jup_cash) = tokio::join!(
+                                                polymarket.collateral_balance_micro_usd(),
+                                                jupiter.usdc_balance(),
+                                            );
+                                            if let (Ok(poly_cash), Ok(jup_cash)) = (poly_cash, jup_cash) {
+                                                coordinator.update_cash_snapshots(poly_cash, jup_cash)?;
+                                                balance_cache.update(EntryBalanceSnapshot {
+                                                    polymarket_contracts: 0,
+                                                    polymarket_collateral_micro_usd: poly_cash,
+                                                    jupiter_contracts: 0,
+                                                    jupiter_usdc_micro: jup_cash,
+                                                });
+                                            }
                                         }
                                         status.event(event_for_disposition(runtime.pair.duration.label(), &disposition)).await;
-                                        writer.append(json!({
-                                            "schemaVersion": 3,
-                                            "type": "live_entry_result",
-                                            "at": now_iso(),
-                                            "pairKey": runtime.pair.key(),
-                                            "result": format!("{disposition:?}"),
-                                        })).await?;
+                                        writer.append(entry_disposition_record(&runtime.pair.key(), &disposition)).await?;
                                     }
                                     Ok(None) => {
                                         runtime.last_preflight_error = None;
@@ -828,7 +923,10 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                                 "code": classify_execution_error(&message),
                                                 "pairKey": runtime.pair.key(),
                                                 "polymarketAgeMs": poly_age,
-                                                "jupiterAgeMs": jup_age,
+                                                "jupiterRequestAgeMs": jup_request_age,
+                                                "jupiterReceiptAgeMs": jup_age,
+                                                "jupiterAdverseMoveBps": jup_adverse_move_bps,
+                                                "jupiterHighVelocity": jup_high_velocity,
                                                 "message": message,
                                             })).await?;
                                             runtime.last_preflight_error = Some(message);
@@ -978,45 +1076,47 @@ fn new_order_discovery(
     ];
     let store = ExecutableOrderStore::default();
     let task_store = store.clone();
+    let (update_sender, updates) = tokio::sync::watch::channel(0_u64);
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(request_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut next_target = 0_usize;
         let mut sequences = [0_u64; 2];
         let mut last_errors: [Option<String>; 2] = [None, None];
         let mut in_flight = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    for (target_index, target) in targets.iter().enumerate() {
-                        if in_flight.len() >= MAXIMUM_ORDER_DISCOVERY_IN_FLIGHT {
-                            break;
+                _ = interval.tick(), if in_flight.len() < MAXIMUM_ORDER_DISCOVERY_IN_FLIGHT => {
+                    // One global request per tick keeps the Developer 10-RPS
+                    // bucket rate-safe while refreshing each side every 200 ms
+                    // at the default cadence.
+                    let target_index = next_target;
+                    next_target = (next_target + 1) % targets.len();
+                    sequences[target_index] = sequences[target_index].saturating_add(1);
+                    let sequence = sequences[target_index];
+                    let target = targets[target_index].clone();
+                    let request_quoter = quoter.clone();
+                    in_flight.spawn(async move {
+                        let requested_at_ms = unix_ms();
+                        let result = request_quoter
+                            .prepare_buy(
+                                &target.market_id,
+                                &target.outcome_mint,
+                                gross_micro_usd,
+                            )
+                            .await;
+                        let prepared = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|build| request_quoter.prepare_submission(build.clone()).ok());
+                        OrderDiscoveryResult {
+                            target,
+                            sequence,
+                            requested_at_ms,
+                            result,
+                            prepared,
                         }
-                        sequences[target_index] = sequences[target_index].saturating_add(1);
-                        let sequence = sequences[target_index];
-                        let target = target.clone();
-                        let request_quoter = quoter.clone();
-                        in_flight.spawn(async move {
-                            let requested_at_ms = unix_ms();
-                            let result = request_quoter
-                                .prepare_buy(
-                                    &target.market_id,
-                                    &target.outcome_mint,
-                                    gross_micro_usd,
-                                )
-                                .await;
-                            let prepared = result
-                                .as_ref()
-                                .ok()
-                                .and_then(|build| request_quoter.prepare_submission(build.clone()).ok());
-                            OrderDiscoveryResult {
-                                target,
-                                sequence,
-                                requested_at_ms,
-                                result,
-                                prepared,
-                            }
-                        });
-                    }
+                    });
                 }
                 completed = in_flight.join_next(), if !in_flight.is_empty() => {
                     let Ok(completed) = completed.expect("guarded non-empty JoinSet") else {
@@ -1037,10 +1137,15 @@ fn new_order_discovery(
                                     sequence: completed.sequence,
                                     requested_at_ms: completed.requested_at_ms,
                                     received_at_ms,
+                                    previous_price_micro_usd: None,
+                                    previous_received_at_ms: None,
                                     build,
                                     prepared: completed.prepared,
                                 },
                             );
+                            update_sender.send_modify(|sequence| {
+                                *sequence = sequence.saturating_add(1);
+                            });
                         }
                         Err(error) => {
                             let message = error.to_string();
@@ -1059,7 +1164,11 @@ fn new_order_discovery(
             }
         }
     });
-    Ok(OrderDiscoveryHandle { store, task })
+    Ok(OrderDiscoveryHandle {
+        store,
+        task,
+        updates,
+    })
 }
 
 fn new_polymarket_stream(
@@ -1103,6 +1212,42 @@ async fn try_live_entry(
         ShortWindowOutcome::Down => runtime.pair.polymarket_down_token(),
     };
 
+    let timed_build = order_store
+        .latest(route.jupiter_outcome)
+        .ok_or_else(|| anyhow!("executable Jupiter order disappeared during preflight"))?;
+    let build = &timed_build.build;
+    if build.order.market_id != jupiter_market.market_id
+        || build.outcome_mint.as_deref() != Some(outcome_mint)
+        || build.execution_endpoint != "/swap/v2/execute"
+        || build.execution_model.as_deref() != Some("atomic_swap")
+        || !build.order.is_buy
+        || !build.order.is_yes
+        || build.order.order_cost_micro_usd != config.jupiter_order_input_micro_usd
+    {
+        bail!("executable Jupiter order does not match the selected 5-minute outcome");
+    }
+    let initial_build_age = timed_build.request_age_ms(unix_ms());
+    if initial_build_age > config.maximum_jupiter_submit_quote_age_ms {
+        bail!(
+            "executable Jupiter order expired before preflight: requestAge={initial_build_age}ms receiptAge={}ms limit={}ms",
+            timed_build.receipt_age_ms(unix_ms()),
+            config.maximum_jupiter_submit_quote_age_ms
+        );
+    }
+    if timed_build.exceeds_adverse_velocity(
+        config.maximum_jupiter_adverse_move_bps,
+        config.jupiter_velocity_window_ms,
+    ) {
+        bail!(
+            "executable Jupiter order rejected for adverse velocity: move={}bps limit={}bps window={}ms",
+            timed_build
+                .adverse_move_bps(config.jupiter_velocity_window_ms)
+                .unwrap_or_default(),
+            config.maximum_jupiter_adverse_move_bps,
+            config.jupiter_velocity_window_ms
+        );
+    }
+
     // Fast-path: use background-cached balance if available; fall back to live query if cold.
     let before = if let Some(cached) = balance_cache.get() {
         cached
@@ -1133,25 +1278,6 @@ async fn try_live_entry(
             )
             .await?
     };
-    let timed_build = order_store
-        .latest(route.jupiter_outcome)
-        .ok_or_else(|| anyhow!("executable Jupiter order disappeared during preflight"))?;
-    let build_received_at_ms = timed_build.received_at_ms;
-    let build = timed_build.build;
-    if build.order.market_id != jupiter_market.market_id
-        || build.outcome_mint.as_deref() != Some(outcome_mint)
-        || build.execution_endpoint != "/swap/v2/execute"
-        || build.execution_model.as_deref() != Some("atomic_swap")
-        || !build.order.is_buy
-        || !build.order.is_yes
-        || build.order.order_cost_micro_usd != config.jupiter_order_input_micro_usd
-    {
-        bail!("executable Jupiter order does not match the selected 5-minute outcome");
-    }
-    let initial_build_age = unix_ms().saturating_sub(build_received_at_ms);
-    if initial_build_age > config.maximum_jupiter_submit_quote_age_ms {
-        return Ok(None);
-    }
     let poly_levels = match route.polymarket_outcome {
         ShortWindowOutcome::Up => &fresh_poly.yes.asks,
         ShortWindowOutcome::Down => &fresh_poly.no.asks,
@@ -1178,10 +1304,10 @@ async fn try_live_entry(
     else {
         return Ok(None);
     };
-    let jupiter_submission = if let Some(prepared) = timed_build.prepared {
+    let jupiter_submission = if let Some(prepared) = timed_build.prepared.clone() {
         prepared
     } else {
-        jupiter.prepare_submission(build)?
+        jupiter.prepare_submission(build.clone())?
     };
     let polymarket_order = polymarket
         .prepare_buy_fok(
@@ -1190,11 +1316,37 @@ async fn try_live_entry(
             selection.contracts_micro,
         )
         .await?;
-    let build_age = unix_ms().saturating_sub(build_received_at_ms);
+    let handoff_at_ms = unix_ms();
+    let build_age = timed_build.request_age_ms(handoff_at_ms);
     if build_age > config.maximum_jupiter_submit_quote_age_ms {
         bail!(
-            "executable Jupiter order expired before submission: age={build_age}ms limit={}ms",
+            "executable Jupiter order expired before submission: requestAge={build_age}ms receiptAge={}ms buildRtt={}ms limit={}ms",
+            timed_build.receipt_age_ms(handoff_at_ms),
+            timed_build
+                .received_at_ms
+                .saturating_sub(timed_build.requested_at_ms),
             config.maximum_jupiter_submit_quote_age_ms
+        );
+    }
+    let latest_build = order_store
+        .latest(route.jupiter_outcome)
+        .ok_or_else(|| anyhow!("executable Jupiter order disappeared before submission"))?;
+    if latest_build.sequence != timed_build.sequence {
+        // Do not submit a transaction after a newer executable price has
+        // arrived. The event-driven loop will immediately reassess that build.
+        return Ok(None);
+    }
+    if latest_build.exceeds_adverse_velocity(
+        config.maximum_jupiter_adverse_move_bps,
+        config.jupiter_velocity_window_ms,
+    ) {
+        bail!(
+            "executable Jupiter order rejected for adverse velocity before submission: move={}bps limit={}bps window={}ms",
+            latest_build
+                .adverse_move_bps(config.jupiter_velocity_window_ms)
+                .unwrap_or_default(),
+            config.maximum_jupiter_adverse_move_bps,
+            config.jupiter_velocity_window_ms
         );
     }
     let pair = live_pair_identity(&runtime.pair, route, token_id, jupiter_market);
@@ -1266,7 +1418,7 @@ async fn readiness(args: ReadinessArgs) -> Result<()> {
     if !args.polymarket_only {
         let scheduler =
             JupiterRequestScheduler::new(Duration::from_millis(DEVELOPER_REQUEST_INTERVAL_MS));
-        let (jupiter, _) = live_components(Some(scheduler), true, None).await?;
+        let (jupiter, _) = live_components(Some(scheduler), true, None, None).await?;
         let balances = jupiter.assert_ready(minimum).await?;
         println!(
             "Jupiter ready: owner={}, USDC=${}, SOL={} lamports; Developer key bucket=10 RPS shared",
@@ -1285,6 +1437,7 @@ async fn recover(args: RecoveryArgs) -> Result<()> {
         Some(scheduler),
         true,
         Some(u64::from(args.maximum_slippage_bps)),
+        None,
     )
     .await?;
     let mut coordinator = LiveCoordinator::load(&args.live_state)?;
@@ -1433,6 +1586,7 @@ async fn live_components(
     scheduler: Option<JupiterRequestScheduler>,
     allow_subminimum_forecast_swap: bool,
     slippage_bps: Option<u64>,
+    shared_swap_client: Option<JupiterSwapClient>,
 ) -> Result<(JupiterHybridExecutor, PolymarketExecutor)> {
     let rpc_url = env_required("SOLANA_RPC_URL")?;
     let private_key = env_required("JUPITER_SOLANA_PRIVATE_KEY")?;
@@ -1445,14 +1599,10 @@ async fn live_components(
         request_scheduler: scheduler.clone(),
         request_priority: RequestPriority::Critical,
     })?;
-    let swap_client = JupiterSwapClient::new(SwapClientOptions {
-        base_url: env_optional("JUPITER_SWAP_URL")
-            .unwrap_or_else(|| "https://api.jup.ag/swap/v2".to_owned()),
-        api_key: Some(api_key),
-        minimum_request_interval: Some(Duration::ZERO),
-        request_scheduler: scheduler,
-        request_priority: RequestPriority::Critical,
-    })?;
+    let swap_client = shared_swap_client.map_or_else(
+        || authenticated_swap_client(&api_key, scheduler, RequestPriority::Critical),
+        Ok,
+    )?;
     let prediction = JupiterPredictionExecutor::new(prediction_client, &rpc_url, &private_key)?;
     let forecast =
         JupiterForecastSwapExecutor::new(swap_client, &rpc_url, &private_key, slippage_bps)?;
@@ -1470,20 +1620,9 @@ async fn live_components(
 }
 
 fn executable_order_quoter(
-    api_key: &str,
-    scheduler: Option<JupiterRequestScheduler>,
+    swap_client: JupiterSwapClient,
     slippage_bps: Option<u64>,
 ) -> Result<JupiterForecastSwapQuoter> {
-    let swap_client = JupiterSwapClient::new(SwapClientOptions {
-        base_url: env_optional("JUPITER_SWAP_URL")
-            .unwrap_or_else(|| "https://api.jup.ag/swap/v2".to_owned()),
-        api_key: Some(api_key.to_owned()),
-        minimum_request_interval: Some(Duration::ZERO),
-        request_scheduler: scheduler,
-        // Continuous price discovery yields to recovery/discrete critical
-        // work in the shared 10-RPS main bucket.
-        request_priority: RequestPriority::Normal,
-    })?;
     if let Some(public_key) = env_optional("JUPITER_SOLANA_PUBLIC_KEY") {
         return Ok(JupiterForecastSwapQuoter::new(
             swap_client,
@@ -1499,6 +1638,21 @@ fn executable_order_quoter(
         &private_key,
         slippage_bps,
     )?)
+}
+
+fn authenticated_swap_client(
+    api_key: &str,
+    scheduler: Option<JupiterRequestScheduler>,
+    request_priority: RequestPriority,
+) -> Result<JupiterSwapClient> {
+    Ok(JupiterSwapClient::new(SwapClientOptions {
+        base_url: env_optional("JUPITER_SWAP_URL")
+            .unwrap_or_else(|| "https://api.jup.ag/swap/v2".to_owned()),
+        api_key: Some(api_key.to_owned()),
+        minimum_request_interval: Some(Duration::ZERO),
+        request_scheduler: scheduler,
+        request_priority,
+    })?)
 }
 
 fn validate_run_args(args: &RunArgs, live: bool) -> Result<()> {
@@ -1519,8 +1673,20 @@ fn validate_run_args(args: &RunArgs, live: bool) -> Result<()> {
     if !(25..=2_000).contains(&args.maximum_jupiter_submit_quote_age_ms) {
         bail!("--maximum-jupiter-submit-quote-age-ms must be 25..2000");
     }
+    if !(1..=5_000).contains(&args.maximum_jupiter_adverse_move_bps) {
+        bail!("--maximum-jupiter-adverse-move-bps must be 1..5000");
+    }
+    if !(25..=5_000).contains(&args.jupiter_velocity_window_ms) {
+        bail!("--jupiter-velocity-window-ms must be 25..5000");
+    }
     if !(1..=2_500).contains(&args.maximum_slippage_bps) {
         bail!("--maximum-slippage-bps must be 1..2500");
+    }
+    if args
+        .jupiter_fixed_slippage_bps
+        .is_some_and(|slippage| !(1..=2_500).contains(&slippage))
+    {
+        bail!("--jupiter-fixed-slippage-bps must be 1..2500 when supplied");
     }
     if args.polymarket_depth_haircut_bps > 5_000 {
         bail!("--polymarket-depth-haircut-bps must be <=5000");
@@ -1551,6 +1717,15 @@ fn engine_config(args: &RunArgs) -> Result<EngineConfig> {
             "Jupiter executable price-discovery order must be between the configured minimum order and maximum venue allocation"
         );
     }
+    let maximum_jupiter_submit_quote_age_ms = match env_optional("JUPITER_MAX_QUOTE_AGE_MS") {
+        Some(value) => value
+            .parse::<i64>()
+            .with_context(|| "JUPITER_MAX_QUOTE_AGE_MS must be an integer")?,
+        None => args.maximum_jupiter_submit_quote_age_ms,
+    };
+    if !(25..=2_000).contains(&maximum_jupiter_submit_quote_age_ms) {
+        bail!("JUPITER_MAX_QUOTE_AGE_MS must be 25..2000");
+    }
     Ok(EngineConfig {
         strategy: ShortWindowStrategyConfig {
             polymarket_maximum_allocation_micro_usd: allocation,
@@ -1565,9 +1740,9 @@ fn engine_config(args: &RunArgs) -> Result<EngineConfig> {
             minimum_exit_profit_micro_usd: parse_usd("0.10")?,
         },
         minimum_venue_balance_micro_usd: minimum_venue_balance,
-        maximum_jupiter_submit_quote_age_ms: env_optional("JUPITER_MAX_QUOTE_AGE_MS")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(args.maximum_jupiter_submit_quote_age_ms),
+        maximum_jupiter_submit_quote_age_ms,
+        maximum_jupiter_adverse_move_bps: args.maximum_jupiter_adverse_move_bps,
+        jupiter_velocity_window_ms: args.jupiter_velocity_window_ms,
         entry_cutoff_ms: args.entry_cutoff_seconds.saturating_mul(1_000),
         max_polymarket_age_ms: args.max_polymarket_age_ms,
         max_jupiter_age_ms: args.max_jupiter_age_ms,
@@ -1711,14 +1886,22 @@ fn candidate_signature(route: &EvaluatedCrossVenueRoute) -> String {
     )
 }
 
+#[derive(Clone, Copy)]
+struct JupiterCandidateDiagnostics<'a> {
+    receipt_age_ms: i64,
+    request_age_ms: i64,
+    high_velocity: bool,
+    adverse_move_bps: Option<Micro>,
+    executable_order: Option<&'a TimedExecutableOrder>,
+}
+
 fn candidate_record(
     session_id: &str,
     pair: &CrossVenuePair,
     best: &EvaluatedCrossVenueRoute,
     poly_age_ms: i64,
-    jupiter_age_ms: i64,
     stale: bool,
-    executable_order: Option<&TimedExecutableOrder>,
+    jupiter: JupiterCandidateDiagnostics<'_>,
 ) -> serde_json::Value {
     json!({
         "schemaVersion": 3, "type": "candidate", "sessionId": session_id, "at": now_iso(),
@@ -1729,10 +1912,21 @@ fn candidate_record(
         "edgeUsdPerContract": format_usd(best.effective_edge_micro_usd_per_contract),
         "commonContracts": format_contracts(best.common_depth_contracts_micro),
         "feeAdjustedCandidate": best.is_fee_adjusted_candidate, "stale": stale,
-        "polymarketAgeMs": poly_age_ms, "jupiterAgeMs": jupiter_age_ms,
-        "jupiterOrderSequence": executable_order.map(|order| order.sequence),
-        "jupiterOrderBuildRttMs": executable_order.map(|order| {
+        "polymarketAgeMs": poly_age_ms,
+        "jupiterAgeMs": jupiter.receipt_age_ms,
+        "jupiterReceiptAgeMs": jupiter.receipt_age_ms,
+        "jupiterRequestAgeMs": jupiter.request_age_ms,
+        "jupiterHighVelocity": jupiter.high_velocity,
+        "jupiterAdverseMoveBps": jupiter.adverse_move_bps,
+        "jupiterOrderSequence": jupiter.executable_order.map(|order| order.sequence),
+        "jupiterOrderBuildRttMs": jupiter.executable_order.map(|order| {
             order.received_at_ms.saturating_sub(order.requested_at_ms)
+        }),
+        "jupiterMode": jupiter.executable_order.and_then(|order| {
+            order.build.execution_context.get("mode").and_then(serde_json::Value::as_str)
+        }),
+        "jupiterSlippageBps": jupiter.executable_order.and_then(|order| {
+            order.build.execution_context.get("slippageBps")
         }),
         "jupiterPriceSource": "swap_v2_executable_order",
     })
@@ -2389,6 +2583,64 @@ fn event_for_disposition(duration: &str, disposition: &EntryDisposition) -> Stat
     }
 }
 
+fn entry_disposition_record(pair_key: &str, disposition: &EntryDisposition) -> serde_json::Value {
+    let mut record = json!({
+        "schemaVersion": 3,
+        "type": "live_entry_result",
+        "at": now_iso(),
+        "pairKey": pair_key,
+        "result": format!("{disposition:?}"),
+    });
+    let object = record
+        .as_object_mut()
+        .expect("live entry result is constructed as an object");
+    match disposition {
+        EntryDisposition::Opened {
+            position_id,
+            repaired,
+        } => {
+            object.insert("disposition".to_owned(), json!("opened"));
+            object.insert("positionId".to_owned(), json!(position_id));
+            object.insert("repaired".to_owned(), json!(repaired));
+        }
+        EntryDisposition::ZeroExposure {
+            position_id,
+            polymarket_submission_result,
+            jupiter_submission_result,
+            polymarket_transaction_hashes,
+            jupiter_transaction_signature,
+        } => {
+            object.insert("disposition".to_owned(), json!("zero_exposure"));
+            object.insert("positionId".to_owned(), json!(position_id));
+            object.insert(
+                "polymarketSubmissionResult".to_owned(),
+                json!(polymarket_submission_result),
+            );
+            object.insert(
+                "jupiterSubmissionResult".to_owned(),
+                json!(jupiter_submission_result),
+            );
+            object.insert(
+                "polymarketTransactionHashes".to_owned(),
+                json!(polymarket_transaction_hashes),
+            );
+            object.insert(
+                "jupiterTransactionSignature".to_owned(),
+                json!(jupiter_transaction_signature),
+            );
+        }
+        EntryDisposition::RecoveryPending {
+            position_id,
+            reason,
+        } => {
+            object.insert("disposition".to_owned(), json!("recovery_pending"));
+            object.insert("positionId".to_owned(), json!(position_id));
+            object.insert("reason".to_owned(), json!(reason));
+        }
+    }
+    record
+}
+
 fn error_event(duration: &str, code: &str, message: &str) -> StatusEvent {
     StatusEvent {
         id: String::new(),
@@ -2404,7 +2656,9 @@ fn error_event(duration: &str, code: &str, message: &str) -> StatusEvent {
 
 fn classify_execution_error(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("expired") || lower.contains("age=") {
+    if lower.contains("adverse velocity") {
+        "JUPITER_HIGH_VELOCITY"
+    } else if lower.contains("expired") || lower.contains("requestage=") || lower.contains("age=") {
         "JUPITER_BUILD_EXPIRED"
     } else if lower.contains("minimum") || lower.contains("min size") {
         "VENUE_MINIMUM_REJECTED"
@@ -2469,6 +2723,8 @@ mod execution_tests {
             sequence,
             requested_at_ms: 1_000,
             received_at_ms: 1_125,
+            previous_price_micro_usd: None,
+            previous_received_at_ms: None,
             build: PredictionOrderBuild {
                 outcome_mint: Some("outcome-mint".to_owned()),
                 transaction: "transaction".to_owned(),
@@ -2557,6 +2813,29 @@ mod execution_tests {
                 .sequence,
             2
         );
+    }
+
+    #[test]
+    fn executable_order_age_includes_remote_build_latency() {
+        let order = executable_build(1);
+        assert_eq!(order.request_age_ms(1_400), 400);
+        assert_eq!(order.receipt_age_ms(1_400), 275);
+    }
+
+    #[test]
+    fn executable_order_store_tracks_adverse_price_velocity() {
+        let store = ExecutableOrderStore::default();
+        store.update(ShortWindowOutcome::Up, executable_build(1));
+        let mut moved = executable_build(2);
+        moved.requested_at_ms = 1_200;
+        moved.received_at_ms = 1_325;
+        moved.build.order.max_buy_price_micro_usd = Some(520_000);
+        store.update(ShortWindowOutcome::Up, moved);
+
+        let latest = store.latest(ShortWindowOutcome::Up).expect("latest order");
+        assert_eq!(latest.adverse_move_bps(1_000), Some(400));
+        assert!(latest.exceeds_adverse_velocity(300, 1_000));
+        assert!(!latest.exceeds_adverse_velocity(400, 1_000));
     }
 
     #[test]

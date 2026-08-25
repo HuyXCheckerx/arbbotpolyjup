@@ -98,10 +98,10 @@ Key details:
 
 Market-metadata requests and Swap V2 `/order` builds share one process-wide
 100 ms scheduler, matching the Developer plan's 10 RPS main bucket. UP and DOWN
-executable orders alternate every 125 ms globally by default, consuming about
-8 RPS and leaving headroom for discovery/recovery. Authenticated Swap V2
-`/execute` uses Jupiter's separate paid-plan execute bucket (documented at
-100 RPS), so a signed transaction does not wait behind price discovery.
+executable orders alternate every 100 ms globally by default, refreshing each
+side every 200 ms without a two-request burst. Authenticated Swap V2 `/execute`
+uses Jupiter's separate paid-plan execute bucket (documented at 100 RPS), so a
+signed transaction does not wait behind price discovery.
 
 The Developer plan and product access are separate. The key must be enabled for
 both **Prediction** and **Swap** in the Jupiter portal. If startup reports:
@@ -170,8 +170,8 @@ The live path:
 1. continuously pipelines exact 5m UP and DOWN Swap V2 executable orders;
 2. ranks both complementary routes using `otherAmountThreshold` and fresh
    Polymarket depth;
-3. refreshes balances and Polymarket depth, then selects the newest Jupiter
-   build produced while those checks were running;
+3. selects the newest in-budget Jupiter build, uses cached balances and fresh
+   WebSocket depth when available, and falls back to live reads only when cold;
 4. prepares an exact-share Polymarket FOK and signs that existing Jupiter build;
 5. persists an intent before exposure;
 6. releases the signed Polymarket and Jupiter submissions concurrently;
@@ -217,11 +217,14 @@ Common options:
 | `--minimum-post-fill-profit-usd` | `$0` | Actual single-winner P&L floor; positive residuals are retained by default |
 | `--jupiter-minimum-order-usd` | `$0.10` | Native Forecast Swap floor; Prediction remains `$5` |
 | `--jupiter-order-input-usd` | `$5` | Exact USDC input for every executable UP/DOWN discovery order |
-| `--jupiter-order-request-interval-ms` | `125` | Global alternating `/order` cadence; 125 ms is 8 RPS |
+| `--jupiter-order-request-interval-ms` | `100` | Global alternating `/order` cadence; each side refreshes every 200 ms at 10 RPS total |
 | `--polymarket-minimum-order-usd` | `$1` | Marketable BUY minimum |
-| `--maximum-slippage-bps` | `100` | Entry/repair protection, allowed range 1–500 |
+| `--maximum-slippage-bps` | `300` | Polymarket entry and explicit repair protection only, allowed range 1–2500; the modeled-profit gate uses the protected limit |
+| `--jupiter-fixed-slippage-bps` | omitted | Diagnostic override only; omission sends no `slippageBps` and uses Jupiter RTSE |
 | `--polymarket-depth-haircut-bps` | `2000` | Ignores the last 20% of displayed depth |
-| `--maximum-jupiter-submit-quote-age-ms` | `250` | Response-received-to-handoff ceiling for a cached executable order |
+| `--maximum-jupiter-submit-quote-age-ms` | `400` | `/order` request-start-to-entry-handoff budget, including remote build RTT |
+| `--maximum-jupiter-adverse-move-bps` | `300` | Blocks an entry after a larger adverse move between consecutive Jupiter builds |
+| `--jupiter-velocity-window-ms` | `1000` | Lookback window for the adverse-move gate |
 | `--maximum-emergency-hedge-loss-usd` | `$1` | Dormant while automatic live repair is disabled |
 | `--jupiter-fill-timeout-ms` | `20000` | Confirmation/reconciliation timeout |
 | `--max-polymarket-age-ms` | `750` | Maximum entry snapshot age |
@@ -350,9 +353,11 @@ payout.
   continues. Inspect the position and submission diagnostics; do not delete the
   state file.
 - `ENTRY_CUTOFF`: fewer than 30 seconds remain; no new entry is allowed.
-- `JUPITER_BUILD_EXPIRED`: local preparation plus the reserved 10 RPS execution
-  slot cannot fit inside the 500 ms freshness ceiling; the transaction is
+- `JUPITER_BUILD_EXPIRED`: remote build time plus local preparation cannot fit
+  inside the 400 ms request-start-to-handoff budget; the transaction is
   discarded, never submitted stale.
+- `JUPITER_HIGH_VELOCITY`: consecutive executable Jupiter prices moved adversely
+  beyond the configured threshold; widening fixed slippage is not the remedy.
 - `VENUE_MINIMUM_REJECTED`: exact price/quantity fell below Jupiter Prediction,
   Swap routing, or Polymarket's current minimum.
 - stale Polymarket feed: the WebSocket reconnects automatically and the REST

@@ -166,6 +166,28 @@ pub struct LivePosition {
     pub settlement_error: Option<String>,
 }
 
+/// Durable diagnostics for a fully reconciled entry attempt that created no
+/// exposure. These attempts are safe to retry, but their venue responses and
+/// transaction identities must remain auditable after the placeholder position
+/// is removed from the active portfolio.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveEntryAttemptAudit {
+    pub position_id: String,
+    pub pair_key: String,
+    pub entered_at_ms: i64,
+    pub completed_at_ms: i64,
+    pub disposition: String,
+    #[serde(default)]
+    pub polymarket_entry_submission_result: Option<String>,
+    #[serde(default)]
+    pub jupiter_entry_submission_result: Option<String>,
+    #[serde(default)]
+    pub polymarket_entry_transaction_hashes: Vec<String>,
+    #[serde(default)]
+    pub jupiter_entry_transaction_signature: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveTraderState {
@@ -185,6 +207,8 @@ pub struct LiveTraderState {
     pub jupiter_cash_micro_usd: Option<Micro>,
     pub forced_entry_submission_attempted: bool,
     pub completed_pairs: Vec<String>,
+    #[serde(default)]
+    pub entry_attempts: Vec<LiveEntryAttemptAudit>,
     pub positions: Vec<LivePosition>,
     /// Immutable, fully settled position records. Active positions move here
     /// only after both venue payouts and Jupiter rent reclamation are verified.
@@ -207,6 +231,7 @@ impl Default for LiveTraderState {
             jupiter_cash_micro_usd: None,
             forced_entry_submission_attempted: false,
             completed_pairs: Vec::new(),
+            entry_attempts: Vec::new(),
             positions: Vec::new(),
             settled_positions: Vec::new(),
         }
@@ -432,8 +457,29 @@ mod tests {
         let state: LiveTraderState = serde_json::from_str(input).expect("valid TypeScript state");
         assert_eq!(state.realized_profit_micro_usd, 5_791);
         assert_eq!(state.polymarket_cash_micro_usd, Some(114_495_224));
+        assert!(state.entry_attempts.is_empty());
         let output = serde_json::to_string(&state).expect("serialize state");
         assert!(output.contains(r#""realizedProfitMicroUsd":"5791n""#));
+    }
+
+    #[test]
+    fn preserves_zero_exposure_attempt_diagnostics() {
+        let mut state = LiveTraderState::default();
+        state.entry_attempts.push(LiveEntryAttemptAudit {
+            position_id: "attempt-1".to_owned(),
+            pair_key: "5m:1".to_owned(),
+            entered_at_ms: 1,
+            completed_at_ms: 2,
+            disposition: "zero_exposure".to_owned(),
+            polymarket_entry_submission_result: Some("rejected".to_owned()),
+            jupiter_entry_submission_result: Some("code=6001".to_owned()),
+            polymarket_entry_transaction_hashes: Vec::new(),
+            jupiter_entry_transaction_signature: Some("failed-signature".to_owned()),
+        });
+        let encoded = serde_json::to_string(&state).expect("serialize state");
+        let decoded: LiveTraderState = serde_json::from_str(&encoded).expect("deserialize state");
+        assert_eq!(decoded.entry_attempts, state.entry_attempts);
+        assert!(encoded.contains("failed-signature"));
     }
 
     #[test]
