@@ -56,7 +56,7 @@ cargo run --release -p jupol-scanner -- live
 # Read-only wallet/API checks
 cargo run --release -p jupol-scanner -- readiness
 
-# Reconcile an interrupted durable state and make only bounded repairs
+# Explicitly reconcile an interrupted durable state and make bounded repairs
 cargo run --release -p jupol-scanner -- recover
 ```
 
@@ -81,8 +81,11 @@ Each entry persists an intent, signs both exact orders, then releases the
 Polymarket FOK and Jupiter transaction concurrently. Swap V2 pairs against its
 guaranteed output threshold and reconciles confirmed execute amounts; Prediction
 uses status plus owner history after keeper orders close. Unsafe or unresolved
-positions quarantine new entries while settlement/recovery continue. Unknown
-quantities or costs remain recovery work; they are never reported as profit.
+positions quarantine new entries while settlement continues. Live mode does
+not run startup, periodic, or immediate post-entry repair. The `recover`
+command is an explicit operator action and may submit a bounded Polymarket
+repair. Unknown quantities or costs remain reconciliation work; they are never
+reported as profit.
 Finalized records move to a durable settled audit ledger. This reduces process
 overhead, but cross-chain execution and the two venues' different resolution
 observations can never be atomic.

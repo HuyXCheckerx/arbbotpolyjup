@@ -489,17 +489,6 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
             poly_ready.collateral_balance_micro_usd,
             jup_ready.usdc_micro,
         )?;
-        for disposition in coordinator
-            .recover_incomplete_positions_with_limits(
-                &jupiter,
-                &polymarket,
-                config.maximum_emergency_hedge_loss_micro_usd,
-                config.maximum_slippage_bps,
-            )
-            .await?
-        {
-            warn!(?disposition, "startup recovery result");
-        }
         let relayer = match PolymarketRelayerOptions::from_env() {
             Ok(options) => match PolymarketRelayer::new(options).await {
                 Ok(value) => Some(value),
@@ -608,26 +597,6 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
             }
             _ = settlement_tick.tick(), if live => {
                 if let Some(coordinator) = coordinator.as_mut() {
-                    if let (Some(jupiter), Some(polymarket)) =
-                        (jupiter_executor.as_ref(), polymarket_executor.as_ref())
-                    {
-                        match coordinator
-                            .recover_incomplete_positions_with_limits(
-                                jupiter,
-                                polymarket,
-                                config.maximum_emergency_hedge_loss_micro_usd,
-                                config.maximum_slippage_bps,
-                            )
-                            .await
-                        {
-                            Ok(dispositions) => {
-                                for disposition in dispositions {
-                                    warn!(?disposition, "periodic recovery result");
-                                }
-                            }
-                            Err(error) => warn!("periodic recovery failed: {error}"),
-                        }
-                    }
                     if let Err(error) = coordinator.mark_expired_positions_awaiting_resolution(unix_ms()) {
                         warn!("could not mark expired live positions: {error}");
                     }
@@ -1139,6 +1108,7 @@ async fn try_live_entry(
         maximum_repair_loss_micro_usd: config.maximum_emergency_hedge_loss_micro_usd,
         maximum_repair_slippage_bps: config.maximum_slippage_bps,
         minimum_post_fill_profit_micro_usd: config.minimum_post_fill_profit_micro_usd,
+        automatic_repair_enabled: false,
         fill_timeout: config.jupiter_fill_timeout,
         diagnostic_test_entry: false,
     };

@@ -2011,38 +2011,34 @@ fn parse_swap_execution(payload: &Value) -> Result<SwapExecution, JupiterError> 
                     -1
                 }
             }),
-        // V2 has exposed both total*Amount and *AmountResult spellings. They
-        // are authoritative execution totals, not quote fields. Accept either
-        // shape, but reject a response that reports conflicting real amounts.
-        total_input_amount: consistent_swap_execution_amount(
+        // Jupiter documents total*Amount as the wallet-reflected amount and
+        // *AmountResult as the amount that entered/exited the swap route. The
+        // two values legitimately differ when a fee is collected in that mint
+        // (for example, 5_000_000 total input and 4_995_000 routed input).
+        // Prefer wallet totals for cost/position accounting and retain the
+        // result fields only as a backwards-compatible fallback.
+        total_input_amount: wallet_swap_execution_amount(
             value,
             "totalInputAmount",
             "inputAmountResult",
-        )?,
-        total_output_amount: consistent_swap_execution_amount(
+        ),
+        total_output_amount: wallet_swap_execution_amount(
             value,
             "totalOutputAmount",
             "outputAmountResult",
-        )?,
+        ),
         error: optional_text(value, "error"),
     })
 }
 
-fn consistent_swap_execution_amount(
+fn wallet_swap_execution_amount(
     value: &Map<String, Value>,
-    primary_field: &str,
-    alternate_field: &str,
-) -> Result<Micro, JupiterError> {
-    let primary = optional_unsigned_micro(value.get(primary_field));
-    let alternate = optional_unsigned_micro(value.get(alternate_field));
-    if let (Some(primary), Some(alternate)) = (primary, alternate)
-        && primary != alternate
-    {
-        return Err(invalid(format!(
-            "Swap V2 execution returned conflicting {primary_field}={primary} and {alternate_field}={alternate}"
-        )));
-    }
-    Ok(primary.or(alternate).unwrap_or(0))
+    wallet_total_field: &str,
+    route_result_field: &str,
+) -> Micro {
+    let wallet_total = optional_unsigned_micro(value.get(wallet_total_field));
+    let route_result = optional_unsigned_micro(value.get(route_result_field));
+    wallet_total.or(route_result).unwrap_or(0)
 }
 
 fn parse_jupiter_event(value: &Value) -> Result<Vec<VenueMarket>, JupiterError> {
@@ -2995,7 +2991,7 @@ mod tests {
     }
 
     #[test]
-    fn swap_execution_uses_actual_result_amounts_and_rejects_conflicts() {
+    fn swap_execution_prefers_documented_wallet_totals_over_fee_adjusted_route_amounts() {
         let result_shape = json!({
             "status": "Success",
             "signature": "signature",
@@ -3007,21 +3003,18 @@ mod tests {
         assert_eq!(execution.total_input_amount, 5_000_000);
         assert_eq!(execution.total_output_amount, 5_250_000);
 
-        let conflicting = json!({
+        let fee_bearing = json!({
             "status": "Success",
             "signature": "signature",
             "code": 0,
             "totalInputAmount": "5000000",
-            "inputAmountResult": "4999999",
-            "totalOutputAmount": "5250000",
+            "inputAmountResult": "4995000",
+            "totalOutputAmount": "5245000",
             "outputAmountResult": "5250000"
         });
-        assert!(
-            parse_swap_execution(&conflicting)
-                .expect_err("conflicting execution totals must be rejected")
-                .to_string()
-                .contains("conflicting totalInputAmount")
-        );
+        let execution = parse_swap_execution(&fee_bearing).expect("fee-bearing execution");
+        assert_eq!(execution.total_input_amount, 5_000_000);
+        assert_eq!(execution.total_output_amount, 5_245_000);
     }
 
     #[test]

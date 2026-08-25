@@ -4,8 +4,8 @@
 //! classified from authoritative fills/balances into the four possible states:
 //! neither leg, both legs, Polymarket only, or Jupiter only. Unequal quantities
 //! are retained when both intended single-winner P&Ls meet the configured
-//! floor. Otherwise bounded repair uses Polymarket because submitting a second
-//! Jupiter request could double-fill an ambiguous first request.
+//! floor. Automatic repair is policy-controlled because submitting another
+//! order after a partial or ambiguous entry can compound venue exposure.
 
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -85,6 +85,7 @@ pub struct LiveEntryRequest {
     pub maximum_repair_loss_micro_usd: Micro,
     pub maximum_repair_slippage_bps: u32,
     pub minimum_post_fill_profit_micro_usd: Micro,
+    pub automatic_repair_enabled: bool,
     pub fill_timeout: Duration,
     pub diagnostic_test_entry: bool,
 }
@@ -393,6 +394,30 @@ impl LiveCoordinator {
             return Ok(EntryDisposition::Opened {
                 position_id: request.position_id,
                 repaired: false,
+            });
+        }
+
+        if !request.automatic_repair_enabled {
+            let reason = format!(
+                "automatic recovery is disabled; preserved observed exposure without submitting a repair order: Poly={final_polymarket} Jup={final_jupiter} floor={} requiredFloor={} action={:?}",
+                initial_risk_plan.intended_single_winner_floor_micro_usd,
+                request.minimum_post_fill_profit_micro_usd,
+                initial_risk_plan.action,
+            );
+            self.finalize_observed_position(
+                &request.position_id,
+                final_polymarket,
+                final_jupiter,
+                polymarket_cost,
+                jupiter_cost,
+                polymarket_result.as_ref().ok(),
+                jupiter_result.as_ref().ok(),
+                LivePositionPhase::RecoveryPlanning,
+                Some(reason.clone()),
+            )?;
+            return Ok(EntryDisposition::RecoveryPending {
+                position_id: request.position_id,
+                reason,
             });
         }
 

@@ -177,21 +177,21 @@ The live path:
 6. releases the signed Polymarket and Jupiter submissions concurrently;
 7. reconciles actual conditional tokens and wallet collateral/USDC before
    recording quantities or cost; Swap V2 uses `/execute`'s confirmed
-   `totalInputAmount` and `totalOutputAmount` and Prediction uses its documented
-   status/history APIs;
+   wallet totals (`totalInputAmount` and `totalOutputAmount`) and does not
+   confuse their fee-adjusted route-result counterparts with contradictory
+   fills; Prediction uses its documented status/history APIs;
 8. computes Polymarket-only-win, Jupiter-only-win, both-win and both-lose P&L;
 9. holds reconciled exposure to settlement, automatically redeems/claims, and
    reclaims empty Forecast token-account rent.
 
-Unknown quantity, identity, or cash debit is kept in recovery state and is not
-reported as realized profit. A known quantity mismatch is retained when both
-intended single-winner payouts exceed actual combined cost by the configured
-post-fill floor. Repair is considered only when at least one of those two P&Ls
-misses that floor. An unresolved, one-sided, negative-floor, or ambiguous
-position quarantines new entries while settlement and recovery keep running; it
-does not globally halt the process. Live mode re-runs recovery every 15 seconds,
-waits out ambiguous Swap handoffs, and never races a pending Jupiter keeper
-order. Cross-chain execution is still non-atomic.
+Unknown quantity, identity, or cash debit is kept in reconciliation state and
+is not reported as realized profit. A known quantity mismatch is retained when
+both intended single-winner payouts exceed actual combined cost by the
+configured post-fill floor. Automatic startup, periodic, and immediate
+post-entry repair are disabled. An unresolved, one-sided, negative-floor, or
+ambiguous position is persisted and quarantines new entries; live mode will not
+submit a repair order. Settlement continues independently. Cross-chain
+execution is still non-atomic.
 
 All new 5-minute entries use direct Swap V2. The executable price-discovery
 amount defaults to `$5` and is configurable; every candidate is therefore
@@ -222,7 +222,7 @@ Common options:
 | `--maximum-slippage-bps` | `100` | Entry/repair protection, allowed range 1–500 |
 | `--polymarket-depth-haircut-bps` | `2000` | Ignores the last 20% of displayed depth |
 | `--maximum-jupiter-submit-quote-age-ms` | `250` | Response-received-to-handoff ceiling for a cached executable order |
-| `--maximum-emergency-hedge-loss-usd` | `$1` | Bound for a post-fill repair |
+| `--maximum-emergency-hedge-loss-usd` | `$1` | Dormant while automatic live repair is disabled |
 | `--jupiter-fill-timeout-ms` | `20000` | Confirmation/reconciliation timeout |
 | `--max-polymarket-age-ms` | `750` | Maximum entry snapshot age |
 | `--max-jupiter-age-ms` | `2000` | Maximum executable-order snapshot age used for screening |
@@ -289,8 +289,9 @@ Press `Ctrl-C` once and allow an active entry/reconciliation to finish. Never
 delete the state to clear a halt: a new file forgets exposure but cannot close
 it on either venue.
 
-First inspect the state and both real wallets. Then, if the recorded identities
-are correct, run the explicit recovery command:
+Live mode never starts recovery or submits a repair automatically. First
+inspect the state and both real wallets. Then, only if the recorded identities
+are correct, run the explicit operator recovery command:
 
 ```bash
 pnpm recover:live --maximum-repair-loss-usd=1 --maximum-slippage-bps=100
@@ -345,8 +346,9 @@ payout.
   identical signed transaction and request ID; expired/rejected builds are not
   rebuilt blindly.
 - `NEW ENTRIES PAUSED`: an existing position failed the post-fill safety gate or
-  still needs reconciliation. Recovery and settlement continue. Inspect the
-  position and submission diagnostics; do not delete the state file.
+  still needs reconciliation. Automatic recovery is disabled, while settlement
+  continues. Inspect the position and submission diagnostics; do not delete the
+  state file.
 - `ENTRY_CUTOFF`: fewer than 30 seconds remain; no new entry is allowed.
 - `JUPITER_BUILD_EXPIRED`: local preparation plus the reserved 10 RPS execution
   slot cannot fit inside the 500 ms freshness ceiling; the transaction is
