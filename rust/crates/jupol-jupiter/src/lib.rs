@@ -1403,22 +1403,27 @@ pub struct JupiterForecastSwapExecutor {
     client: JupiterSwapClient,
     rpc: SolanaRpc,
     keypair: Keypair,
+    slippage_bps: Option<u64>,
 }
 
 /// Builds wallet-specific executable Forecast orders without holding signing
 /// authority. This is suitable for continuously using Swap V2 `/order` as an
+/// Low-overhead price discovery quoter for Forecast markets. It prepares an
 /// executable price feed: only the selected build is later signed by the live
-/// executor.
+/// executor (or pre-signed immediately if keypair is available).
 #[derive(Clone)]
 pub struct JupiterForecastSwapQuoter {
     client: JupiterSwapClient,
     owner_pubkey: String,
+    keypair: Option<Arc<Keypair>>,
+    slippage_bps: Option<u64>,
 }
 
 impl JupiterForecastSwapQuoter {
     pub fn new(
         client: JupiterSwapClient,
         owner_pubkey: impl Into<String>,
+        slippage_bps: Option<u64>,
     ) -> Result<Self, JupiterError> {
         let owner_pubkey = owner_pubkey.into();
         owner_pubkey
@@ -1427,19 +1432,51 @@ impl JupiterForecastSwapQuoter {
         Ok(Self {
             client,
             owner_pubkey,
+            keypair: None,
+            slippage_bps,
         })
     }
 
     pub fn from_private_key(
         client: JupiterSwapClient,
         private_key: &str,
+        slippage_bps: Option<u64>,
     ) -> Result<Self, JupiterError> {
-        Self::new(client, parse_keypair(private_key)?.pubkey().to_string())
+        let keypair = parse_keypair(private_key)?;
+        let owner_pubkey = keypair.pubkey().to_string();
+        Ok(Self {
+            client,
+            owner_pubkey,
+            keypair: Some(Arc::new(keypair)),
+            slippage_bps,
+        })
     }
 
     #[must_use]
     pub fn owner_pubkey(&self) -> &str {
         &self.owner_pubkey
+    }
+
+    pub fn prepare_submission(
+        &self,
+        build: PredictionOrderBuild,
+    ) -> Result<PreparedJupiterSubmission, JupiterError> {
+        let keypair = self
+            .keypair
+            .as_ref()
+            .ok_or_else(|| invalid("quoter has no keypair configured for pre-signing"))?;
+        validate_required_signers(&build, &self.owner_pubkey)?;
+        if build.execution_endpoint != "/swap/v2/execute" {
+            return Err(invalid(format!(
+                "Forecast Swap build has unsupported endpoint {}",
+                build.execution_endpoint
+            )));
+        }
+        let signed_transaction = sign_versioned_transaction(&build.transaction, keypair)?;
+        Ok(PreparedJupiterSubmission {
+            build,
+            signed_transaction,
+        })
     }
 
     pub async fn prepare_buy(
@@ -1455,7 +1492,7 @@ impl JupiterForecastSwapQuoter {
                 outcome_mint,
                 deposit_amount_micro_usd,
                 Some(&self.owner_pubkey),
-                None,
+                self.slippage_bps,
             )
             .await?;
         forecast_swap_build(order, market_id, outcome_mint, true, &self.owner_pubkey)
@@ -1467,11 +1504,13 @@ impl JupiterForecastSwapExecutor {
         client: JupiterSwapClient,
         rpc_url: &str,
         private_key: &str,
+        slippage_bps: Option<u64>,
     ) -> Result<Self, JupiterError> {
         Ok(Self {
             client,
             rpc: SolanaRpc::new(rpc_url)?,
             keypair: parse_keypair(private_key)?,
+            slippage_bps,
         })
     }
 
@@ -1520,7 +1559,7 @@ impl JupiterForecastSwapExecutor {
                 outcome_mint,
                 deposit_amount_micro_usd,
                 Some(&self.owner_pubkey()),
-                None,
+                self.slippage_bps,
             )
             .await?;
         forecast_swap_build(order, market_id, outcome_mint, true, &self.owner_pubkey())
@@ -1539,7 +1578,7 @@ impl JupiterForecastSwapExecutor {
                 USDC_MINT,
                 contracts_micro,
                 Some(&self.owner_pubkey()),
-                None,
+                self.slippage_bps,
             )
             .await?;
         forecast_swap_build(
@@ -1685,6 +1724,16 @@ impl JupiterForecastSwapExecutor {
             .get("requestId")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("Forecast Swap build is missing requestId"))?;
+
+        // Concurrently dispatch the signed transaction directly to Solana RPC to minimize block-landing latency.
+        let _rpc_dispatch = {
+            let rpc = self.rpc.clone();
+            let tx_b64 = prepared.signed_transaction.clone();
+            tokio::spawn(async move {
+                let _ = rpc.send_transaction_with_options(&tx_b64, true, 0).await;
+            })
+        };
+
         let mut execution = match self
             .client
             .execute(&prepared.signed_transaction, request_id)
@@ -2158,7 +2207,25 @@ fn forecast_swap_build(
     } else {
         order.out_amount
     };
-    let average_price_micro_usd = if is_buy {
+    let optimistic_price_micro_usd = if is_buy {
+        ceil_divide(
+            gross_micro_usd
+                .checked_mul(ONE_USD_MICRO)
+                .ok_or_else(|| invalid("Swap price overflow"))?,
+            quoted_quantity_micro,
+        )?
+    } else {
+        gross_micro_usd
+            .checked_mul(ONE_USD_MICRO)
+            .ok_or_else(|| invalid("Swap price overflow"))?
+            / quoted_quantity_micro
+    };
+    if !(1..ONE_USD_MICRO).contains(&optimistic_price_micro_usd) {
+        return Err(invalid(format!(
+            "Swap V2 returned invalid optimistic price {optimistic_price_micro_usd}"
+        )));
+    }
+    let raw_average_price_micro_usd = if is_buy {
         ceil_divide(
             gross_micro_usd
                 .checked_mul(ONE_USD_MICRO)
@@ -2171,11 +2238,7 @@ fn forecast_swap_build(
             .ok_or_else(|| invalid("Swap price overflow"))?
             / guaranteed_quantity_micro
     };
-    if !(1..ONE_USD_MICRO).contains(&average_price_micro_usd) {
-        return Err(invalid(format!(
-            "Swap V2 returned invalid average price {average_price_micro_usd}"
-        )));
-    }
+    let average_price_micro_usd = raw_average_price_micro_usd.min(ONE_USD_MICRO - 1);
     let position_pubkey = forecast_swap_position_id(market_id, outcome_mint);
     let execution_context = forecast_swap_execution_context(&order);
     Ok(PredictionOrderBuild {

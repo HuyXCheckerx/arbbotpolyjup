@@ -29,7 +29,8 @@ use jupol_domain::types::{BinaryOrderBook, BookLevel, ShortWindowOutcome, SideOr
 use jupol_jupiter::{
     JupiterClient, JupiterClientOptions, JupiterForecastSwapExecutor, JupiterForecastSwapQuoter,
     JupiterHybridExecutor, JupiterPredictionExecutor, JupiterSwapClient,
-    PREDICTION_MINIMUM_BUY_MICRO_USD, PredictionOrderBuild, SwapClientOptions,
+    PREDICTION_MINIMUM_BUY_MICRO_USD, PredictionOrderBuild, PreparedJupiterSubmission,
+    SwapClientOptions,
 };
 use jupol_live::{EntryDisposition, LiveCoordinator, LiveEntryRequest, capture_entry_balances};
 use jupol_polymarket::{
@@ -103,7 +104,7 @@ struct RunArgs {
     sample_interval_ms: u64,
     #[arg(long, default_value_t = 5_000)]
     polymarket_poll_ms: u64,
-    #[arg(long, default_value_t = 750)]
+    #[arg(long, default_value_t = 2_500)]
     max_polymarket_age_ms: i64,
     #[arg(long, default_value_t = 2_000)]
     max_jupiter_age_ms: i64,
@@ -111,7 +112,7 @@ struct RunArgs {
     jupiter_order_input_usd: String,
     #[arg(long, default_value_t = DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS)]
     jupiter_order_request_interval_ms: u64,
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, default_value_t = 1_000)]
     maximum_jupiter_submit_quote_age_ms: i64,
     #[arg(long, default_value_t = 30)]
     entry_cutoff_seconds: i64,
@@ -129,7 +130,7 @@ struct RunArgs {
     minimum_entry_profit_usd: String,
     #[arg(long, default_value = "0")]
     minimum_post_fill_profit_usd: String,
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 300)]
     maximum_slippage_bps: u32,
     #[arg(long, default_value_t = 2_000)]
     polymarket_depth_haircut_bps: u32,
@@ -248,6 +249,7 @@ struct TimedExecutableOrder {
     requested_at_ms: i64,
     received_at_ms: i64,
     build: PredictionOrderBuild,
+    prepared: Option<PreparedJupiterSubmission>,
 }
 
 #[derive(Default)]
@@ -463,15 +465,22 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
         request_scheduler: scheduler.clone(),
         request_priority: RequestPriority::Normal,
     })?;
-    let order_quoter = executable_order_quoter(&api_key, scheduler.clone())?;
+    let jupiter_slippage_bps = env_optional("JUPITER_SLIPPAGE_BPS")
+        .and_then(|s| s.parse::<u64>().ok())
+        .or(Some(u64::from(config.maximum_slippage_bps)));
+    let order_quoter = executable_order_quoter(&api_key, scheduler.clone(), jupiter_slippage_bps)?;
     let gamma_url = env_optional("POLYMARKET_GAMMA_URL");
     let clob_url = env_optional("POLYMARKET_CLOB_URL");
     let gamma = PolymarketGammaClient::new(gamma_url.as_deref())?;
     let polymarket_data = PolymarketMarketData::new(clob_url.as_deref())?;
 
     let (jupiter_executor, polymarket_executor, mut coordinator, relayer) = if live {
-        let (jupiter, polymarket) =
-            live_components(scheduler.clone(), !args.disable_sub_five_jupiter_swap).await?;
+        let (jupiter, polymarket) = live_components(
+            scheduler.clone(),
+            !args.disable_sub_five_jupiter_swap,
+            jupiter_slippage_bps,
+        )
+        .await?;
         let poly_ready = polymarket
             .assert_ready(config.minimum_venue_balance_micro_usd)
             .await?;
@@ -870,6 +879,7 @@ struct OrderDiscoveryResult {
     sequence: u64,
     requested_at_ms: i64,
     result: std::result::Result<PredictionOrderBuild, jupol_jupiter::JupiterError>,
+    prepared: Option<PreparedJupiterSubmission>,
 }
 
 fn new_order_discovery(
@@ -932,11 +942,16 @@ fn new_order_discovery(
                                 gross_micro_usd,
                             )
                             .await;
+                        let prepared = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|build| request_quoter.prepare_submission(build.clone()).ok());
                         OrderDiscoveryResult {
                             target,
                             sequence,
                             requested_at_ms,
                             result,
+                            prepared,
                         }
                     });
                 }
@@ -960,6 +975,7 @@ fn new_order_discovery(
                                     requested_at_ms: completed.requested_at_ms,
                                     received_at_ms,
                                     build,
+                                    prepared: completed.prepared,
                                 },
                             );
                         }
@@ -1081,7 +1097,11 @@ async fn try_live_entry(
     else {
         return Ok(None);
     };
-    let jupiter_submission = jupiter.prepare_submission(build)?;
+    let jupiter_submission = if let Some(prepared) = timed_build.prepared {
+        prepared
+    } else {
+        jupiter.prepare_submission(build)?
+    };
     let polymarket_order = polymarket
         .prepare_buy_fok(
             token_id,
@@ -1165,7 +1185,7 @@ async fn readiness(args: ReadinessArgs) -> Result<()> {
     if !args.polymarket_only {
         let scheduler =
             JupiterRequestScheduler::new(Duration::from_millis(DEVELOPER_REQUEST_INTERVAL_MS));
-        let (jupiter, _) = live_components(Some(scheduler), true).await?;
+        let (jupiter, _) = live_components(Some(scheduler), true, None).await?;
         let balances = jupiter.assert_ready(minimum).await?;
         println!(
             "Jupiter ready: owner={}, USDC=${}, SOL={} lamports; Developer key bucket=10 RPS shared",
@@ -1180,7 +1200,12 @@ async fn readiness(args: ReadinessArgs) -> Result<()> {
 async fn recover(args: RecoveryArgs) -> Result<()> {
     let scheduler =
         JupiterRequestScheduler::new(Duration::from_millis(DEVELOPER_REQUEST_INTERVAL_MS));
-    let (jupiter, polymarket) = live_components(Some(scheduler), true).await?;
+    let (jupiter, polymarket) = live_components(
+        Some(scheduler),
+        true,
+        Some(u64::from(args.maximum_slippage_bps)),
+    )
+    .await?;
     let mut coordinator = LiveCoordinator::load(&args.live_state)?;
     for result in coordinator
         .recover_incomplete_positions_with_limits(
@@ -1326,10 +1351,11 @@ fn print_state(path: &Path) -> Result<()> {
 async fn live_components(
     scheduler: Option<JupiterRequestScheduler>,
     allow_subminimum_forecast_swap: bool,
+    slippage_bps: Option<u64>,
 ) -> Result<(JupiterHybridExecutor, PolymarketExecutor)> {
-    let api_key = env_required("JUPITER_API_KEY")?;
-    let rpc = env_required("SOLANA_RPC_URL")?;
+    let rpc_url = env_required("SOLANA_RPC_URL")?;
     let private_key = env_required("JUPITER_SOLANA_PRIVATE_KEY")?;
+    let api_key = env_required("JUPITER_API_KEY")?;
     let prediction_client = JupiterClient::new(JupiterClientOptions {
         base_url: env_optional("JUPITER_PREDICTION_URL")
             .unwrap_or_else(|| "https://api.jup.ag/prediction/v1".to_owned()),
@@ -1346,8 +1372,9 @@ async fn live_components(
         request_scheduler: scheduler,
         request_priority: RequestPriority::Critical,
     })?;
-    let prediction = JupiterPredictionExecutor::new(prediction_client, &rpc, &private_key)?;
-    let forecast = JupiterForecastSwapExecutor::new(swap_client, &rpc, &private_key)?;
+    let prediction = JupiterPredictionExecutor::new(prediction_client, &rpc_url, &private_key)?;
+    let forecast =
+        JupiterForecastSwapExecutor::new(swap_client, &rpc_url, &private_key, slippage_bps)?;
     let jupiter = JupiterHybridExecutor {
         prediction,
         forecast,
@@ -1364,6 +1391,7 @@ async fn live_components(
 fn executable_order_quoter(
     api_key: &str,
     scheduler: Option<JupiterRequestScheduler>,
+    slippage_bps: Option<u64>,
 ) -> Result<JupiterForecastSwapQuoter> {
     let swap_client = JupiterSwapClient::new(SwapClientOptions {
         base_url: env_optional("JUPITER_SWAP_URL")
@@ -1376,7 +1404,11 @@ fn executable_order_quoter(
         request_priority: RequestPriority::Normal,
     })?;
     if let Some(public_key) = env_optional("JUPITER_SOLANA_PUBLIC_KEY") {
-        return Ok(JupiterForecastSwapQuoter::new(swap_client, public_key)?);
+        return Ok(JupiterForecastSwapQuoter::new(
+            swap_client,
+            public_key,
+            slippage_bps,
+        )?);
     }
     let private_key = env_required("JUPITER_SOLANA_PRIVATE_KEY").context(
         "executable Jupiter price discovery requires JUPITER_SOLANA_PUBLIC_KEY or JUPITER_SOLANA_PRIVATE_KEY as the Swap V2 taker",
@@ -1384,6 +1416,7 @@ fn executable_order_quoter(
     Ok(JupiterForecastSwapQuoter::from_private_key(
         swap_client,
         &private_key,
+        slippage_bps,
     )?)
 }
 
@@ -1402,11 +1435,11 @@ fn validate_run_args(args: &RunArgs, live: bool) -> Result<()> {
     if args.entry_cutoff_seconds < 30 {
         bail!("--entry-cutoff-seconds cannot be below the required 30 seconds");
     }
-    if !(25..=2_000).contains(&args.maximum_jupiter_submit_quote_age_ms) {
-        bail!("--maximum-jupiter-submit-quote-age-ms must be 25..2000");
+    if !(25..=5_000).contains(&args.maximum_jupiter_submit_quote_age_ms) {
+        bail!("--maximum-jupiter-submit-quote-age-ms must be 25..5000");
     }
-    if !(1..=500).contains(&args.maximum_slippage_bps) {
-        bail!("--maximum-slippage-bps must be 1..500");
+    if !(1..=2_500).contains(&args.maximum_slippage_bps) {
+        bail!("--maximum-slippage-bps must be 1..2500");
     }
     if args.polymarket_depth_haircut_bps > 5_000 {
         bail!("--polymarket-depth-haircut-bps must be <=5000");
@@ -2311,8 +2344,13 @@ fn classify_execution_error(message: &str) -> &'static str {
 
 fn executable_order_error_key(message: &str) -> String {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("failed to get quotes") {
-        "FAILED_TO_GET_QUOTES".to_owned()
+    if lower.contains("failed to get quotes")
+        || lower.contains("insufficient liquidity")
+        || lower.contains("invalid minimum output")
+        || lower.contains("invalid average price")
+        || lower.contains("invalid optimistic price")
+    {
+        "LIQUIDITY_UNAVAILABLE_OR_OUT_OF_BOUNDS".to_owned()
     } else if lower.contains("429") || lower.contains("rate limit") {
         "API_RATE_LIMITED".to_owned()
     } else if lower.contains("401") || lower.contains("unauthorized") {
@@ -2377,6 +2415,7 @@ mod execution_tests {
                     estimated_total_fee_micro_usd: 0,
                 },
             },
+            prepared: None,
         }
     }
 

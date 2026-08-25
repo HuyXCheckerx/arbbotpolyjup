@@ -287,13 +287,23 @@ impl SolanaRpc {
     }
 
     pub async fn send_transaction(&self, signed_base64: &str) -> Result<String, SolanaError> {
+        self.send_transaction_with_options(signed_base64, false, 3)
+            .await
+    }
+
+    pub async fn send_transaction_with_options(
+        &self,
+        signed_base64: &str,
+        skip_preflight: bool,
+        max_retries: usize,
+    ) -> Result<String, SolanaError> {
         self.rpc(
             "sendTransaction",
             json!([signed_base64, {
                 "encoding": "base64",
-                "skipPreflight": false,
-                "preflightCommitment": "confirmed",
-                "maxRetries": 3
+                "skipPreflight": skip_preflight,
+                "preflightCommitment": if skip_preflight { "processed" } else { "confirmed" },
+                "maxRetries": max_retries
             }]),
         )
         .await
