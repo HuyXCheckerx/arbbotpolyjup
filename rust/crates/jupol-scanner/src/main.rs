@@ -104,7 +104,7 @@ struct RunArgs {
     sample_interval_ms: u64,
     #[arg(long, default_value_t = 5_000)]
     polymarket_poll_ms: u64,
-    #[arg(long, default_value_t = 2_500)]
+    #[arg(long, default_value_t = 750)]
     max_polymarket_age_ms: i64,
     #[arg(long, default_value_t = 2_000)]
     max_jupiter_age_ms: i64,
@@ -112,7 +112,7 @@ struct RunArgs {
     jupiter_order_input_usd: String,
     #[arg(long, default_value_t = DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS)]
     jupiter_order_request_interval_ms: u64,
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = 250)]
     maximum_jupiter_submit_quote_age_ms: i64,
     #[arg(long, default_value_t = 30)]
     entry_cutoff_seconds: i64,
@@ -1435,8 +1435,8 @@ fn validate_run_args(args: &RunArgs, live: bool) -> Result<()> {
     if args.entry_cutoff_seconds < 30 {
         bail!("--entry-cutoff-seconds cannot be below the required 30 seconds");
     }
-    if !(25..=5_000).contains(&args.maximum_jupiter_submit_quote_age_ms) {
-        bail!("--maximum-jupiter-submit-quote-age-ms must be 25..5000");
+    if !(25..=2_000).contains(&args.maximum_jupiter_submit_quote_age_ms) {
+        bail!("--maximum-jupiter-submit-quote-age-ms must be 25..2000");
     }
     if !(1..=2_500).contains(&args.maximum_slippage_bps) {
         bail!("--maximum-slippage-bps must be 1..2500");
