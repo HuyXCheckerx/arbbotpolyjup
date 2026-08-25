@@ -41,8 +41,9 @@ lookalikes are rejected.
   no authenticated Prediction quota.
 - A live candidate must request a new exact Jupiter Prediction or Swap V2 build.
   The public price cannot arm an order by itself.
-- Prediction and Swap share one 100 ms Developer-key scheduler (10 RPS), with
-  entry/recovery priority.
+- Prediction and Swap `/order` builds share one 100 ms Developer-key main-bucket
+  scheduler (10 RPS), with entry/recovery priority. Authenticated Swap
+  `/execute` uses Jupiter's separate paid-plan execution bucket.
 - A Jupiter build must fit inside the 500 ms build-to-handoff ceiling, including
   a conservative 250 ms allowance for the critical 10 RPS slot.
 - Polymarket displayed depth is reduced by 20% by default and then re-read before

@@ -90,13 +90,14 @@ Key details:
 - The Rust CLI loads `.env` automatically. Do not paste secrets into commands,
   logs, screenshots, or support messages.
 
-### Jupiter Developer key: 10 RPS and product access
+### Jupiter Developer key: request buckets and product access
 
-All authenticated Prediction and Swap V2 requests share one process-wide
-100 ms scheduler, matching the Developer plan's 10 RPS. Entry and recovery work
-has priority and jumps queued discovery; `/execute` still consumes the same
-bucket so the process cannot cause its own 429 by bypassing the plan limit.
-Public Degen and Polymarket WebSockets do not consume this budget.
+Prediction requests and Swap V2 `/order` builds share one process-wide 100 ms
+scheduler, matching the Developer plan's 10 RPS main bucket. Entry and recovery
+work has priority and jumps queued discovery. Authenticated Swap V2 `/execute`
+uses Jupiter's separate paid-plan execute bucket (documented at 100 RPS), so a
+signed transaction no longer waits behind discovery/build traffic. Public Degen
+and Polymarket WebSockets do not consume either authenticated budget.
 
 The Developer plan and product access are separate. The key must be enabled for
 both **Prediction** and **Swap** in the Jupiter portal. If startup reports:
@@ -173,17 +174,21 @@ The live path:
 3. re-reads Polymarket depth and prepares an exact-share FOK;
 4. persists an intent before exposure;
 5. releases the signed Polymarket and Jupiter submissions concurrently;
-6. reconciles actual conditional tokens, wallet collateral/USDC and Solana
-   transaction deltas before recording quantities or cost;
+6. reconciles actual conditional tokens and wallet collateral/USDC before
+   recording quantities or cost; Swap V2 uses `/execute`'s confirmed
+   `totalInputAmount` and `totalOutputAmount` and Prediction uses its documented
+   status/history APIs;
 7. computes Polymarket-only-win, Jupiter-only-win, both-win and both-lose P&L;
 8. holds reconciled exposure to settlement, automatically redeems/claims, and
    reclaims empty Forecast token-account rent.
 
 Unknown quantity, identity, or cash debit is kept in recovery state and is not
 reported as realized profit. Known mismatches can use only the configured
-bounded repair. Live mode re-runs recovery every 15 seconds, waits out ambiguous
-Swap handoffs, and never races a pending Jupiter keeper order. Cross-chain
-execution is still non-atomic.
+bounded repair. An unresolved, one-sided, mismatched, or negative-floor position
+quarantines new entries while settlement and recovery keep running; it does not
+globally halt the process. Live mode re-runs recovery every 15 seconds, waits out
+ambiguous Swap handoffs, and never races a pending Jupiter keeper order.
+Cross-chain execution is still non-atomic.
 
 Jupiter Prediction is used for `$5+` native Forecast orders and all standard
 `POLY-*` markets. Native Forecast orders below `$5` may use direct Swap V2 down
@@ -227,7 +232,7 @@ Common options:
 Example conservative live run:
 
 ```bash
-pnpm bot:short-window:live -- \
+pnpm bot:short-window:live \
   --no-daily-threshold \
   --max-venue-allocation-usd=10 \
   --maximum-open-positions=1 \
@@ -312,15 +317,25 @@ Automatic settlement records realized P&L from confirmed wallet credits. A
 confirmed Polymarket redemption is saved as pending before credit observation,
 so a restart rechecks that transaction instead of submitting the redemption
 again. Jupiter claim accounting likewise uses the confirmed owned-USDC credit,
-not the API's pre-transaction payout estimate.
+not the API's pre-transaction payout estimate. Fully settled positions are moved
+to the state's immutable `settled_positions` audit ledger instead of being
+discarded.
 
 ## Common failures
 
 - `401 Unauthorized`: the key lacks Prediction product access or is invalid;
   enable it in the Jupiter portal. The 10 RPS plan alone does not grant access.
-- `429`: another process may share the same key, or the upstream bucket is
-  tighter than expected. This process already spaces the shared bucket at
-  100 ms.
+- `429` from Prediction or Swap `/order`: another process may share the same key,
+  or the upstream main bucket is tighter than expected. This process spaces the
+  main bucket at 100 ms. A Solana RPC `429` is separate: use a paid, low-latency
+  RPC and do not confuse it with Jupiter API rate limiting.
+- Swap `/execute` failure: diagnostics include request ID, router, execution
+  mode, code and error. Failed-to-land/unknown results are retried only with the
+  identical signed transaction and request ID; expired/rejected builds are not
+  rebuilt blindly.
+- `NEW ENTRIES PAUSED`: an existing position failed the post-fill safety gate or
+  still needs reconciliation. Recovery and settlement continue. Inspect the
+  position and submission diagnostics; do not delete the state file.
 - `ENTRY_CUTOFF`: fewer than 30 seconds remain; no new entry is allowed.
 - `JUPITER_BUILD_EXPIRED`: local preparation plus the reserved 10 RPS execution
   slot cannot fit inside the 500 ms freshness ceiling; the transaction is

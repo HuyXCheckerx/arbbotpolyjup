@@ -568,6 +568,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                     jupiter_executor.as_ref(), polymarket_executor.as_ref(), coordinator.as_mut(), best,
                                 ) {
                                     if coordinator.state().positions.len() < config.maximum_open_positions
+                                        && coordinator.entry_blocker().is_none()
                                         && !coordinator.state().completed_pairs.contains(&runtime.pair.key)
                                         && !coordinator.state().positions.iter().any(|position| position.pair.key == runtime.pair.key)
                                     {
@@ -585,10 +586,10 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                                 runtime.last_preflight_error = None;
                                                 let (poly_cash, jup_cash) = tokio::join!(
                                                     polymarket.collateral_balance_micro_usd(),
-                                                    jupiter.wallet_balances(),
+                                                    jupiter.usdc_balance(),
                                                 );
                                                 if let (Ok(poly_cash), Ok(jup_cash)) = (poly_cash, jup_cash) {
-                                                    coordinator.update_cash_snapshots(poly_cash, jup_cash.usdc_micro)?;
+                                                    coordinator.update_cash_snapshots(poly_cash, jup_cash)?;
                                                 }
                                                 writer.append(json!({
                                                     "schemaVersion": 3,
@@ -684,6 +685,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                             jupiter_executor.as_ref(), polymarket_executor.as_ref(), coordinator.as_mut(), best,
                         ) {
                             if coordinator.state().positions.len() < config.maximum_open_positions
+                                && coordinator.entry_blocker().is_none()
                                 && !coordinator.state().completed_pairs.contains(&runtime.pair.key())
                                 && !coordinator.state().positions.iter().any(|position| position.pair.key == runtime.pair.key())
                             {
@@ -695,10 +697,10 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
                                         runtime.last_preflight_error = None;
                                         let (poly_cash, jup_cash) = tokio::join!(
                                             polymarket.collateral_balance_micro_usd(),
-                                            jupiter.wallet_balances(),
+                                            jupiter.usdc_balance(),
                                         );
                                         if let (Ok(poly_cash), Ok(jup_cash)) = (poly_cash, jup_cash) {
-                                            coordinator.update_cash_snapshots(poly_cash, jup_cash.usdc_micro)?;
+                                            coordinator.update_cash_snapshots(poly_cash, jup_cash)?;
                                         }
                                         status.event(event_for_disposition(runtime.pair.duration.label(), &disposition)).await;
                                         writer.append(json!({
@@ -892,16 +894,16 @@ async fn try_live_entry(
     coordinator: &mut LiveCoordinator,
     config: &EngineConfig,
 ) -> Result<Option<EntryDisposition>> {
-    let (poly_cash, jup_ready) = tokio::join!(
+    let (poly_cash, jup_usdc) = tokio::join!(
         polymarket.collateral_balance_micro_usd(),
-        jupiter.wallet_balances(),
+        jupiter.usdc_balance(),
     );
     let poly_cash = poly_cash?;
-    let jup_ready = jup_ready?;
+    let jup_usdc = jup_usdc?;
     let proposal = match evaluate_short_window_entry(
         Some(screened_best),
         poly_cash,
-        jup_ready.usdc_micro,
+        jup_usdc,
         &config.strategy,
     )? {
         EntryEvaluation::Eligible(proposal) => proposal,
@@ -978,16 +980,14 @@ async fn try_live_entry(
     else {
         return Ok(None);
     };
-    let (jupiter_submission, polymarket_order) = tokio::join!(
-        jupiter.prepare_submission(build),
-        polymarket.prepare_buy_fok(
+    let jupiter_submission = jupiter.prepare_submission(build)?;
+    let polymarket_order = polymarket
+        .prepare_buy_fok(
             token_id,
             selection.limit_price_micro_usd,
             selection.contracts_micro,
-        ),
-    );
-    let jupiter_submission = jupiter_submission?;
-    let polymarket_order = polymarket_order?;
+        )
+        .await?;
     let build_age = unix_ms().saturating_sub(build_received_at_ms);
     if build_age.saturating_add(JUPITER_CRITICAL_SLOT_BUDGET_MS)
         > config.maximum_jupiter_submit_quote_age_ms
@@ -1008,6 +1008,8 @@ async fn try_live_entry(
         before,
         maximum_repair_loss_micro_usd: config.maximum_emergency_hedge_loss_micro_usd,
         maximum_repair_slippage_bps: config.maximum_slippage_bps,
+        minimum_post_fill_profit_micro_usd: config.strategy.minimum_entry_edge_total_micro_usd,
+        maximum_post_fill_mismatch_micro: 10_000,
         fill_timeout: config.jupiter_fill_timeout,
         diagnostic_test_entry: false,
     };
@@ -1027,25 +1029,21 @@ async fn try_daily_live_entry(
     coordinator: &mut LiveCoordinator,
     config: &EngineConfig,
 ) -> Result<Option<EntryDisposition>> {
-    let (poly_cash, jup_ready) = tokio::join!(
+    let (poly_cash, jup_usdc) = tokio::join!(
         polymarket.collateral_balance_micro_usd(),
-        jupiter.wallet_balances(),
+        jupiter.usdc_balance(),
     );
     let poly_cash = poly_cash?;
-    let jup_ready = jup_ready?;
+    let jup_usdc = jup_usdc?;
     let mut strategy = config.strategy;
     strategy.jupiter_minimum_gross_order_micro_usd = strategy
         .jupiter_minimum_gross_order_micro_usd
         .max(PREDICTION_MINIMUM_BUY_MICRO_USD);
-    let proposal = match evaluate_short_window_entry(
-        Some(screened_best),
-        poly_cash,
-        jup_ready.usdc_micro,
-        &strategy,
-    )? {
-        EntryEvaluation::Eligible(proposal) => proposal,
-        EntryEvaluation::Rejected(_) => return Ok(None),
-    };
+    let proposal =
+        match evaluate_short_window_entry(Some(screened_best), poly_cash, jup_usdc, &strategy)? {
+            EntryEvaluation::Eligible(proposal) => proposal,
+            EntryEvaluation::Rejected(_) => return Ok(None),
+        };
     let is_yes = proposal.route.jupiter_outcome == ShortWindowOutcome::Up;
     let (build, fresh_poly) = tokio::join!(
         async {
@@ -1097,16 +1095,14 @@ async fn try_daily_live_entry(
     else {
         return Ok(None);
     };
-    let (jupiter_submission, polymarket_order) = tokio::join!(
-        jupiter.prepare_submission(build),
-        polymarket.prepare_buy_fok(
+    let jupiter_submission = jupiter.prepare_submission(build)?;
+    let polymarket_order = polymarket
+        .prepare_buy_fok(
             token_id,
             selection.limit_price_micro_usd,
             selection.contracts_micro,
-        ),
-    );
-    let jupiter_submission = jupiter_submission?;
-    let polymarket_order = polymarket_order?;
+        )
+        .await?;
     let build_age = unix_ms().saturating_sub(build_received_at_ms);
     if build_age.saturating_add(JUPITER_CRITICAL_SLOT_BUDGET_MS)
         > config.maximum_jupiter_submit_quote_age_ms
@@ -1138,6 +1134,8 @@ async fn try_daily_live_entry(
         before,
         maximum_repair_loss_micro_usd: config.maximum_emergency_hedge_loss_micro_usd,
         maximum_repair_slippage_bps: config.maximum_slippage_bps,
+        minimum_post_fill_profit_micro_usd: config.strategy.minimum_entry_edge_total_micro_usd,
+        maximum_post_fill_mismatch_micro: 10_000,
         fill_timeout: config.jupiter_fill_timeout,
         diagnostic_test_entry: false,
     };
@@ -1666,6 +1664,7 @@ async fn update_live_status(store: &StatusStore, coordinator: &LiveCoordinator) 
         .update_strategy(|strategy| {
             strategy.halted = state.halted;
             strategy.halt_reason = state.halt_reason.clone();
+            strategy.entry_quarantine_reason = coordinator.entry_blocker();
             strategy.polymarket_cash_usd = state
                 .polymarket_cash_micro_usd
                 .map_or_else(|| "0".to_owned(), format_usd);
@@ -1674,6 +1673,7 @@ async fn update_live_status(store: &StatusStore, coordinator: &LiveCoordinator) 
                 .map_or_else(|| "0".to_owned(), format_usd);
             strategy.realized_profit_usd = format_usd(state.realized_profit_micro_usd);
             strategy.open_positions = state.positions.len();
+            strategy.settled_positions = state.settled_positions.len();
             strategy.awaiting_resolution = state
                 .positions
                 .iter()
@@ -1772,6 +1772,8 @@ fn position_status(position: &LivePosition) -> serde_json::Value {
         "jupiterRentReclaimedSol": format_sol_lamports(position.jupiter_rent_reclaimed_lamports),
         "realizedProfitUsd": format_usd(position.realized_profit_micro_usd),
         "enteredAt": iso_ms(position.entered_at_ms),
+        "polymarketEntrySubmissionResult": position.polymarket_entry_submission_result,
+        "jupiterEntrySubmissionResult": position.jupiter_entry_submission_result,
         "lastError": position.last_error,
         "settlementError": position.settlement_error,
     })

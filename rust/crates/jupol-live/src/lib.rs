@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use jupol_domain::Micro;
 use jupol_domain::fixed::ONE_USD_MICRO;
+use jupol_domain::short_window::polymarket_crypto_taker_fee_per_contract_micro_usd;
 use jupol_jupiter::{
     JupiterError, JupiterHybridExecutor, PreparedJupiterSubmission, SubmittedJupiterOrder,
     forecast_swap_position_id,
@@ -82,6 +83,8 @@ pub struct LiveEntryRequest {
     pub before: EntryBalanceSnapshot,
     pub maximum_repair_loss_micro_usd: Micro,
     pub maximum_repair_slippage_bps: u32,
+    pub minimum_post_fill_profit_micro_usd: Micro,
+    pub maximum_post_fill_mismatch_micro: Micro,
     pub fill_timeout: Duration,
     pub diagnostic_test_entry: bool,
 }
@@ -144,6 +147,14 @@ impl LiveCoordinator {
         &self.state
     }
 
+    /// Returns the reason new entries are quarantined while an existing
+    /// position needs reconciliation. This is intentionally separate from the
+    /// operator-controlled global halt flag: settlement/recovery can continue.
+    #[must_use]
+    pub fn entry_blocker(&self) -> Option<String> {
+        portfolio_entry_blocker(&self.state)
+    }
+
     #[must_use]
     pub fn state_path(&self) -> &Path {
         &self.state_path
@@ -165,6 +176,11 @@ impl LiveCoordinator {
                     .unwrap_or("no reason recorded")
             )));
         }
+        if let Some(reason) = self.entry_blocker() {
+            return Err(LiveError::InvalidRequest(format!(
+                "new entries are quarantined: {reason}"
+            )));
+        }
         if self.state.positions.iter().any(|position| {
             position.id == request.position_id || position.pair.key == request.pair.key
         }) {
@@ -184,14 +200,20 @@ impl LiveCoordinator {
             polymarket.submit_fok(request.polymarket),
             jupiter.submit_prepared_and_wait(request.jupiter, request.fill_timeout),
         );
+        self.record_entry_submission_results(
+            &request.position_id,
+            &polymarket_result_label(&polymarket_result),
+            &jupiter_result_label(&jupiter_result),
+        )?;
 
-        let observation = capture_entry_balances(
+        let observation = capture_entry_balances_with_retry(
             polymarket,
             jupiter,
             &request.polymarket_token_id,
             request.jupiter_outcome_mint.as_deref(),
             jupiter_build.order.position_pubkey.as_str(),
             false,
+            3,
         )
         .await;
         let after = match observation {
@@ -260,7 +282,7 @@ impl LiveCoordinator {
                 .map_or(0, |fill| fill.gross_micro_usd)
         };
         let observed_jupiter_cost =
-            positive_delta(before.jupiter_usdc_micro, after.jupiter_usdc_micro);
+            positive_delta(after.jupiter_usdc_micro, before.jupiter_usdc_micro);
         let jupiter_cost = if observed_jupiter_cost > 0 {
             observed_jupiter_cost
         } else {
@@ -347,17 +369,73 @@ impl LiveCoordinator {
             {
                 Ok(repair) => {
                     repaired = true;
-                    final_polymarket = repair.final_contracts_micro;
-                    polymarket_cost = polymarket_cost
+                    let modeled_contracts = repair.final_contracts_micro;
+                    let modeled_cost = polymarket_cost
                         .checked_add(repair.additional_cost_micro_usd)
                         .and_then(|value| value.checked_sub(repair.proceeds_micro_usd))
                         .ok_or_else(|| {
                             LiveError::Recovery("repair accounting overflow".to_owned())
                         })?;
+                    match capture_polymarket_state_with_retry(
+                        polymarket,
+                        &request.polymarket_token_id,
+                        3,
+                    )
+                    .await
+                    {
+                        Ok((owned_contracts, collateral)) => {
+                            final_polymarket =
+                                positive_delta(before.polymarket_contracts, owned_contracts);
+                            polymarket_cost =
+                                positive_delta(collateral, before.polymarket_collateral_micro_usd);
+                        }
+                        Err(error) => {
+                            let reason = format!(
+                                "repair reported Poly={modeled_contracts}, but authoritative post-repair balances could not be captured: {error}"
+                            );
+                            self.finalize_observed_position(
+                                &request.position_id,
+                                modeled_contracts,
+                                final_jupiter,
+                                modeled_cost,
+                                jupiter_cost,
+                                polymarket_result.as_ref().ok(),
+                                jupiter_result.as_ref().ok(),
+                                LivePositionPhase::RecoveryPlanning,
+                                Some(reason.clone()),
+                            )?;
+                            return Ok(EntryDisposition::RecoveryPending {
+                                position_id: request.position_id,
+                                reason,
+                            });
+                        }
+                    }
                 }
                 Err(error) => {
+                    let recaptured = capture_polymarket_state_with_retry(
+                        polymarket,
+                        &request.polymarket_token_id,
+                        3,
+                    )
+                    .await;
+                    let recapture_note = match recaptured {
+                        Ok((owned_contracts, collateral)) => {
+                            final_polymarket =
+                                positive_delta(before.polymarket_contracts, owned_contracts);
+                            polymarket_cost =
+                                positive_delta(collateral, before.polymarket_collateral_micro_usd);
+                            format!(
+                                "authoritative post-repair Poly={final_polymarket} collateralDebit={polymarket_cost}"
+                            )
+                        }
+                        Err(ref recapture_error) => {
+                            format!("post-repair recapture also failed: {recapture_error}")
+                        }
+                    };
                     let reason = format!(
-                        "observed Poly={final_polymarket} Jup={final_jupiter}; repair failed: {error}"
+                        "observed Poly={final_polymarket} Jup={final_jupiter}; submissions Poly={} Jup={}; repair failed: {error}; {recapture_note}",
+                        result_label(&polymarket_result),
+                        result_label(&jupiter_result),
                     );
                     self.finalize_observed_position(
                         &request.position_id,
@@ -378,14 +456,28 @@ impl LiveCoordinator {
             }
         }
 
-        let phase = if final_polymarket > 0 && final_jupiter > 0 {
+        let total_cost = polymarket_cost
+            .checked_add(jupiter_cost)
+            .ok_or_else(|| LiveError::Recovery("post-fill cost overflow".to_owned()))?;
+        let risk_plan = build_risk_plan(final_polymarket, final_jupiter, total_cost);
+        let acceptable = post_fill_is_acceptable(
+            &risk_plan,
+            request.minimum_post_fill_profit_micro_usd,
+            request.maximum_post_fill_mismatch_micro,
+        );
+        let phase = if acceptable {
             LivePositionPhase::Open
         } else {
             LivePositionPhase::RecoveryPlanning
         };
-        let reason = (phase == LivePositionPhase::RecoveryPlanning).then(|| {
+        let reason = (!acceptable).then(|| {
             format!(
-                "repair completed without a complementary pair: Poly={final_polymarket} Jup={final_jupiter}"
+                "post-fill safety gate rejected entry: Poly={final_polymarket} Jup={final_jupiter} mismatch={} floor={} requiredFloor={} maxMismatch={} action={:?}",
+                risk_plan.venue_size_mismatch_micro,
+                risk_plan.intended_single_winner_floor_micro_usd,
+                request.minimum_post_fill_profit_micro_usd,
+                request.maximum_post_fill_mismatch_micro,
+                risk_plan.action,
             )
         });
         self.finalize_observed_position(
@@ -520,6 +612,7 @@ impl LiveCoordinator {
                 (Ok(poly), Ok(jup))
                     if poly == 0
                         && jup == 0
+                        && !has_recorded_exposure(&position)
                         && zero_observation_is_mature(
                             position.entry_zero_exposure_proof.as_deref(),
                             unix_timestamp_ms(),
@@ -540,8 +633,16 @@ impl LiveCoordinator {
                     dispositions.push(EntryDisposition::ZeroExposure { position_id: id });
                 }
                 (Ok(0), Ok(0)) => {
-                    let reason = "first repeated zero-balance observation recorded; a later pass must confirm it";
-                    self.mark_zero_observation_pending(&id, reason)?;
+                    let reason = if has_recorded_exposure(&position) {
+                        "current zero balances conflict with durable fill/cost evidence; preserve the position and reconcile settlement, unwind transactions, and cash"
+                    } else {
+                        "first repeated zero-balance observation recorded; a later pass must confirm it"
+                    };
+                    if has_recorded_exposure(&position) {
+                        self.mark_recovery_pending(&id, reason)?;
+                    } else {
+                        self.mark_zero_observation_pending(&id, reason)?;
+                    }
                     dispositions.push(EntryDisposition::RecoveryPending {
                         position_id: id,
                         reason: reason.to_owned(),
@@ -578,6 +679,14 @@ impl LiveCoordinator {
                     });
                 }
                 (Ok(poly), Ok(jup)) if poly == jup && poly > 0 => {
+                    let plan = build_risk_plan(
+                        poly,
+                        jup,
+                        position
+                            .polymarket_entry_cost_micro_usd
+                            .saturating_add(position.jupiter_entry_cost_micro_usd),
+                    );
+                    let acceptable = post_fill_is_acceptable(&plan, 0, 10_000);
                     self.finalize_observed_position(
                         &id,
                         poly,
@@ -586,12 +695,30 @@ impl LiveCoordinator {
                         position.jupiter_entry_cost_micro_usd,
                         None,
                         None,
-                        LivePositionPhase::Open,
-                        None,
+                        if acceptable {
+                            LivePositionPhase::Open
+                        } else {
+                            LivePositionPhase::RecoveryPlanning
+                        },
+                        (!acceptable).then(|| {
+                            format!(
+                                "startup safety gate rejected matched quantities: floor={} mismatch={}",
+                                plan.intended_single_winner_floor_micro_usd,
+                                plan.venue_size_mismatch_micro
+                            )
+                        }),
                     )?;
-                    dispositions.push(EntryDisposition::Opened {
-                        position_id: id,
-                        repaired: false,
+                    dispositions.push(if acceptable {
+                        EntryDisposition::Opened {
+                            position_id: id,
+                            repaired: false,
+                        }
+                    } else {
+                        EntryDisposition::RecoveryPending {
+                            position_id: id,
+                            reason: "matched quantities have a negative single-winner floor"
+                                .to_owned(),
+                        }
                     });
                 }
                 (Ok(poly), Ok(jup)) if poly != jup => {
@@ -607,48 +734,80 @@ impl LiveCoordinator {
                     )
                     .await
                     {
-                        Ok(repair) if repair.final_contracts_micro == jup && jup > 0 => {
+                        Ok(repair) => {
+                            let recaptured_poly = polymarket
+                                .refresh_conditional_balance_micro(
+                                    &position.pair.polymarket_token_id,
+                                )
+                                .await
+                                .unwrap_or(repair.final_contracts_micro);
+                            let repaired_cost = position
+                                .polymarket_entry_cost_micro_usd
+                                .saturating_add(repair.additional_cost_micro_usd)
+                                .saturating_sub(repair.proceeds_micro_usd);
+                            let plan = build_risk_plan(
+                                recaptured_poly,
+                                jup,
+                                repaired_cost.saturating_add(position.jupiter_entry_cost_micro_usd),
+                            );
+                            let acceptable = post_fill_is_acceptable(&plan, 0, 10_000);
+                            let reason = (!acceptable).then(|| {
+                                format!(
+                                    "startup post-repair safety gate rejected position: Poly={recaptured_poly} Jup={jup} floor={} mismatch={}",
+                                    plan.intended_single_winner_floor_micro_usd,
+                                    plan.venue_size_mismatch_micro,
+                                )
+                            });
                             self.finalize_observed_position(
                                 &id,
-                                repair.final_contracts_micro,
+                                recaptured_poly,
                                 jup,
-                                position
-                                    .polymarket_entry_cost_micro_usd
-                                    .saturating_add(repair.additional_cost_micro_usd)
-                                    .saturating_sub(repair.proceeds_micro_usd),
+                                repaired_cost,
                                 position.jupiter_entry_cost_micro_usd,
                                 None,
                                 None,
-                                LivePositionPhase::Open,
-                                None,
+                                if acceptable {
+                                    LivePositionPhase::Open
+                                } else {
+                                    LivePositionPhase::RecoveryPlanning
+                                },
+                                reason.clone(),
                             )?;
-                            dispositions.push(EntryDisposition::Opened {
-                                position_id: id,
-                                repaired: true,
-                            });
-                        }
-                        Ok(repair) if repair.final_contracts_micro == 0 && jup == 0 => {
-                            self.state.positions.retain(|candidate| candidate.id != id);
-                            self.state.completed_pairs.push(position.pair.key);
-                            self.bump_and_save()?;
-                            dispositions.push(EntryDisposition::ZeroExposure { position_id: id });
-                        }
-                        Ok(repair) => {
-                            let reason = format!(
-                                "startup repair remained mismatched: Poly={} Jup={jup}",
-                                repair.final_contracts_micro
-                            );
-                            self.mark_recovery_pending(&id, &reason)?;
-                            dispositions.push(EntryDisposition::RecoveryPending {
-                                position_id: id,
-                                reason,
+                            dispositions.push(if acceptable {
+                                EntryDisposition::Opened {
+                                    position_id: id,
+                                    repaired: true,
+                                }
+                            } else {
+                                EntryDisposition::RecoveryPending {
+                                    position_id: id,
+                                    reason: reason.unwrap_or_else(|| {
+                                        "startup repair did not produce a safe arb".to_owned()
+                                    }),
+                                }
                             });
                         }
                         Err(error) => {
+                            let recaptured_poly = polymarket
+                                .refresh_conditional_balance_micro(
+                                    &position.pair.polymarket_token_id,
+                                )
+                                .await
+                                .unwrap_or(poly);
                             let reason = format!(
-                                "startup observed Poly={poly} Jup={jup}; bounded repair failed: {error}"
+                                "startup observed Poly={poly} Jup={jup}; bounded repair failed: {error}; authoritative post-repair Poly={recaptured_poly}"
                             );
-                            self.mark_recovery_pending(&id, &reason)?;
+                            self.finalize_observed_position(
+                                &id,
+                                recaptured_poly,
+                                jup,
+                                position.polymarket_entry_cost_micro_usd,
+                                position.jupiter_entry_cost_micro_usd,
+                                None,
+                                None,
+                                LivePositionPhase::RecoveryPlanning,
+                                Some(reason.clone()),
+                            )?;
                             dispositions.push(EntryDisposition::RecoveryPending {
                                 position_id: id,
                                 reason,
@@ -830,6 +989,7 @@ impl LiveCoordinator {
                 .positions
                 .iter()
                 .find(|position| &position.id == id)
+                .cloned()
                 .ok_or_else(|| LiveError::Recovery("settled position disappeared".to_owned()))?;
             let realized = position
                 .polymarket_settlement_payout_micro_usd
@@ -843,6 +1003,16 @@ impl LiveCoordinator {
                 .ok_or_else(|| LiveError::Recovery("realized P&L overflow".to_owned()))?;
             if !self.state.completed_pairs.contains(&position.pair.key) {
                 self.state.completed_pairs.push(position.pair.key.clone());
+            }
+            let mut archived = position;
+            archived.realized_profit_micro_usd = realized;
+            if !self
+                .state
+                .settled_positions
+                .iter()
+                .any(|candidate| candidate.id == archived.id)
+            {
+                self.state.settled_positions.push(archived);
             }
         }
         self.state
@@ -940,6 +1110,23 @@ impl LiveCoordinator {
         self.bump_and_save()
     }
 
+    fn record_entry_submission_results(
+        &mut self,
+        id: &str,
+        polymarket_result: &str,
+        jupiter_result: &str,
+    ) -> Result<(), LiveError> {
+        let position = self
+            .state
+            .positions
+            .iter_mut()
+            .find(|position| position.id == id)
+            .ok_or_else(|| LiveError::InvalidRequest(format!("position {id} disappeared")))?;
+        position.polymarket_entry_submission_result = Some(polymarket_result.to_owned());
+        position.jupiter_entry_submission_result = Some(jupiter_result.to_owned());
+        self.bump_and_save()
+    }
+
     fn mark_zero_observation_pending(&mut self, id: &str, reason: &str) -> Result<(), LiveError> {
         let position = self
             .state
@@ -949,7 +1136,7 @@ impl LiveCoordinator {
             .ok_or_else(|| LiveError::InvalidRequest(format!("position {id} disappeared")))?;
         position.phase = LivePositionPhase::RecoveryPlanning;
         position.last_error = Some(reason.to_owned());
-        if position.entry_zero_exposure_proof.is_none() {
+        if !has_recorded_exposure(position) && position.entry_zero_exposure_proof.is_none() {
             position.entry_zero_exposure_proof =
                 Some(format!("first_zero_observation_ms:{}", unix_timestamp_ms()));
         }
@@ -1091,10 +1278,20 @@ async fn repair_polymarket_to_target(
                 "repair SELL quantity {requested_excess} has no precision-valid size at limit {limit}"
             )));
         }
-        let unwind_loss = multiply_price_quantity(ONE_USD_MICRO - limit, excess)?;
-        if unwind_loss > effective_maximum_loss {
+        let gross_proceeds = multiply_price_quantity(limit, excess)?;
+        let fee = polymarket_taker_fee_total(limit, excess)?;
+        let net_proceeds = gross_proceeds.saturating_sub(fee);
+        let remaining_contracts = current.saturating_sub(excess);
+        let remaining_matched_payout = min(remaining_contracts, target);
+        let modeled_loss = modeled_sell_repair_loss(
+            polymarket_cost,
+            jupiter_cost,
+            net_proceeds,
+            remaining_matched_payout,
+        )?;
+        if modeled_loss > effective_maximum_loss {
             return Err(LiveError::Recovery(format!(
-                "repair SELL modeled loss {unwind_loss} exceeds bound {effective_maximum_loss}"
+                "repair SELL modeled loss {modeled_loss} exceeds bound {effective_maximum_loss} (net proceeds {net_proceeds}, remaining matched payout {remaining_matched_payout})"
             )));
         }
         // The loss bound must be proven before signing or submitting. Checking
@@ -1134,7 +1331,7 @@ fn placeholder_position(
         jupiter_order_pubkey: build.order.order_pubkey.clone(),
         jupiter_position_pubkey,
         jupiter_entry_position_pubkey: Some(build.order.position_pubkey.clone()),
-        jupiter_quoted_contracts_micro: Some(build.order.new_contracts_micro),
+        jupiter_quoted_contracts_micro: Some(build.order.contracts_micro),
         jupiter_execution_reconciliation_source: None,
         jupiter_contracts_micro: 0,
         polymarket_contracts_micro: 0,
@@ -1149,6 +1346,8 @@ fn placeholder_position(
         jupiter_settlement_payout_micro_usd: 0,
         polymarket_entry_transaction_hashes: Vec::new(),
         jupiter_entry_transaction_signature: None,
+        polymarket_entry_submission_result: None,
+        jupiter_entry_submission_result: None,
         polymarket_settlement_transaction_signature: None,
         polymarket_redemption_collateral_before_micro_usd: None,
         jupiter_settlement_transaction_signature: None,
@@ -1279,26 +1478,28 @@ pub async fn capture_entry_balances(
 ) -> Result<EntryBalanceSnapshot, LiveError> {
     let poly_future = polymarket.refresh_conditional_balance_micro(polymarket_token_id);
     let collateral_future = polymarket.collateral_balance_micro_usd();
-    let jupiter_wallet_future = jupiter.wallet_balances();
+    // Entry reconciliation needs USDC only. Avoid an unrelated getBalance RPC
+    // call on every capture; that extra call was a major source of Helius 429s.
+    let jupiter_usdc_future = jupiter.usdc_balance();
     if let Some(mint) = jupiter_outcome_mint {
-        let (poly, collateral, jup, jupiter_wallet) = tokio::join!(
+        let (poly, collateral, jup, jupiter_usdc) = tokio::join!(
             poly_future,
             collateral_future,
             jupiter.token_balance(mint),
-            jupiter_wallet_future
+            jupiter_usdc_future
         );
         Ok(EntryBalanceSnapshot {
             polymarket_contracts: poly?,
             polymarket_collateral_micro_usd: collateral?,
             jupiter_contracts: jup?,
-            jupiter_usdc_micro: jupiter_wallet?.usdc_micro,
+            jupiter_usdc_micro: jupiter_usdc?,
         })
     } else {
-        let (poly, collateral, jup, jupiter_wallet) = tokio::join!(
+        let (poly, collateral, jup, jupiter_usdc) = tokio::join!(
             poly_future,
             collateral_future,
             jupiter.get_position(jupiter_position_pubkey),
-            jupiter_wallet_future
+            jupiter_usdc_future
         );
         let jupiter_contracts = match jup {
             Ok(position) => position.contracts_micro,
@@ -1317,9 +1518,74 @@ pub async fn capture_entry_balances(
             polymarket_contracts: poly?,
             polymarket_collateral_micro_usd: collateral?,
             jupiter_contracts,
-            jupiter_usdc_micro: jupiter_wallet?.usdc_micro,
+            jupiter_usdc_micro: jupiter_usdc?,
         })
     }
+}
+
+async fn capture_entry_balances_with_retry(
+    polymarket: &PolymarketExecutor,
+    jupiter: &JupiterHybridExecutor,
+    polymarket_token_id: &str,
+    jupiter_outcome_mint: Option<&str>,
+    jupiter_position_pubkey: &str,
+    before_submission: bool,
+    attempts: u32,
+) -> Result<EntryBalanceSnapshot, LiveError> {
+    let attempts = attempts.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match capture_entry_balances(
+            polymarket,
+            jupiter,
+            polymarket_token_id,
+            jupiter_outcome_mint,
+            jupiter_position_pubkey,
+            before_submission,
+        )
+        .await
+        {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_millis(150_u64 << attempt.min(2))).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        LiveError::Recovery("balance capture exhausted without an error".to_owned())
+    }))
+}
+
+async fn capture_polymarket_state_with_retry(
+    polymarket: &PolymarketExecutor,
+    token_id: &str,
+    attempts: u32,
+) -> Result<(Micro, Micro), LiveError> {
+    let attempts = attempts.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        let (contracts, collateral) = tokio::join!(
+            polymarket.refresh_conditional_balance_micro(token_id),
+            polymarket.collateral_balance_micro_usd(),
+        );
+        match (contracts, collateral) {
+            (Ok(contracts), Ok(collateral)) => return Ok((contracts, collateral)),
+            (contracts, collateral) => {
+                last_error = Some(LiveError::Recovery(format!(
+                    "Polymarket recapture failed: contracts={} collateral={}",
+                    result_value(contracts),
+                    result_value(collateral),
+                )));
+            }
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_millis(150_u64 << attempt.min(2))).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        LiveError::Recovery("Polymarket recapture exhausted without an error".to_owned())
+    }))
 }
 
 fn validate_entry_request(request: &LiveEntryRequest) -> Result<(), LiveError> {
@@ -1336,7 +1602,74 @@ fn validate_entry_request(request: &LiveEntryRequest) -> Result<(), LiveError> {
             "repair slippage cannot exceed 5000 bps".to_owned(),
         ));
     }
+    if request.minimum_post_fill_profit_micro_usd < 0
+        || request.maximum_post_fill_mismatch_micro < 0
+    {
+        return Err(LiveError::InvalidRequest(
+            "post-fill profit and mismatch bounds cannot be negative".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn post_fill_is_acceptable(
+    plan: &PostFillRiskPlan,
+    minimum_profit_micro_usd: Micro,
+    maximum_mismatch_micro: Micro,
+) -> bool {
+    plan.action == PostFillAction::HoldOrExitNormally
+        && plan.venue_size_mismatch_micro <= maximum_mismatch_micro
+        && plan.intended_single_winner_floor_micro_usd >= minimum_profit_micro_usd
+}
+
+fn portfolio_entry_blocker(state: &LiveTraderState) -> Option<String> {
+    state.positions.iter().find_map(|position| {
+        if matches!(
+            position.phase,
+            LivePositionPhase::JupiterPrepared
+                | LivePositionPhase::JupiterPending
+                | LivePositionPhase::PolymarketHedging
+                | LivePositionPhase::LegsSubmitting
+                | LivePositionPhase::RecoveryPlanning
+                | LivePositionPhase::ExposureError
+        ) {
+            return Some(format!(
+                "position {} is in {:?}",
+                position.id, position.phase
+            ));
+        }
+        if let Some(error) = position.settlement_error.as_deref() {
+            return Some(format!(
+                "position {} has unresolved settlement error: {error}",
+                position.id
+            ));
+        }
+        let Some(plan) = position.post_fill_risk_plan.as_ref() else {
+            return Some(format!(
+                "position {} has no verified post-fill risk plan",
+                position.id
+            ));
+        };
+        if position.polymarket_contracts_micro <= 0 || position.jupiter_contracts_micro <= 0 {
+            return Some(format!(
+                "position {} has one-sided exposure Poly={} Jup={}",
+                position.id, position.polymarket_contracts_micro, position.jupiter_contracts_micro,
+            ));
+        }
+        if plan.action != PostFillAction::HoldOrExitNormally
+            || plan.intended_single_winner_floor_micro_usd < 0
+            || plan.venue_size_mismatch_micro > 10_000
+        {
+            return Some(format!(
+                "position {} is not a safe matched arb: action={:?} floor={} mismatch={}",
+                position.id,
+                plan.action,
+                plan.intended_single_winner_floor_micro_usd,
+                plan.venue_size_mismatch_micro,
+            ));
+        }
+        None
+    })
 }
 
 fn submission_is_ambiguous(
@@ -1362,6 +1695,41 @@ fn result_label<T, E: fmt::Display>(result: &Result<T, E>) -> String {
     result
         .as_ref()
         .map_or_else(|error| format!("error({error})"), |_| "success".to_owned())
+}
+
+fn polymarket_result_label(result: &Result<PolymarketFill, PolymarketError>) -> String {
+    result.as_ref().map_or_else(
+        |error| format!("error({error})"),
+        |fill| {
+            format!(
+                "success(contracts={} gross={} submittedAtMs={} tx={})",
+                fill.filled_contracts_micro,
+                fill.gross_micro_usd,
+                fill.submitted_at_ms,
+                if fill.transaction_hashes.is_empty() {
+                    "none".to_owned()
+                } else {
+                    fill.transaction_hashes.join(",")
+                }
+            )
+        },
+    )
+}
+
+fn jupiter_result_label(result: &Result<SubmittedJupiterOrder, JupiterError>) -> String {
+    result.as_ref().map_or_else(
+        |error| format!("error({error})"),
+        |fill| {
+            format!(
+                "success(signature={} status={} contracts={} cost={} submittedAtMs={})",
+                fill.transaction_signature,
+                fill.status.status,
+                fill.status.filled_contracts_micro,
+                fill.status.size_micro_usd,
+                fill.submission_started_at_ms,
+            )
+        },
+    )
 }
 
 fn result_value<E: fmt::Display>(result: Result<Micro, E>) -> String {
@@ -1411,6 +1779,31 @@ fn multiply_price_quantity(price: Micro, quantity: Micro) -> Result<Micro, LiveE
         .checked_mul(quantity)
         .and_then(|value| value.checked_div(ONE_USD_MICRO))
         .ok_or_else(|| LiveError::Recovery("price/quantity calculation overflow".to_owned()))
+}
+
+fn polymarket_taker_fee_total(price: Micro, quantity: Micro) -> Result<Micro, LiveError> {
+    polymarket_crypto_taker_fee_per_contract_micro_usd(price)
+        .map_err(|error| {
+            LiveError::Recovery(format!("Polymarket fee calculation failed: {error}"))
+        })?
+        .checked_mul(quantity)
+        .and_then(|value| value.checked_add(ONE_USD_MICRO / 2))
+        .and_then(|value| value.checked_div(ONE_USD_MICRO))
+        .ok_or_else(|| LiveError::Recovery("Polymarket fee calculation overflow".to_owned()))
+}
+
+fn modeled_sell_repair_loss(
+    polymarket_cost: Micro,
+    jupiter_cost: Micro,
+    net_proceeds: Micro,
+    remaining_matched_payout: Micro,
+) -> Result<Micro, LiveError> {
+    let total_cost = polymarket_cost
+        .checked_add(jupiter_cost)
+        .ok_or_else(|| LiveError::Recovery("repair SELL modeled-loss overflow".to_owned()))?;
+    Ok(total_cost
+        .saturating_sub(net_proceeds)
+        .saturating_sub(remaining_matched_payout))
 }
 
 fn apply_buy_slippage(price: Micro, bps: u32) -> Result<Micro, LiveError> {
@@ -1486,6 +1879,8 @@ mod tests {
             jupiter_settlement_payout_micro_usd: 0,
             polymarket_entry_transaction_hashes: Vec::new(),
             jupiter_entry_transaction_signature: None,
+            polymarket_entry_submission_result: None,
+            jupiter_entry_submission_result: None,
             polymarket_settlement_transaction_signature: Some("entry-hash".to_owned()),
             polymarket_redemption_collateral_before_micro_usd: None,
             jupiter_settlement_transaction_signature: None,
@@ -1520,6 +1915,42 @@ mod tests {
         let plan = build_risk_plan(12_340_000, 12_340_000, 11_000_000);
         assert_eq!(plan.action, PostFillAction::HoldOrExitNormally);
         assert_eq!(plan.venue_size_mismatch_micro, 0);
+    }
+
+    #[test]
+    fn post_fill_gate_requires_matched_size_and_minimum_profit() {
+        let safe = build_risk_plan(10_000_000, 10_005_000, 9_800_000);
+        assert!(post_fill_is_acceptable(&safe, 100_000, 10_000));
+
+        let negative = build_risk_plan(10_000_000, 10_000_000, 10_100_000);
+        assert!(!post_fill_is_acceptable(&negative, 0, 10_000));
+
+        let mismatched = build_risk_plan(10_000_000, 10_020_000, 9_000_000);
+        assert!(!post_fill_is_acceptable(&mismatched, 100_000, 10_000));
+    }
+
+    #[test]
+    fn portfolio_quarantines_only_unhealthy_positions() {
+        let mut state = LiveTraderState::default();
+        let mut position = test_position();
+        position.phase = LivePositionPhase::Open;
+        position.polymarket_contracts_micro = 10_000_000;
+        position.jupiter_contracts_micro = 10_000_000;
+        position.polymarket_entry_cost_micro_usd = 5_000_000;
+        position.jupiter_entry_cost_micro_usd = 4_800_000;
+        position.remaining_entry_cost_micro_usd = 9_800_000;
+        position.post_fill_risk_plan = Some(build_risk_plan(10_000_000, 10_000_000, 9_800_000));
+        state.positions.push(position.clone());
+        assert_eq!(portfolio_entry_blocker(&state), None);
+
+        position.jupiter_contracts_micro = 0;
+        position.post_fill_risk_plan = Some(build_risk_plan(10_000_000, 0, 5_000_000));
+        state.positions[0] = position;
+        assert!(
+            portfolio_entry_blocker(&state)
+                .expect("one-sided exposure blocks entry")
+                .contains("one-sided")
+        );
     }
 
     #[test]
@@ -1590,5 +2021,80 @@ mod tests {
     fn known_exposure_cannot_be_treated_as_zero_after_expiry() {
         let position = test_position();
         assert!(has_recorded_exposure(&position));
+    }
+
+    #[test]
+    fn known_exposure_never_acquires_a_zero_exposure_proof() {
+        let unique = format!(
+            "jupol-live-zero-proof-{}-{}",
+            std::process::id(),
+            unix_timestamp_ms()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let path = directory.join("state.json");
+        let mut coordinator = LiveCoordinator::load(&path).expect("coordinator");
+        coordinator.state.positions.push(test_position());
+        coordinator
+            .mark_zero_observation_pending("live-test", "zero")
+            .expect("persist zero observation");
+        assert_eq!(
+            coordinator.state.positions[0].entry_zero_exposure_proof,
+            None
+        );
+        drop(coordinator);
+        fs::remove_dir_all(directory).expect("remove test-owned directory");
+    }
+
+    #[test]
+    fn fully_settled_positions_move_to_the_audit_ledger() {
+        let unique = format!(
+            "jupol-live-settled-ledger-{}-{}",
+            std::process::id(),
+            unix_timestamp_ms()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let path = directory.join("state.json");
+        let mut coordinator = LiveCoordinator::load(&path).expect("coordinator");
+        let mut position = test_position();
+        position.phase = LivePositionPhase::AwaitingResolution;
+        position.polymarket_settled = true;
+        position.jupiter_settled = true;
+        position.jupiter_rent_reclaimed = true;
+        position.polymarket_settlement_payout_micro_usd = 5_000_000;
+        position.jupiter_settlement_payout_micro_usd = 0;
+        position.remaining_entry_cost_micro_usd = 4_000_000;
+        coordinator.state.positions.push(position);
+
+        assert_eq!(
+            coordinator
+                .finalize_fully_settled_positions()
+                .expect("finalize"),
+            1
+        );
+        assert!(coordinator.state.positions.is_empty());
+        assert_eq!(coordinator.state.settled_positions.len(), 1);
+        assert_eq!(coordinator.state.realized_profit_micro_usd, 1_000_000);
+        assert_eq!(
+            coordinator.state.settled_positions[0].realized_profit_micro_usd,
+            1_000_000
+        );
+        drop(coordinator);
+        fs::remove_dir_all(directory).expect("remove test-owned directory");
+    }
+
+    #[test]
+    fn poly_only_unwind_loss_uses_entry_cost_minus_net_sale_proceeds() {
+        let quantity = 5_000_000;
+        let entry_cost = 1_050_000;
+        let limit = 190_000;
+        let gross = multiply_price_quantity(limit, quantity).unwrap();
+        let fee = polymarket_taker_fee_total(limit, quantity).unwrap();
+        let modeled_loss =
+            modeled_sell_repair_loss(entry_cost, 0, gross.saturating_sub(fee), 0).unwrap();
+        assert!(modeled_loss <= 200_000);
+        assert_ne!(
+            modeled_loss,
+            multiply_price_quantity(ONE_USD_MICRO - limit, quantity).unwrap()
+        );
     }
 }

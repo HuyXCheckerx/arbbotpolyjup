@@ -65,10 +65,11 @@ wallet/API initialization and acts as the local single-instance lock.
 
 ## Jupiter Developer plan
 
-Prediction discovery/builds and Swap V2 orders share one scheduler at 100 ms
-spacing, matching a 10 RPS Developer plan. Signed `/execute` handoff has critical
-priority. The public Degen WebSocket and Polymarket WebSocket consume no Jupiter
-API budget.
+Prediction discovery/builds and Swap V2 `/order` requests share one scheduler at
+100 ms spacing, matching a 10 RPS Developer main bucket. Prediction handoff has
+critical priority; authenticated Swap V2 `/execute` uses Jupiter's separate
+paid-plan execution bucket. The public Degen WebSocket and Polymarket WebSocket
+consume no Jupiter API budget.
 
 A plan/key existing is not enough by itself: the key must have both Prediction
 and Swap product access. A Prediction `401 Unauthorized` is terminal and the CLI
@@ -77,8 +78,11 @@ exits with a portal-permission message instead of retrying forever.
 ## Execution boundary
 
 Each entry persists an intent, signs both exact orders, then releases the
-Polymarket FOK and Jupiter transaction concurrently. It re-reads conditional
-tokens, USDC/collateral balances and Solana transaction deltas before booking a
-fill. Unknown quantities or costs remain recovery work; they are never reported
-as profit. This reduces process overhead, but cross-chain execution and the two
-venues' different resolution observations can never be atomic.
+Polymarket FOK and Jupiter transaction concurrently. Swap V2 pairs against its
+guaranteed output threshold and reconciles confirmed execute amounts; Prediction
+uses status plus owner history after keeper orders close. Unsafe or unresolved
+positions quarantine new entries while settlement/recovery continue. Unknown
+quantities or costs remain recovery work; they are never reported as profit.
+Finalized records move to a durable settled audit ledger. This reduces process
+overhead, but cross-chain execution and the two venues' different resolution
+observations can never be atomic.

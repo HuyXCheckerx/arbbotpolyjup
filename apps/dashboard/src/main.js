@@ -166,6 +166,9 @@ function renderPositions(positions = [], awaitingCount = 0) {
     const errorLine = pos.lastError
       ? `<div class="pos-error-line">ERROR: ${escapeHtml(pos.lastError)}</div>`
       : "";
+    const entrySubmissionLine = pos.polymarketEntrySubmissionResult || pos.jupiterEntrySubmissionResult
+      ? `<div class="pos-risk-line">ENTRY SUBMISSIONS: Poly=${escapeHtml(pos.polymarketEntrySubmissionResult || "unknown")} · Jup=${escapeHtml(pos.jupiterEntrySubmissionResult || "unknown")}</div>`
+      : "";
     const settlementErrorLine = pos.settlementError
       ? `<div class="pos-error-line">SETTLEMENT RETRY: ${escapeHtml(pos.settlementError)}</div>`
       : "";
@@ -243,6 +246,7 @@ function renderPositions(positions = [], awaitingCount = 0) {
         </div>
 
         ${errorLine}
+        ${entrySubmissionLine}
         <div class="${postFillRiskClass}">FOUR-STATE RISK: ${postFillReason}</div>
         ${settlementErrorLine}
       </div>
@@ -367,6 +371,9 @@ async function fetchStatus() {
     if (data.strategy?.halted) {
       el.haltTag.style.display = "inline-block";
       el.haltTag.textContent = `HALTED: ${data.strategy.haltReason || "EXPOSURE ALERT"}`;
+    } else if (data.strategy?.entryQuarantineReason) {
+      el.haltTag.style.display = "inline-block";
+      el.haltTag.textContent = `NEW ENTRIES PAUSED: ${data.strategy.entryQuarantineReason}`;
     } else {
       el.haltTag.style.display = "none";
     }

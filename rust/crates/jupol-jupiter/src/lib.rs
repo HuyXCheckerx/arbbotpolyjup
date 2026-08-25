@@ -459,6 +459,8 @@ pub struct JupiterSwapClient {
     scheduler: Option<JupiterRequestScheduler>,
     priority: RequestPriority,
     last_local_request: Arc<Mutex<Option<tokio::time::Instant>>>,
+    last_execute_request: Arc<Mutex<Option<tokio::time::Instant>>>,
+    authenticated: bool,
 }
 
 impl JupiterSwapClient {
@@ -483,6 +485,8 @@ impl JupiterSwapClient {
             scheduler: options.request_scheduler,
             priority: options.request_priority,
             last_local_request: Arc::new(Mutex::new(None)),
+            last_execute_request: Arc::new(Mutex::new(None)),
+            authenticated: options.api_key.is_some(),
         })
     }
 
@@ -524,11 +528,10 @@ impl JupiterSwapClient {
         signed_transaction: &str,
         request_id: &str,
     ) -> Result<SwapExecution, JupiterError> {
-        // Execute receives critical priority but still consumes the same API
-        // key bucket. Repeating the same signed transaction + requestId is
-        // idempotent and resolves a dropped HTTP response without creating a
-        // second order.
-        self.reserve().await?;
+        // Swap V2 /execute has a dedicated bucket (100 RPS for paid plans),
+        // separate from the shared /order and discovery bucket. Do not make a
+        // fresh executable order wait behind quote traffic.
+        self.reserve_execute().await;
         let payload: Value = self
             .http
             .post_json(
@@ -554,16 +557,30 @@ impl JupiterSwapClient {
                         -1
                     }
                 }),
-            total_input_amount: required_unsigned_micro(
-                value.get("totalInputAmount"),
-                "totalInputAmount",
-            )?,
-            total_output_amount: required_unsigned_micro(
-                value.get("totalOutputAmount"),
-                "totalOutputAmount",
-            )?,
+            // Failed executions are allowed to omit amount fields. Preserve
+            // their code/error instead of replacing the useful failure with a
+            // secondary "missing amount" parser error.
+            total_input_amount: optional_unsigned_micro(value.get("totalInputAmount")).unwrap_or(0),
+            total_output_amount: optional_unsigned_micro(value.get("totalOutputAmount"))
+                .unwrap_or(0),
             error: optional_text(value, "error"),
         })
+    }
+
+    async fn reserve_execute(&self) {
+        let minimum_interval = if self.authenticated {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(50)
+        };
+        let mut last = self.last_execute_request.lock().await;
+        if let Some(previous) = *last {
+            let wait = minimum_interval.saturating_sub(previous.elapsed());
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
+        *last = Some(tokio::time::Instant::now());
     }
 
     async fn reserve(&self) -> Result<(), JupiterError> {
@@ -838,29 +855,42 @@ impl JupiterClient {
     ) -> Result<PredictionOrderStatus, JupiterError> {
         let payload = self.get(&format!("orders/{order_pubkey}")).await?;
         let value = object(&payload, "order")?;
-        let status = text(value, "status").to_ascii_lowercase();
-        if !matches!(status.as_str(), "pending" | "filled" | "failed") {
-            return Err(invalid(format!("unsupported order status {status}")));
-        }
-        Ok(PredictionOrderStatus {
-            order_pubkey: optional_text(value, "pubkey").or_else(|| Some(order_pubkey.to_owned())),
-            position_pubkey: text(value, "position").to_owned(),
-            market_id: text(value, "marketId").to_owned(),
-            status,
-            is_buy: boolean(value, "isBuy"),
-            is_yes: boolean(value, "isYes"),
-            contracts_micro: required_micro(value.get("contracts"), "contracts")?,
-            filled_contracts_micro: required_micro(
-                value.get("filledContracts"),
-                "filledContracts",
-            )?,
-            average_fill_price_micro_usd: required_micro(
-                value.get("avgFillPriceUsd"),
-                "avgFillPriceUsd",
-            )?,
-            size_micro_usd: required_micro(value.get("sizeUsd"), "sizeUsd")?,
-            settled: boolean(value, "settled"),
-        })
+        parse_prediction_order(value, order_pubkey)
+    }
+
+    pub async fn get_prediction_order_status(
+        &self,
+        order_pubkey: &str,
+    ) -> Result<String, JupiterError> {
+        let payload = self.get(&format!("orders/status/{order_pubkey}")).await?;
+        let value = object(&payload, "order status")?;
+        normalize_prediction_order_status(text(value, "status"))
+    }
+
+    pub async fn get_prediction_order_for_owner(
+        &self,
+        owner_pubkey: &str,
+        order_pubkey: &str,
+    ) -> Result<Option<PredictionOrderStatus>, JupiterError> {
+        let mut url = self.url("orders")?;
+        url.query_pairs_mut()
+            .append_pair("ownerPubkey", owner_pubkey)
+            .append_pair("start", "0")
+            .append_pair("end", "100");
+        self.reserve().await?;
+        let payload: Value = self.http.get_json(url.as_str()).await?;
+        let value = object(&payload, "orders response")?;
+        value
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|order| order.get("pubkey").and_then(Value::as_str) == Some(order_pubkey))
+            .map(|order| {
+                object(order, "order history")
+                    .and_then(|order| parse_prediction_order(order, order_pubkey))
+            })
+            .transpose()
     }
 
     pub async fn get_prediction_position(
@@ -1049,6 +1079,13 @@ impl JupiterPredictionExecutor {
             .await?)
     }
 
+    pub async fn usdc_balance(&self) -> Result<Micro, JupiterError> {
+        Ok(self
+            .rpc
+            .get_token_balance(&self.keypair.pubkey(), USDC_MINT)
+            .await?)
+    }
+
     pub async fn token_balance(&self, mint: &str) -> Result<Micro, JupiterError> {
         Ok(self
             .rpc
@@ -1067,7 +1104,23 @@ impl JupiterPredictionExecutor {
         &self,
         order_pubkey: &str,
     ) -> Result<PredictionOrderStatus, JupiterError> {
-        self.client.get_prediction_order(order_pubkey).await
+        let status = self
+            .client
+            .get_prediction_order_status(order_pubkey)
+            .await?;
+        Ok(PredictionOrderStatus {
+            order_pubkey: Some(order_pubkey.to_owned()),
+            position_pubkey: String::new(),
+            market_id: String::new(),
+            status,
+            is_buy: false,
+            is_yes: false,
+            contracts_micro: 0,
+            filled_contracts_micro: 0,
+            average_fill_price_micro_usd: 0,
+            size_micro_usd: 0,
+            settled: false,
+        })
     }
 
     pub async fn did_selected_market_win(
@@ -1206,7 +1259,7 @@ impl JupiterPredictionExecutor {
         }
     }
 
-    pub async fn prepare_submission(
+    pub fn prepare_submission(
         &self,
         build: PredictionOrderBuild,
     ) -> Result<PreparedJupiterSubmission, JupiterError> {
@@ -1218,9 +1271,11 @@ impl JupiterPredictionExecutor {
             )));
         }
         let signed_transaction = sign_versioned_transaction(&build.transaction, &self.keypair)?;
-        if build.execution_model.as_deref() != Some("atomic_swap") {
-            self.rpc.simulate_transaction(&signed_transaction).await?;
-        }
+        // Jupiter's /execute endpoint submits the signed transaction and
+        // returns an authoritative execution result. A separate local RPC
+        // simulation adds latency and can reject a valid handoff solely because
+        // the configured RPC is rate-limited. Atomic fills retain their
+        // post-execute on-chain delta audit below.
         Ok(PreparedJupiterSubmission {
             build,
             signed_transaction,
@@ -1261,13 +1316,15 @@ impl JupiterPredictionExecutor {
                 execution.error.as_deref().unwrap_or("missing signature")
             )));
         }
-        let Some(signature) = execution.signature else {
+        let Some(signature) = execution.signature.clone() else {
             return Err(JupiterError::ExecutionFailed(
                 "successful Prediction execution omitted its signature".to_owned(),
             ));
         };
-        self.rpc.confirm_transaction(&signature, timeout).await?;
         let status = if prepared.build.execution_model.as_deref() == Some("atomic_swap") {
+            // Atomic Prediction builds do not return authoritative token
+            // amounts from /execute, so retain the on-chain delta audit.
+            self.rpc.confirm_transaction(&signature, timeout).await?;
             self.reconcile_atomic(&prepared.build, &signature, timeout)
                 .await?
         } else {
@@ -1277,7 +1334,12 @@ impl JupiterPredictionExecutor {
                 .order_pubkey
                 .as_deref()
                 .ok_or_else(|| invalid("keeper order has no order pubkey"))?;
-            self.wait_for_order(order_pubkey, timeout).await?
+            // Prediction /execute already performs landing and confirmation.
+            // Poll the documented status/history APIs instead of spending a
+            // second RPC confirmation budget and then querying /orders/{id},
+            // which returns 400 after a filled order account is closed.
+            self.wait_for_order(&prepared.build, order_pubkey, timeout)
+                .await?
         };
         if status.status == "pending" {
             return Err(JupiterError::AmbiguousExecution(format!(
@@ -1294,14 +1356,43 @@ impl JupiterPredictionExecutor {
 
     pub async fn wait_for_order(
         &self,
+        build: &PredictionOrderBuild,
         order_pubkey: &str,
         timeout: Duration,
     ) -> Result<PredictionOrderStatus, JupiterError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let status = self.client.get_prediction_order(order_pubkey).await?;
-            if status.status != "pending" || tokio::time::Instant::now() >= deadline {
-                return Ok(status);
+            match self.client.get_prediction_order_status(order_pubkey).await {
+                Ok(status) if status == "pending" => {}
+                Ok(_) => {
+                    if let Some(status) = self
+                        .client
+                        .get_prediction_order_for_owner(&self.owner_pubkey(), order_pubkey)
+                        .await?
+                    {
+                        return Ok(status);
+                    }
+                }
+                Err(error) if is_http_not_found(&error) => {
+                    // The documented API can return "no order history found"
+                    // for a few slots immediately after submission.
+                }
+                Err(error) => return Err(error),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(PredictionOrderStatus {
+                    order_pubkey: Some(order_pubkey.to_owned()),
+                    position_pubkey: build.order.position_pubkey.clone(),
+                    market_id: build.order.market_id.clone(),
+                    status: "pending".to_owned(),
+                    is_buy: build.order.is_buy,
+                    is_yes: build.order.is_yes,
+                    contracts_micro: build.order.contracts_micro,
+                    filled_contracts_micro: 0,
+                    average_fill_price_micro_usd: 0,
+                    size_micro_usd: 0,
+                    settled: false,
+                });
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
@@ -1549,7 +1640,7 @@ impl JupiterForecastSwapExecutor {
     pub async fn submit_prepared_and_wait(
         &self,
         prepared: PreparedJupiterSubmission,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<SubmittedJupiterOrder, JupiterError> {
         let submission_started_at_ms = unix_timestamp_ms();
         let request_id = prepared
@@ -1558,7 +1649,7 @@ impl JupiterForecastSwapExecutor {
             .get("requestId")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("Forecast Swap build is missing requestId"))?;
-        let execution = match self
+        let mut execution = match self
             .client
             .execute(&prepared.signed_transaction, request_id)
             .await
@@ -1583,37 +1674,59 @@ impl JupiterForecastSwapExecutor {
                     })?
             }
         };
+        // A failed-to-land/unknown response is definitive about this attempt
+        // but the exact same signed transaction and requestId remain
+        // idempotent. Retry them in the dedicated execute bucket; never rebuild
+        // here, because a new request could race the Polymarket leg.
+        for _ in 0..2 {
+            if execution.status == ExecutionStatus::Success
+                || !matches!(execution.code, -1_000 | -1_001 | -2_000 | -2_001)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            execution = self
+                .client
+                .execute(&prepared.signed_transaction, request_id)
+                .await
+                .map_err(|error| {
+                    JupiterError::AmbiguousExecution(format!(
+                        "Swap V2 retry returned no authoritative state for request {request_id}: {error}"
+                    ))
+                })?;
+        }
         if execution.status != ExecutionStatus::Success
             || execution.code != 0
             || execution.signature.is_none()
         {
+            let router = prepared
+                .build
+                .execution_context
+                .get("router")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let mode = prepared
+                .build
+                .execution_context
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             return Err(JupiterError::ExecutionFailed(format!(
-                "Swap V2 request {request_id} code={} error={}",
+                "Swap V2 request {request_id} router={router} mode={mode} code={} error={}",
                 execution.code,
                 execution.error.as_deref().unwrap_or("missing signature")
             )));
         }
-        let Some(signature) = execution.signature else {
+        let Some(signature) = execution.signature.clone() else {
             return Err(JupiterError::ExecutionFailed(
                 "successful Swap V2 execution omitted its signature".to_owned(),
             ));
         };
-        self.rpc.confirm_transaction(&signature, timeout).await?;
-        let outcome_mint = prepared
-            .build
-            .outcome_mint
-            .as_deref()
-            .ok_or_else(|| invalid("Forecast Swap build is missing outcomeMint"))?;
-        let deltas = self
-            .rpc
-            .wait_for_token_deltas(
-                &signature,
-                &self.keypair.pubkey(),
-                &[USDC_MINT, outcome_mint],
-                timeout,
-            )
-            .await?;
-        let status = reconcile_token_deltas(&prepared.build, &deltas)?;
+        // /execute already performs landing, confirmation polling, and returns
+        // wallet-reflected totals. Using those authoritative totals avoids two
+        // latency-sensitive RPC round trips and the Helius 429 failures seen in
+        // the entry logs.
+        let status = reconcile_swap_execution(&prepared.build, &execution)?;
         Ok(SubmittedJupiterOrder {
             transaction_signature: signature,
             submission_started_at_ms,
@@ -1654,6 +1767,10 @@ impl JupiterHybridExecutor {
 
     pub async fn wallet_balances(&self) -> Result<jupol_solana::WalletBalances, JupiterError> {
         self.prediction.wallet_balances().await
+    }
+
+    pub async fn usdc_balance(&self) -> Result<Micro, JupiterError> {
+        self.prediction.usdc_balance().await
     }
 
     pub async fn prepare_buy(
@@ -1750,14 +1867,14 @@ impl JupiterHybridExecutor {
         }
     }
 
-    pub async fn prepare_submission(
+    pub fn prepare_submission(
         &self,
         build: PredictionOrderBuild,
     ) -> Result<PreparedJupiterSubmission, JupiterError> {
         if is_forecast_swap_build(&build) {
             self.forecast.prepare_submission(build)
         } else {
-            self.prediction.prepare_submission(build).await
+            self.prediction.prepare_submission(build)
         }
     }
 
@@ -1916,11 +2033,23 @@ fn forecast_swap_build(
     is_buy: bool,
     owner_pubkey: &str,
 ) -> Result<PredictionOrderBuild, JupiterError> {
-    let quantity_micro = if is_buy {
+    let quoted_quantity_micro = if is_buy {
         order.out_amount
     } else {
         order.in_amount
     };
+    let guaranteed_quantity_micro = if is_buy {
+        order.other_amount_threshold.unwrap_or(order.out_amount)
+    } else {
+        order.in_amount
+    };
+    if guaranteed_quantity_micro <= 0
+        || (is_buy && guaranteed_quantity_micro > quoted_quantity_micro)
+    {
+        return Err(invalid(format!(
+            "Swap V2 returned invalid guaranteed output {guaranteed_quantity_micro} for quote {quoted_quantity_micro}"
+        )));
+    }
     let gross_micro_usd = if is_buy {
         order.in_amount
     } else {
@@ -1931,13 +2060,13 @@ fn forecast_swap_build(
             gross_micro_usd
                 .checked_mul(ONE_USD_MICRO)
                 .ok_or_else(|| invalid("Swap price overflow"))?,
-            quantity_micro,
+            guaranteed_quantity_micro,
         )?
     } else {
         gross_micro_usd
             .checked_mul(ONE_USD_MICRO)
             .ok_or_else(|| invalid("Swap price overflow"))?
-            / quantity_micro
+            / guaranteed_quantity_micro
     };
     if !(1..ONE_USD_MICRO).contains(&average_price_micro_usd) {
         return Err(invalid(format!(
@@ -1945,22 +2074,7 @@ fn forecast_swap_build(
         )));
     }
     let position_pubkey = forecast_swap_position_id(market_id, outcome_mint);
-    let execution_context = Map::from_iter([
-        (
-            "requestId".to_owned(),
-            Value::String(order.request_id.clone()),
-        ),
-        ("router".to_owned(), Value::String(order.router.clone())),
-        ("mode".to_owned(), Value::String(order.mode.clone())),
-        (
-            "inputMint".to_owned(),
-            Value::String(order.input_mint.clone()),
-        ),
-        (
-            "outputMint".to_owned(),
-            Value::String(order.output_mint.clone()),
-        ),
-    ]);
+    let execution_context = forecast_swap_execution_context(&order);
     Ok(PredictionOrderBuild {
         outcome_mint: Some(outcome_mint.to_owned()),
         transaction: order.transaction,
@@ -1979,21 +2093,59 @@ fn forecast_swap_build(
             market_id: market_id.to_owned(),
             is_buy,
             is_yes: true,
-            contracts_micro: quantity_micro,
-            new_contracts_micro: if is_buy { quantity_micro } else { 0 },
+            // Preserve the optimistic quote for diagnostics, but expose only
+            // the guaranteed minimum as executable new size to strategy code.
+            contracts_micro: quoted_quantity_micro,
+            new_contracts_micro: if is_buy { guaranteed_quantity_micro } else { 0 },
             max_buy_price_micro_usd: is_buy.then_some(average_price_micro_usd),
             min_sell_price_micro_usd: (!is_buy).then_some(average_price_micro_usd),
             order_cost_micro_usd: if is_buy { gross_micro_usd } else { 0 },
             new_average_price_micro_usd: is_buy.then_some(average_price_micro_usd),
             new_size_micro_usd: if is_buy { gross_micro_usd } else { 0 },
             payout_micro_usd: if is_buy {
-                quantity_micro
+                guaranteed_quantity_micro
             } else {
                 gross_micro_usd
             },
             estimated_total_fee_micro_usd: 0,
         },
     })
+}
+
+fn forecast_swap_execution_context(order: &SwapOrder) -> Map<String, Value> {
+    Map::from_iter([
+        (
+            "requestId".to_owned(),
+            Value::String(order.request_id.clone()),
+        ),
+        ("router".to_owned(), Value::String(order.router.clone())),
+        ("mode".to_owned(), Value::String(order.mode.clone())),
+        (
+            "inputMint".to_owned(),
+            Value::String(order.input_mint.clone()),
+        ),
+        (
+            "outputMint".to_owned(),
+            Value::String(order.output_mint.clone()),
+        ),
+        (
+            "quotedOutAmount".to_owned(),
+            Value::String(order.out_amount.to_string()),
+        ),
+        (
+            "otherAmountThreshold".to_owned(),
+            Value::String(
+                order
+                    .other_amount_threshold
+                    .unwrap_or(order.out_amount)
+                    .to_string(),
+            ),
+        ),
+        (
+            "slippageBps".to_owned(),
+            order.slippage_bps.map_or(Value::Null, Value::from),
+        ),
+    ])
 }
 
 #[must_use]
@@ -2128,6 +2280,49 @@ fn reconcile_token_deltas(
     })
 }
 
+fn reconcile_swap_execution(
+    build: &PredictionOrderBuild,
+    execution: &SwapExecution,
+) -> Result<PredictionOrderStatus, JupiterError> {
+    let (filled_contracts_micro, gross_micro_usd) = if build.order.is_buy {
+        (execution.total_output_amount, execution.total_input_amount)
+    } else {
+        (execution.total_input_amount, execution.total_output_amount)
+    };
+    if filled_contracts_micro <= 0 || gross_micro_usd <= 0 {
+        return Err(JupiterError::AmbiguousExecution(format!(
+            "successful Swap V2 response has invalid wallet totals: contracts={filled_contracts_micro}, USDC={gross_micro_usd}"
+        )));
+    }
+    if build.order.is_buy && filled_contracts_micro < build.order.new_contracts_micro {
+        return Err(JupiterError::AmbiguousExecution(format!(
+            "Swap V2 output {filled_contracts_micro} is below its guaranteed threshold {}",
+            build.order.new_contracts_micro
+        )));
+    }
+    let numerator = gross_micro_usd
+        .checked_mul(ONE_USD_MICRO)
+        .ok_or_else(|| invalid("Swap V2 fill price overflow"))?;
+    let average_fill_price_micro_usd = if build.order.is_buy {
+        ceil_divide(numerator, filled_contracts_micro)?
+    } else {
+        numerator / filled_contracts_micro
+    };
+    Ok(PredictionOrderStatus {
+        order_pubkey: None,
+        position_pubkey: build.order.position_pubkey.clone(),
+        market_id: build.order.market_id.clone(),
+        status: "filled".to_owned(),
+        is_buy: build.order.is_buy,
+        is_yes: build.order.is_yes,
+        contracts_micro: filled_contracts_micro,
+        filled_contracts_micro,
+        average_fill_price_micro_usd,
+        size_micro_usd: gross_micro_usd,
+        settled: true,
+    })
+}
+
 fn parse_execution_status(value: &str) -> Result<ExecutionStatus, JupiterError> {
     match value {
         "Success" => Ok(ExecutionStatus::Success),
@@ -2205,6 +2400,41 @@ fn parse_claim_build(payload: &Value) -> Result<PredictionClaimBuild, JupiterErr
             "claim.position.payoutAmountUsd",
         )?,
     })
+}
+
+fn parse_prediction_order(
+    value: &Map<String, Value>,
+    fallback_order_pubkey: &str,
+) -> Result<PredictionOrderStatus, JupiterError> {
+    let status = normalize_prediction_order_status(text(value, "status"))?;
+    Ok(PredictionOrderStatus {
+        order_pubkey: optional_text(value, "pubkey")
+            .or_else(|| Some(fallback_order_pubkey.to_owned())),
+        position_pubkey: text(value, "position").to_owned(),
+        market_id: text(value, "marketId").to_owned(),
+        status,
+        is_buy: boolean(value, "isBuy"),
+        is_yes: boolean(value, "isYes"),
+        contracts_micro: required_micro(value.get("contracts"), "contracts")?,
+        filled_contracts_micro: required_micro(value.get("filledContracts"), "filledContracts")?,
+        average_fill_price_micro_usd: required_micro(
+            value.get("avgFillPriceUsd"),
+            "avgFillPriceUsd",
+        )?,
+        size_micro_usd: required_micro(value.get("sizeUsd"), "sizeUsd")?,
+        settled: boolean(value, "settled"),
+    })
+}
+
+fn normalize_prediction_order_status(status: &str) -> Result<String, JupiterError> {
+    match status.to_ascii_lowercase().as_str() {
+        // /orders/status uses these keeper lifecycle names. Internally both are
+        // pending because neither proves a terminal fill quantity.
+        "created" | "partiallyfilled" | "pending" => Ok("pending".to_owned()),
+        "filled" => Ok("filled".to_owned()),
+        "failed" => Ok("failed".to_owned()),
+        status => Err(invalid(format!("unsupported order status {status}"))),
+    }
 }
 
 fn parse_order_build(payload: &Value) -> Result<PredictionOrderBuild, JupiterError> {
@@ -2416,6 +2646,14 @@ fn definitive_http_rejection(error: &JupiterError) -> bool {
     })
 }
 
+fn is_http_not_found(error: &JupiterError) -> bool {
+    matches!(
+        error,
+        JupiterError::Http(error)
+            if error.status().is_some_and(|status| status.as_u16() == 404)
+    )
+}
+
 fn invalid(message: impl Into<String>) -> JupiterError {
     JupiterError::InvalidResponse(message.into())
 }
@@ -2531,6 +2769,119 @@ mod tests {
         assert_eq!(
             body.get("signedTransaction").and_then(Value::as_str),
             Some("signed")
+        );
+    }
+
+    #[test]
+    fn forecast_build_sizes_against_guaranteed_output_not_optimistic_quote() {
+        let build = forecast_swap_build(
+            SwapOrder {
+                transaction: "base64".to_owned(),
+                request_id: "swap-1".to_owned(),
+                input_mint: USDC_MINT.to_owned(),
+                output_mint: "outcome".to_owned(),
+                in_amount: 5_000_000,
+                out_amount: 10_000_000,
+                other_amount_threshold: Some(8_500_000),
+                slippage_bps: Some(1_500),
+                price_impact: None,
+                fee_bps: None,
+                signature_fee_lamports: None,
+                prioritization_fee_lamports: None,
+                rent_fee_lamports: None,
+                last_valid_block_height: 100,
+                router: "metis".to_owned(),
+                mode: "ultra".to_owned(),
+            },
+            "market",
+            "outcome",
+            true,
+            "owner",
+        )
+        .expect("valid forecast build");
+        assert_eq!(build.order.contracts_micro, 10_000_000);
+        assert_eq!(build.order.new_contracts_micro, 8_500_000);
+        assert_eq!(build.order.payout_micro_usd, 8_500_000);
+        assert_eq!(build.order.max_buy_price_micro_usd, Some(588_236));
+        assert_eq!(
+            build
+                .execution_context
+                .get("otherAmountThreshold")
+                .and_then(Value::as_str),
+            Some("8500000")
+        );
+    }
+
+    #[test]
+    fn swap_execution_uses_wallet_totals_and_enforces_threshold() {
+        let mut build = parse_order_build(&json!({
+            "transaction": "base64",
+            "txMeta": { "blockhash": "hash", "lastValidBlockHeight": 10 },
+            "jupiterSwapRequestId": "swap-1",
+            "requiredSigners": ["owner"],
+            "execution": { "endpoint": "/swap/v2/execute", "context": {} },
+            "executionModel": "atomic_swap",
+            "outcomeMint": "outcome",
+            "order": {
+                "positionPubkey": "position",
+                "marketId": "market",
+                "isBuy": true,
+                "isYes": true,
+                "contractsMicro": "10000000",
+                "newContractsMicro": "8500000"
+            }
+        }))
+        .expect("valid build");
+        let execution = SwapExecution {
+            status: ExecutionStatus::Success,
+            signature: Some("signature".to_owned()),
+            code: 0,
+            total_input_amount: 5_000_000,
+            total_output_amount: 8_750_000,
+            error: None,
+        };
+        let status = reconcile_swap_execution(&build, &execution).expect("above threshold");
+        assert_eq!(status.filled_contracts_micro, 8_750_000);
+        assert_eq!(status.size_micro_usd, 5_000_000);
+
+        build.order.new_contracts_micro = 9_000_000;
+        assert!(reconcile_swap_execution(&build, &execution).is_err());
+    }
+
+    #[test]
+    fn parses_documented_closed_order_history_shape() {
+        let order = json!({
+            "pubkey": "order",
+            "position": "position",
+            "marketId": "market",
+            "status": "filled",
+            "isBuy": true,
+            "isYes": false,
+            "contracts": "7000000",
+            "filledContracts": "6850000",
+            "avgFillPriceUsd": "510000",
+            "sizeUsd": "3493500",
+            "settled": true
+        });
+        let status = parse_prediction_order(order.as_object().expect("object"), "fallback")
+            .expect("valid history order");
+        assert_eq!(status.order_pubkey.as_deref(), Some("order"));
+        assert_eq!(status.filled_contracts_micro, 6_850_000);
+    }
+
+    #[test]
+    fn normalizes_documented_keeper_lifecycle_statuses() {
+        assert_eq!(
+            normalize_prediction_order_status("created").expect("created is live"),
+            "pending"
+        );
+        assert_eq!(
+            normalize_prediction_order_status("partiallyfilled").expect("partial is live"),
+            "pending"
+        );
+        assert_eq!(
+            normalize_prediction_order_status("filled").expect("filled is terminal"),
+            "filled"
         );
     }
 

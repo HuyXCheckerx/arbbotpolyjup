@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::signers::Signer as _;
 use alloy::signers::local::{LocalSigner, PrivateKeySigner};
 use ethers::abi::{Token, encode};
-use ethers::signers::LocalWallet;
+use ethers::signers::{LocalWallet, Signer as _};
 use ethers::types::{Address as EthersAddress, U256 as EthersU256};
 use ethers::utils::keccak256;
 use futures::{SinkExt as _, StreamExt as _};
@@ -342,11 +342,13 @@ pub struct PolymarketRelayer {
     client: RelayClient,
     signature: WalletSignature,
     wallet_address: EthersAddress,
+    signer_address: EthersAddress,
 }
 
 impl PolymarketRelayer {
     pub async fn new(options: PolymarketRelayerOptions) -> Result<Self, PolymarketError> {
         let wallet: LocalWallet = options.private_key.parse().map_err(sdk_error)?;
+        let signer_address = wallet.address();
         let auth = AuthMethod::relayer_key(&options.api_key, &options.api_key_address);
         let tx_type = match options.signature {
             WalletSignature::Eoa | WalletSignature::Poly1271 => RelayerTxType::Eoa,
@@ -374,6 +376,7 @@ impl PolymarketRelayer {
             client,
             signature: options.signature,
             wallet_address,
+            signer_address,
         })
     }
 
@@ -433,6 +436,21 @@ impl PolymarketRelayer {
                 "EOA redemption requires a funded direct Polygon transaction; gasless relayer is unavailable"
                     .to_owned(),
             ))
+        } else if self.signature == WalletSignature::Proxy {
+            // rs-builder-relayer-client 0.2.0 fixes a one-call Proxy envelope
+            // at 200k gas. Real adapter redemptions in the incident exhausted
+            // that inner limit. Its public API only scales gas by batch length,
+            // so add two harmless zero-value calls to the signer EOA: the SDK
+            // then signs a 360k envelope while the padding itself is cheap.
+            self.execute_legacy(
+                vec![
+                    call,
+                    relay_gas_padding_call(self.signer_address),
+                    relay_gas_padding_call(self.signer_address),
+                ],
+                "Jupol automatic redemption (360k proxy gas)",
+            )
+            .await
         } else {
             self.execute_legacy(vec![call], "Jupol automatic redemption")
                 .await
@@ -501,6 +519,14 @@ fn redeem_pusd_via_adapter(
     Transaction {
         to: adapter.to_owned(),
         data: format!("0x{}", hex::encode(calldata)),
+        value: "0".to_owned(),
+    }
+}
+
+fn relay_gas_padding_call(signer: EthersAddress) -> Transaction {
+    Transaction {
+        to: format!("{signer:?}"),
+        data: "0x".to_owned(),
         value: "0".to_owned(),
     }
 }
@@ -1668,6 +1694,15 @@ mod tests {
         let selector =
             hex::encode(&keccak256(b"redeemPositions(address,bytes32,bytes32,uint256[])")[..4]);
         assert!(call.data.starts_with(&format!("0x{selector}")));
+    }
+
+    #[test]
+    fn proxy_redemption_padding_is_a_zero_value_eoa_call() {
+        let signer = EthersAddress::from_low_u64_be(7);
+        let call = relay_gas_padding_call(signer);
+        assert_eq!(call.to, format!("{signer:?}"));
+        assert_eq!(call.data, "0x");
+        assert_eq!(call.value, "0");
     }
 
     #[test]

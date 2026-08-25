@@ -137,6 +137,10 @@ pub struct LivePosition {
     #[serde(default)]
     pub jupiter_entry_transaction_signature: Option<String>,
     #[serde(default)]
+    pub polymarket_entry_submission_result: Option<String>,
+    #[serde(default)]
+    pub jupiter_entry_submission_result: Option<String>,
+    #[serde(default)]
     pub polymarket_settlement_transaction_signature: Option<String>,
     #[serde(default, with = "optional_micro_n")]
     pub polymarket_redemption_collateral_before_micro_usd: Option<Micro>,
@@ -180,6 +184,11 @@ pub struct LiveTraderState {
     pub forced_entry_submission_attempted: bool,
     pub completed_pairs: Vec<String>,
     pub positions: Vec<LivePosition>,
+    /// Immutable, fully settled position records. Active positions move here
+    /// only after both venue payouts and Jupiter rent reclamation are verified.
+    /// Keeping the full record makes aggregate realized P&L auditable.
+    #[serde(default)]
+    pub settled_positions: Vec<LivePosition>,
 }
 
 impl Default for LiveTraderState {
@@ -197,6 +206,7 @@ impl Default for LiveTraderState {
             forced_entry_submission_attempted: false,
             completed_pairs: Vec::new(),
             positions: Vec::new(),
+            settled_positions: Vec::new(),
         }
     }
 }

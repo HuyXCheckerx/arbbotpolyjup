@@ -19,7 +19,7 @@ Bitcoin-above-strike mirrors, the trader:
    WebSocket without spending Jupiter's authenticated request budget;
 4. requires fresh data, at least 30 seconds to close, real wallet capacity,
    conservative depth after a 20% default haircut, fees, and both profit floors;
-5. requests a new exact Jupiter build through the shared 10 RPS Developer
+5. requests a new exact Jupiter build through the 10 RPS Developer main-bucket
    scheduler, then re-reads Polymarket depth;
 6. prepares a protected exact-share Polymarket FOK and signs the Jupiter
    transaction before either is released;
@@ -33,13 +33,15 @@ Jupiter Prediction `/orders` then `/execute` is used for native Forecast orders
 of at least `$5` and for standard `POLY-*` markets. Native Forecast orders below
 `$5` can use Swap V2 down to the configured `$0.10` strategy floor when an
 outcome mint and viable route exist. Swap uses Jupiter-managed RTSE rather than
-a manually forced zero-slippage value.
+a manually forced zero-slippage value. Swap sizing and the paired Polymarket
+quantity use `otherAmountThreshold`, Jupiter's guaranteed minimum output, rather
+than the optimistic quoted `outAmount`.
 
 The executable Jupiter build must fit inside a 500 ms build-to-handoff ceiling.
-That check reserves a conservative 250 ms for the critical shared 10 RPS slot;
-`/execute` is prioritized but does not illegally bypass the API bucket. Network
-time used to obtain the build is not counted as its local age. An old build is
-discarded, never sent stale.
+Prediction handoff retains priority in the shared main bucket. Authenticated Swap
+V2 `/execute` uses Jupiter's separate paid-plan execution bucket and therefore
+does not wait behind `/order` builds. Network time used to obtain the build is
+not counted as its local age. An old build is discarded, never sent stale.
 
 ## Why concurrent execution
 
@@ -55,9 +57,11 @@ execution states that must all be handled:
 | Only one filled, quantities/costs known | Attempt only a bounded Polymarket repair; otherwise isolate for recovery/settlement |
 | Any identity, quantity, debit or submission remains unknown | Preserve durable recovery state; never guess or report profit |
 
-A known problem is position-local. Unknown exposure is the condition that can
-justify a global halt. The startup recovery command re-reads both venues before
-acting.
+A known problem is position-local. After observation/repair, the bot recomputes
+the actual single-winner floor and contract mismatch. A negative floor, mismatch
+over 0.01 contracts, one-sided exposure, or unresolved recovery quarantines all
+new entries while existing settlement and recovery continue. The startup
+recovery command re-reads both venues before acting.
 
 ## Four resolution outcomes
 
@@ -84,11 +88,16 @@ captures:
 - the confirmed Solana transaction's owned token deltas for native Forecast;
 - venue order/transaction identities and actual responses.
 
-Actual wallet debits take precedence over quotes. If tokens appear but their
-cash debit cannot be reconciled, the position enters recovery and its cost is
-not silently treated as zero. Realized P&L is posted only after both venues are
-settled and Jupiter rent reclaim is complete. Outcome tokens temporarily reduce
-displayed free cash; the position ledger must be considered with wallet cash.
+Actual wallet debits take precedence over quotes. Swap V2's confirmed
+`totalInputAmount`/`totalOutputAmount` are authoritative and avoid a redundant
+RPC confirmation pass; Prediction keeper orders are reconciled through
+`/orders/status/{pubkey}` plus owner order history because a filled order account
+can be closed. If tokens appear but their cash debit cannot be reconciled, the
+position enters recovery and its cost is not silently treated as zero. Realized
+P&L is posted only after both venues are settled and Jupiter rent reclaim is
+complete. The complete finalized record is retained in `settled_positions`.
+Outcome tokens temporarily reduce displayed free cash; the position ledger must
+be considered with wallet cash.
 
 ## Recovery and repair
 
@@ -132,6 +141,11 @@ The live process checks expired positions every 15 seconds:
 `pnpm redeem:polymarket` manually retries Polymarket redemption. It sends a real
 relayer transaction.
 
+Legacy Proxy-wallet redemption uses a three-call relayer batch so the current
+relayer SDK supplies 360k rather than its insufficient 200k single-call gas
+limit. The two padding calls are zero-value/no-data calls to the signer; they do
+not transfer funds. `poly1271` and Safe execution are unchanged.
+
 ## Required configuration
 
 - Rust 1.90 or newer;
@@ -142,8 +156,9 @@ relayer transaction.
 - Polymarket relayer key for gasless approvals/redemption;
 - `LIVE_TRADING_CONFIRMATION=I_ACCEPT_REAL_MONEY_RISK`.
 
-The Jupiter key's 10 RPS allowance is enforced by a single 100 ms scheduler
-shared by Prediction and Swap. A `401 Unauthorized` means product access/key
+The Jupiter key's 10 RPS main allowance is enforced by a single 100 ms scheduler
+for Prediction and Swap `/order`; Swap `/execute` uses Jupiter's distinct
+paid-plan execution bucket. A `401 Unauthorized` means product access/key
 configuration is wrong; retrying cannot repair it.
 
 See [HOW_TO_RUN.md](../HOW_TO_RUN.md) for commands, flags, setup and
