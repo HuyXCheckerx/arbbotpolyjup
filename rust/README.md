@@ -24,7 +24,7 @@ path.
   sibling temporary-file replacement.
 - `jupol-live`: durable concurrent two-venue execution, four-state exposure
   accounting, bounded recovery and settlement.
-- `jupol-scanner`: 5-minute market discovery, continuously pipelined executable
+- `jupol-scanner`: 15-minute market discovery, continuously pipelined executable
   Jupiter prices, status API, structured JSONL diagnostics and the CLI.
 
 ## Build and verify
@@ -56,6 +56,9 @@ cargo run --release -p jupol-scanner -- live
 # Read-only wallet/API checks
 cargo run --release -p jupol-scanner -- readiness
 
+# Check public IP geoblocking and authenticated Polymarket read access
+cargo run --release -p jupol-scanner -- check-polymarket-access
+
 # Explicitly reconcile an interrupted durable state and make bounded repairs
 cargo run --release -p jupol-scanner -- recover
 ```
@@ -67,9 +70,10 @@ wallet/API initialization and acts as the local single-instance lock.
 
 Prediction market-metadata discovery and Swap V2 `/order` requests share one
 scheduler at 100 ms minimum spacing, matching a 10 RPS Developer main bucket.
-The scanner alternates executable 5m UP/DOWN builds every 100 ms globally by
-default, refreshing each side every 200 ms. Fixed Jupiter slippage is omitted by
-default so `/order` selects RTSE. Authenticated Swap V2 `/execute` uses Jupiter's
+The scanner alternates executable 15m UP/DOWN builds every 100 ms globally by
+default, refreshing each side every 200 ms. It requests a fixed 300 bps Jupiter
+tolerance by default and screens against the returned guaranteed minimum output.
+Authenticated Swap V2 `/execute` uses Jupiter's
 separate paid-plan execution bucket. Jupiter's public price WebSocket is not
 used.
 

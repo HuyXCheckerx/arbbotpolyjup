@@ -14,9 +14,10 @@ submit, reconcile, settle, or redeem live orders.
 
 | Goal | Command | Can change venue/on-chain state? |
 | --- | --- | --- |
-| Monitor the current 5m BTC pair | `pnpm monitor:short-window` | No |
+| Monitor the current 15m BTC pair | `pnpm monitor:short-window` | No |
 | Check both wallets and APIs | `pnpm check:live:readiness` | No |
 | Check only Polymarket | `pnpm check:polymarket:live` | No |
+| Check Polymarket IP restriction and authentication | `pnpm check:polymarket:access` | No orders |
 | Start live trading | `pnpm bot:short-window:live` | Yes |
 | Reconcile/repair interrupted positions | `pnpm recover:live` | **Yes, may submit bounded repair orders** |
 | Create Polymarket approvals | `pnpm setup:polymarket:live` | Yes |
@@ -139,9 +140,17 @@ already contain the wallet-specific transaction that live mode can sign.
 Then run read-only live readiness:
 
 ```bash
+pnpm check:polymarket:access
 pnpm check:polymarket:live
 pnpm check:live:readiness
 ```
+
+`check:polymarket:access` prints the server's Polymarket-detected outbound IP,
+country and region, then reports whether that location is blocked. When the
+location is allowed it also performs an authenticated collateral read, but it
+never builds or submits an order. `POLYMARKET_LOCATION_BLOCKED` identifies an
+IP/location restriction; an authentication error instead identifies the
+configured wallet credentials or signature/funder setup.
 
 Readiness verifies the configured wallet identity, real collateral/USDC, CLOB
 allowances, Jupiter status, and the SOL reserve. It never signs or submits an
@@ -167,7 +176,7 @@ same durable state by default.
 
 The live path:
 
-1. continuously pipelines exact 5m UP and DOWN Swap V2 executable orders;
+1. continuously pipelines exact 15m UP and DOWN Swap V2 executable orders;
 2. ranks both complementary routes using `otherAmountThreshold` and fresh
    Polymarket depth;
 3. selects the newest in-budget Jupiter build, uses cached balances and fresh
@@ -193,7 +202,7 @@ ambiguous position is persisted and quarantines new entries; live mode will not
 submit a repair order. Settlement continues independently. Cross-chain
 execution is still non-atomic.
 
-All new 5-minute entries use direct Swap V2. The executable price-discovery
+All new 15-minute entries use direct Swap V2. The executable price-discovery
 amount defaults to `$5` and is configurable; every candidate is therefore
 size-specific rather than extrapolated from a displayed unit price.
 
@@ -220,7 +229,7 @@ Common options:
 | `--jupiter-order-request-interval-ms` | `100` | Global alternating `/order` cadence; each side refreshes every 200 ms at 10 RPS total |
 | `--polymarket-minimum-order-usd` | `$1` | Marketable BUY minimum |
 | `--maximum-slippage-bps` | `300` | Polymarket entry and explicit repair protection only, allowed range 1–2500; the modeled-profit gate uses the protected limit |
-| `--jupiter-fixed-slippage-bps` | omitted | Diagnostic override only; omission sends no `slippageBps` and uses Jupiter RTSE |
+| `--jupiter-fixed-slippage-bps` | `300` | Fixed Swap V2 tolerance; the arb gate uses the returned guaranteed minimum output, not optimistic output |
 | `--polymarket-depth-haircut-bps` | `2000` | Ignores the last 20% of displayed depth |
 | `--maximum-jupiter-submit-quote-age-ms` | `400` | `/order` request-start-to-entry-handoff budget, including remote build RTT |
 | `--maximum-jupiter-adverse-move-bps` | `300` | Blocks an entry after a larger adverse move between consecutive Jupiter builds |
@@ -231,7 +240,7 @@ Common options:
 | `--max-jupiter-age-ms` | `2000` | Maximum executable-order snapshot age used for screening |
 | `--polymarket-poll-ms` | `5000` | REST fallback cadence; WebSocket is primary |
 | `--entry-cutoff-seconds` | `30` | Final no-entry window; values below 30 are rejected |
-| `--disable-sub-five-jupiter-swap` | off | Legacy recovery compatibility; new 5m entries always use Swap V2 |
+| `--disable-sub-five-jupiter-swap` | off | Legacy recovery compatibility; new 15m entries always use Swap V2 |
 | `--output` | Rust JSONL path | Append-only diagnostics/candidates |
 | `--live-state` | shared state path | Durable exposure and settlement state |
 | `--web-port` | `3210` | Status API and live instance lock |

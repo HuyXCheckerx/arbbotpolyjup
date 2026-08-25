@@ -536,20 +536,22 @@ impl JupiterSwapClient {
         &self,
         signed_transaction: &str,
         request_id: &str,
+        last_valid_block_height: u64,
     ) -> Result<SwapExecution, JupiterError> {
         // Swap V2 /execute has a dedicated bucket (100 RPS for paid plans),
         // separate from the shared /order and discovery bucket. Do not make a
         // fresh executable order wait behind quote traffic.
         self.reserve_execute().await;
+        let mut body = json!({
+            "signedTransaction": signed_transaction,
+            "requestId": request_id,
+        });
+        if last_valid_block_height > 0 {
+            body["lastValidBlockHeight"] = Value::String(last_valid_block_height.to_string());
+        }
         let payload: Value = self
             .http
-            .post_json(
-                &format!("{}/execute", self.base_url),
-                &json!({
-                    "signedTransaction": signed_transaction,
-                    "requestId": request_id,
-                }),
-            )
+            .post_json(&format!("{}/execute", self.base_url), &body)
             .await?;
         parse_swap_execution(&payload)
     }
@@ -1795,7 +1797,11 @@ impl JupiterForecastSwapExecutor {
 
         let mut execution = match self
             .client
-            .execute(&prepared.signed_transaction, request_id)
+            .execute(
+                &prepared.signed_transaction,
+                request_id,
+                prepared.build.last_valid_block_height,
+            )
             .await
         {
             Ok(execution) => execution,
@@ -1809,7 +1815,11 @@ impl JupiterForecastSwapExecutor {
                 // response. Never rebuild here: a new requestId could double-fill.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 self.client
-                    .execute(&prepared.signed_transaction, request_id)
+                    .execute(
+                        &prepared.signed_transaction,
+                        request_id,
+                        prepared.build.last_valid_block_height,
+                    )
                     .await
                     .map_err(|second_error| {
                         JupiterError::AmbiguousExecution(format!(
@@ -1831,7 +1841,11 @@ impl JupiterForecastSwapExecutor {
             tokio::time::sleep(Duration::from_millis(75)).await;
             execution = self
                 .client
-                .execute(&prepared.signed_transaction, request_id)
+                .execute(
+                    &prepared.signed_transaction,
+                    request_id,
+                    prepared.build.last_valid_block_height,
+                )
                 .await
                 .map_err(|error| {
                     JupiterError::AmbiguousExecution(format!(
@@ -2379,11 +2393,23 @@ fn validate_requested_swap_mode(
     order: &SwapOrder,
     fixed_slippage_bps: Option<u64>,
 ) -> Result<(), JupiterError> {
-    if fixed_slippage_bps.is_none() && !order.mode.eq_ignore_ascii_case("ultra") {
-        return Err(JupiterError::InvalidResponse(format!(
-            "Swap V2 omitted slippageBps but returned mode={}, expected ultra/RTSE",
-            order.mode
-        )));
+    match fixed_slippage_bps {
+        None if !order.mode.eq_ignore_ascii_case("ultra") => {
+            return Err(JupiterError::InvalidResponse(format!(
+                "Swap V2 omitted slippageBps but returned mode={}, expected ultra/RTSE",
+                order.mode
+            )));
+        }
+        Some(expected)
+            if !order.mode.eq_ignore_ascii_case("manual")
+                || order.slippage_bps != Some(expected) =>
+        {
+            return Err(JupiterError::InvalidResponse(format!(
+                "Swap V2 did not honor fixed slippage: requested={expected}bps returned={:?} mode={}",
+                order.slippage_bps, order.mode
+            )));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -3047,7 +3073,9 @@ mod tests {
         validate_requested_swap_mode(&order, None).expect("RTSE mode");
         order.mode = "manual".to_owned();
         assert!(validate_requested_swap_mode(&order, None).is_err());
+        order.slippage_bps = Some(300);
         validate_requested_swap_mode(&order, Some(300)).expect("explicit fixed override");
+        assert!(validate_requested_swap_mode(&order, Some(200)).is_err());
     }
 
     #[test]

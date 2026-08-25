@@ -10,7 +10,7 @@ Jupiter Forecast's Chainlink spot observation.
 
 ## Entry pipeline
 
-For the current BTC 5-minute round, the trader:
+For the current BTC 15-minute round, the trader:
 
 1. verifies exact market identity, interval and outcome mapping;
 2. evaluates both `Poly UP + Jup DOWN` and `Poly DOWN + Jup UP`;
@@ -28,10 +28,10 @@ For the current BTC 5-minute round, the trader:
    Prediction position and/or Solana token deltas before it books fill quantity
    or cost.
 
-All new 5-minute entries use direct Swap V2. The exact USDC discovery/entry
+All new 15-minute entries use direct Swap V2. The exact USDC discovery/entry
 amount defaults to `$5` and is controlled by `--jupiter-order-input-usd`. Swap
-uses Jupiter-managed RTSE rather than a manually forced zero-slippage value.
-Swap sizing and the paired Polymarket
+uses a fixed 300 bps tolerance by default, restoring the execution behavior of
+the higher-fill historical runtime. Swap sizing and the paired Polymarket
 quantity use `otherAmountThreshold`, Jupiter's guaranteed minimum output, rather
 than the optimistic quoted `outAmount`. Swap builds must explicitly report
 `swapMode=ExactIn`, and `otherAmountThreshold` must be a positive minimum no
@@ -48,10 +48,10 @@ out-of-sequence, superseded, or high-velocity build is discarded.
 UP and DOWN `/order` requests alternate globally every 100 ms by default, so
 each outcome launches every 200 ms without a two-request burst. A price increase
 above 300 bps versus the preceding build inside one second blocks entry by
-default. This is independent from Polymarket/repair slippage. Jupiter
-`slippageBps` is omitted unless `--jupiter-fixed-slippage-bps` is explicitly
-supplied. With the flag absent, the response must report Ultra mode and Jupiter
-RTSE or the build is rejected.
+default. This is independent from Polymarket/repair slippage. Jupiter must
+return manual mode and the requested `slippageBps`; otherwise the build is
+rejected before it can become a candidate. The tolerance protects landing,
+while `otherAmountThreshold` keeps the modeled edge conservative.
 
 ## Why concurrent execution
 

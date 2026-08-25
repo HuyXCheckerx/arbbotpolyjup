@@ -65,6 +65,7 @@ const DEVELOPER_REQUEST_INTERVAL_MS: u64 = 100;
 const DEFAULT_ORDER_DISCOVERY_REQUEST_INTERVAL_MS: u64 = 100;
 const MAXIMUM_PRECISION_SIZE_MISMATCH_BPS: Micro = 500;
 const MAXIMUM_ORDER_DISCOVERY_IN_FLIGHT: usize = 16;
+const TRADED_DURATION: DurationKind = DurationKind::FifteenMinutes;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -83,6 +84,7 @@ enum Command {
     Live(RunArgs),
     Readiness(ReadinessArgs),
     Recover(RecoveryArgs),
+    CheckPolymarketAccess,
     SetupApprovals,
     Redeem(RedeemArgs),
     State(StateArgs),
@@ -137,11 +139,11 @@ struct RunArgs {
     minimum_entry_profit_usd: String,
     #[arg(long, default_value = "0")]
     minimum_post_fill_profit_usd: String,
-    /// Polymarket entry and explicit repair protection. Jupiter uses RTSE by default.
+    /// Polymarket entry and explicit repair protection.
     #[arg(long, default_value_t = 300)]
     maximum_slippage_bps: u32,
-    /// Optional fixed Jupiter Swap V2 slippage override. Omission uses RTSE.
-    #[arg(long)]
+    /// Fixed Jupiter Swap V2 tolerance. The executable threshold is priced into the arb gate.
+    #[arg(long, default_value = "300")]
     jupiter_fixed_slippage_bps: Option<u64>,
     #[arg(long, default_value_t = 2_000)]
     polymarket_depth_haircut_bps: u32,
@@ -184,7 +186,7 @@ impl Default for RunArgs {
             minimum_entry_profit_usd: "0.10".to_owned(),
             minimum_post_fill_profit_usd: "0".to_owned(),
             maximum_slippage_bps: 300,
-            jupiter_fixed_slippage_bps: None,
+            jupiter_fixed_slippage_bps: Some(300),
             polymarket_depth_haircut_bps: 2_000,
             maximum_emergency_hedge_loss_usd: "1".to_owned(),
             jupiter_fill_timeout_ms: 20_000,
@@ -499,6 +501,7 @@ async fn main() -> Result<()> {
         Command::Live(args) => run_engine(args, true).await,
         Command::Readiness(args) => readiness(args).await,
         Command::Recover(args) => recover(args).await,
+        Command::CheckPolymarketAccess => check_polymarket_access().await,
         Command::SetupApprovals => setup_approvals().await,
         Command::Redeem(args) => redeem(args).await,
         Command::State(args) => print_state(&args.live_state),
@@ -544,9 +547,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
         request_priority: RequestPriority::Normal,
     })?;
     if env_optional("JUPITER_SLIPPAGE_BPS").is_some() {
-        warn!(
-            "legacy JUPITER_SLIPPAGE_BPS is ignored; omit --jupiter-fixed-slippage-bps to use Jupiter RTSE"
-        );
+        warn!("legacy JUPITER_SLIPPAGE_BPS is ignored; use --jupiter-fixed-slippage-bps");
     }
     let jupiter_slippage_bps = args.jupiter_fixed_slippage_bps;
     let shared_swap_client =
@@ -630,7 +631,7 @@ async fn run_engine(args: RunArgs, live: bool) -> Result<()> {
             "maximumJupiterSubmitQuoteAgeMs": config.maximum_jupiter_submit_quote_age_ms,
             "maximumJupiterAdverseMoveBps": config.maximum_jupiter_adverse_move_bps,
             "jupiterVelocityWindowMs": config.jupiter_velocity_window_ms,
-            "enabledDurations": ["5m"],
+            "enabledDurations": ["15m"],
             "entryCutoffSeconds": args.entry_cutoff_seconds,
             "minimumEntryProfitUsd": format_usd(config.strategy.minimum_entry_edge_total_micro_usd),
             "minimumPostFillProfitUsd": format_usd(config.minimum_post_fill_profit_micro_usd),
@@ -964,10 +965,10 @@ async fn discover_all(
 ) -> Result<HashMap<DurationKind, RuntimePair>> {
     loop {
         let now = unix_ms();
-        match discover_pair(DurationKind::FiveMinutes, now, gamma, jupiter).await {
-            Ok(five) => {
+        match discover_pair(TRADED_DURATION, now, gamma, jupiter).await {
+            Ok(fifteen) => {
                 let mut pairs = HashMap::new();
-                for pair in [five] {
+                for pair in [fifteen] {
                     status
                         .update_duration(pair.duration.label(), |entry| {
                             entry.phase = "monitoring".to_owned();
@@ -999,9 +1000,9 @@ async fn discover_all(
                     );
                 }
                 status
-                    .update_duration("15m", |entry| {
+                    .update_duration("5m", |entry| {
                         entry.phase = "disabled".to_owned();
-                        entry.message = "15-minute trading is disabled; this runtime operates only the current 5-minute pair."
+                        entry.message = "5-minute trading is disabled; this runtime operates only the current 15-minute pair."
                             .to_owned();
                     })
                     .await;
@@ -1048,20 +1049,20 @@ fn new_order_discovery(
     request_interval: Duration,
 ) -> Result<OrderDiscoveryHandle> {
     let runtime = pairs
-        .get(&DurationKind::FiveMinutes)
-        .ok_or_else(|| anyhow!("5-minute pair is missing after discovery"))?;
+        .get(&TRADED_DURATION)
+        .ok_or_else(|| anyhow!("15-minute pair is missing after discovery"))?;
     let up_mint = runtime
         .pair
         .jupiter_up
         .outcome_mint
         .clone()
-        .ok_or_else(|| anyhow!("5-minute Jupiter UP market has no outcome mint for Swap V2"))?;
+        .ok_or_else(|| anyhow!("15-minute Jupiter UP market has no outcome mint for Swap V2"))?;
     let down_mint = runtime
         .pair
         .jupiter_down
         .outcome_mint
         .clone()
-        .ok_or_else(|| anyhow!("5-minute Jupiter DOWN market has no outcome mint for Swap V2"))?;
+        .ok_or_else(|| anyhow!("15-minute Jupiter DOWN market has no outcome mint for Swap V2"))?;
     let targets = [
         OrderDiscoveryTarget {
             outcome: ShortWindowOutcome::Up,
@@ -1206,7 +1207,7 @@ async fn try_live_entry(
     let outcome_mint = jupiter_market
         .outcome_mint
         .as_deref()
-        .ok_or_else(|| anyhow!("5-minute Jupiter market has no Swap V2 outcome mint"))?;
+        .ok_or_else(|| anyhow!("15-minute Jupiter market has no Swap V2 outcome mint"))?;
     let token_id = match route.polymarket_outcome {
         ShortWindowOutcome::Up => runtime.pair.polymarket_up_token(),
         ShortWindowOutcome::Down => runtime.pair.polymarket_down_token(),
@@ -1224,7 +1225,7 @@ async fn try_live_entry(
         || !build.order.is_yes
         || build.order.order_cost_micro_usd != config.jupiter_order_input_micro_usd
     {
-        bail!("executable Jupiter order does not match the selected 5-minute outcome");
+        bail!("executable Jupiter order does not match the selected 15-minute outcome");
     }
     let initial_build_age = timed_build.request_age_ms(unix_ms());
     if initial_build_age > config.maximum_jupiter_submit_quote_age_ms {
@@ -1427,6 +1428,46 @@ async fn readiness(args: ReadinessArgs) -> Result<()> {
             balances.sol_lamports
         );
     }
+    Ok(())
+}
+
+async fn check_polymarket_access() -> Result<()> {
+    let clob_url = env_optional("POLYMARKET_CLOB_URL");
+    let market_data = PolymarketMarketData::new(clob_url.as_deref())?;
+    let access = market_data.access_status().await?;
+    println!("Polymarket CLOB: {}", access.clob_health);
+    println!("Detected outbound IP: {}", access.detected_ip);
+    println!(
+        "Detected location: country={} region={}",
+        access.country,
+        if access.region.is_empty() {
+            "unknown"
+        } else {
+            &access.region
+        }
+    );
+    if access.blocked {
+        println!("Geographic access: BLOCKED");
+        println!("RESULT: POLYMARKET_LOCATION_BLOCKED");
+        bail!(
+            "Polymarket rejects new orders from the detected server location {} {}",
+            access.country,
+            access.region
+        );
+    }
+    println!("Geographic access: ALLOWED");
+
+    let executor = PolymarketExecutor::new(PolymarketOptions::from_env()?)
+        .await
+        .context("location is allowed, but Polymarket wallet authentication failed")?;
+    let collateral = executor
+        .collateral_balance_micro_usd()
+        .await
+        .context("location is allowed, but the authenticated CLOB balance read failed")?;
+    println!("Authenticated wallet: {}", executor.account());
+    println!("Authenticated collateral: ${}", format_usd(collateral));
+    println!("Authenticated CLOB read: OK");
+    println!("RESULT: POLYMARKET_ACCESS_OK");
     Ok(())
 }
 
@@ -1925,8 +1966,14 @@ fn candidate_record(
         "jupiterMode": jupiter.executable_order.and_then(|order| {
             order.build.execution_context.get("mode").and_then(serde_json::Value::as_str)
         }),
+        "jupiterRouter": jupiter.executable_order.and_then(|order| {
+            order.build.execution_context.get("router").and_then(serde_json::Value::as_str)
+        }),
         "jupiterSlippageBps": jupiter.executable_order.and_then(|order| {
             order.build.execution_context.get("slippageBps")
+        }),
+        "jupiterLastValidBlockHeight": jupiter.executable_order.map(|order| {
+            order.build.last_valid_block_height
         }),
         "jupiterPriceSource": "swap_v2_executable_order",
     })

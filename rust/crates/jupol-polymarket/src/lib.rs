@@ -834,11 +834,34 @@ pub struct PolymarketMarketData {
     client: Client<Unauthenticated>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolymarketAccessStatus {
+    pub clob_health: String,
+    pub blocked: bool,
+    pub detected_ip: String,
+    pub country: String,
+    pub region: String,
+}
+
 impl PolymarketMarketData {
     pub fn new(clob_url: Option<&str>) -> Result<Self, PolymarketError> {
         let client = Client::new(clob_url.unwrap_or(DEFAULT_CLOB_URL), Config::default())
             .map_err(sdk_error)?;
         Ok(Self { client })
+    }
+
+    /// Checks public CLOB availability and Polymarket's documented geographic
+    /// restriction endpoint. This does not authenticate or submit an order.
+    pub async fn access_status(&self) -> Result<PolymarketAccessStatus, PolymarketError> {
+        let clob_health = self.client.ok().await.map_err(sdk_error)?;
+        let geoblock = self.client.check_geoblock().await.map_err(sdk_error)?;
+        Ok(PolymarketAccessStatus {
+            clob_health,
+            blocked: geoblock.blocked,
+            detected_ip: geoblock.ip,
+            country: geoblock.country,
+            region: geoblock.region,
+        })
     }
 
     pub async fn binary_order_book(

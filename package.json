@@ -18,6 +18,7 @@
     "bot:short-window:any-route": "cargo run --release -p jupol-scanner -- live --output=logs/btc-poly-jup-short-window-any-route.jsonl",
     "check:live:readiness": "cargo run --release -p jupol-scanner -- readiness",
     "check:polymarket:live": "cargo run --release -p jupol-scanner -- readiness --polymarket-only",
+    "check:polymarket:access": "cargo run --release -p jupol-scanner -- check-polymarket-access",
     "setup:polymarket:live": "cargo run --release -p jupol-scanner -- setup-approvals",
     "recover:live": "cargo run --release -p jupol-scanner -- recover",
     "redeem:polymarket": "cargo run --release -p jupol-scanner -- redeem",

@@ -1,7 +1,7 @@
 # BTC Polymarket / Jupiter short-window monitor
 
 The Rust monitor compares Polymarket BTC Up/Down with native Jupiter Forecast
-for the current 5-minute interval only. The 15-minute and daily loops are
+for the current 15-minute interval only. The 5-minute and daily loops are
 disabled.
 
 It is read-only:
@@ -50,8 +50,9 @@ Jupiter Forecast observes Chainlink spot.
 - Fast adverse Jupiter price movement is a separate entry blocker. By default,
   an increase above 300 bps versus the preceding build inside one second is
   rejected rather than delegated to wider fixed slippage.
-- Fixed Jupiter slippage is disabled by default. The omitted `slippageBps`
-  parameter selects Ultra mode and Jupiter RTSE.
+- A fixed 300 bps Jupiter tolerance is requested by default. The strategy uses
+  the returned `otherAmountThreshold` as executable output, so the tolerance is
+  already charged against candidate profitability rather than hidden.
 - Polymarket displayed depth is reduced by 20% by default and then re-read before
   an exact-share protected FOK is prepared.
 - The final 30 seconds are a mandatory no-entry window.

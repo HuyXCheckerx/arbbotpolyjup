@@ -5,21 +5,21 @@ use jupol_polymarket::PolymarketGammaClient;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DurationKind {
-    FiveMinutes,
+    FifteenMinutes,
 }
 
 impl DurationKind {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::FiveMinutes => "5m",
+            Self::FifteenMinutes => "15m",
         }
     }
 
     #[must_use]
     pub const fn milliseconds(self) -> i64 {
         match self {
-            Self::FiveMinutes => 300_000,
+            Self::FifteenMinutes => 900_000,
         }
     }
 }
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn floors_round_boundaries() {
-        let duration = DurationKind::FiveMinutes;
+        let duration = DurationKind::FifteenMinutes;
         let now = 1_725_000_123_456_i64;
         let start = now.div_euclid(duration.milliseconds()) * duration.milliseconds();
         assert!(start <= now);
